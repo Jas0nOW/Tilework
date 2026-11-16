@@ -553,8 +553,9 @@ impl<P: Win> App<P> {
         let Some(v) = self.p.visible_rect(h) else { return };
         let move_only = self.p.is_maximized(h);
         let v = if move_only { self.surfaces[&key].tree.rect_of(self.surfaces[&key].area, h).unwrap_or(v) } else { v };
-        log(&format!("drag start {h:x}"));
-        self.drag = Some(Drag { hwnd: h, key, start: v, resize: false, move_only, intent: self.p.resize_intent(h), dpi: self.p.dpi(h), monitor_changed: false, released_since: None, target: None, last: None });
+        let intent = self.p.resize_intent(h);
+        log(&format!("drag start {h:x} class={} rect={}x{}@{},{} intent={intent:?} move_only={move_only}", self.p.class_name(h), v.w, v.h, v.x, v.y));
+        self.drag = Some(Drag { hwnd: h, key, start: v, resize: false, move_only, intent, dpi: self.p.dpi(h), monitor_changed: false, released_since: None, target: None, last: None });
         set_timer(self.main, TIMER_DRAG, 30);
     }
 
@@ -613,6 +614,8 @@ impl<P: Win> App<P> {
         }
         let home = d.key;
         if !self.drag_desktop_valid(home.desktop) { return; }
+        log(&format!("drag end {h:x} start={}x{}@{},{} end={} resize={} intent={:?} target={:?}", d.start.w, d.start.h, d.start.x, d.start.y,
+            self.p.visible_rect(h).map(|r| format!("{}x{}@{},{}", r.w, r.h, r.x, r.y)).unwrap_or_default(), d.resize, d.intent, d.target.map(|t| t.2)));
         if d.resize {
             if let (Some(v), Some(s)) = (self.p.visible_rect(h), self.surfaces.get_mut(&home))
                 && let Some(old) = s.tree.rect_of(s.area, h) {
