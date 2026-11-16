@@ -7,10 +7,25 @@
 
 pub const MAX_ZONES: usize = 4;
 /// Smallest zone a window may get: enough of the title bar stays free to grab and move it.
-pub const MIN_W: i32 = 260;
-pub const MIN_H: i32 = 160;
+static MIN_W_PX: AtomicI32 = AtomicI32::new(260);
+static MIN_H_PX: AtomicI32 = AtomicI32::new(160);
+
+fn min_w() -> i32 {
+    MIN_W_PX.load(Ordering::Relaxed)
+}
+
+fn min_h() -> i32 {
+    MIN_H_PX.load(Ordering::Relaxed)
+}
+
+/// Sets the smallest zone size (from the user's settings).
+pub fn set_min_zone(w: i32, h: i32) {
+    MIN_W_PX.store(w, Ordering::Relaxed);
+    MIN_H_PX.store(h, Ordering::Relaxed);
+}
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rect {
@@ -99,7 +114,7 @@ impl Tree {
             .iter()
             .filter(|(h, r)| {
                 let (mw, mh) = self.mins.get(h).copied().unwrap_or((0, 0));
-                r.w < MIN_W.max(mw) || r.h < MIN_H.max(mh)
+                r.w < min_w().max(mw) || r.h < min_h().max(mh)
             })
             .count()
     }
@@ -546,7 +561,7 @@ type Mins = HashMap<Hwnd, (i32, i32)>;
 
 fn leaf_min(mins: &Mins, h: Hwnd) -> (i32, i32) {
     let (mw, mh) = mins.get(&h).copied().unwrap_or((0, 0));
-    (MIN_W.max(mw), MIN_H.max(mh))
+    (min_w().max(mw), min_h().max(mh))
 }
 
 /// Smallest (width, height) a node needs so that no window inside is squeezed below its minimum.
@@ -661,7 +676,7 @@ fn set_edge_node(n: &mut Node, r: Rect, h: Hwnd, edge: Edge, coord: i32, mins: &
                         };
                         let start = if horizontal_edge { rects[d].x } else { rects[d].y };
                         let pair = if horizontal_edge { rects[d].w + rects[d + 1].w } else { rects[d].h + rects[d + 1].h };
-                        let min = (if horizontal_edge { MIN_W } else { MIN_H }).min(pair / 2);
+                        let min = (if horizontal_edge { min_w() } else { min_h() }).min(pair / 2);
                         let left = (coord - start).clamp(min, pair - min);
                         let mut px: Vec<f64> = rects.iter().map(|rc| if horizontal_edge { rc.w as f64 } else { rc.h as f64 }).collect();
                         px[d] = left as f64;
@@ -994,5 +1009,43 @@ mod tests {
         let get = |id: Hwnd| l.iter().find(|(i, _)| *i == id).unwrap().1;
         assert_eq!(get(4), Rect::new(0, 540, 640, 540));
         assert_eq!(get(2), Rect::new(640, 0, 640, 1080), "the neighbours grow into the freed space");
+    }
+
+    #[test]
+    fn growing_a_zone_stops_exactly_where_the_neighbour_cannot_shrink_any_more() {
+        let mut t = tree_of(&[1, 2, 3]);
+        t.mins.insert(2, (500, 0)); // window 2 refuses to get narrower than 500 px
+        assert!(t.set_edge(SCREEN, 1, Edge::Right, 1200)); // user drags 1 far into 2
+        assert_eq!(rect(&t, 2).w, 500, "2 keeps its minimum");
+        assert_eq!(rect(&t, 1).right(), rect(&t, 2).x, "no overlap, no gap");
+        assert_eq!(t.violations(SCREEN), 0);
+        let total: i32 = [1, 2, 3].iter().map(|i| rect(&t, *i).w).sum();
+        assert_eq!(total, 1920);
+    }
+
+    #[test]
+    fn every_window_can_be_resized_in_both_directions_without_overlap() {
+        let mut t = tree_of(&[1, 2, 3, 4, 5]);
+        for (h, edge, coord) in [(1, Edge::Right, 300), (2, Edge::Right, 800), (3, Edge::Left, 900), (4, Edge::Bottom, 300), (5, Edge::Top, 700)] {
+            t.set_edge(SCREEN, h, edge, coord);
+            let l = t.layout(SCREEN);
+            for (i, (a, ra)) in l.iter().enumerate() {
+                for (b, rb) in l.iter().skip(i + 1) {
+                    let w = ra.right().min(rb.right()) - ra.x.max(rb.x);
+                    let hh = ra.bottom().min(rb.bottom()) - ra.y.max(rb.y);
+                    assert!(w <= 0 || hh <= 0, "{a} and {b} overlap after resizing {h}");
+                }
+            }
+            assert_eq!(l.iter().map(|(_, r)| r.w as i64 * r.h as i64).sum::<i64>(), 1920 * 1080, "no gaps either");
+        }
+    }
+
+    #[test]
+    fn the_smallest_zone_can_be_configured() {
+        set_min_zone(120, 90);
+        let mut t = tree_of(&[1, 2]);
+        t.set_edge(SCREEN, 1, Edge::Right, 130);
+        assert_eq!(rect(&t, 1).w, 130);
+        set_min_zone(260, 160);
     }
 }

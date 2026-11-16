@@ -1,7 +1,9 @@
 //! The tiling manager: reacts to window events, keeps one tree per surface (virtual desktop x
 //! monitor), applies the layout and handles drag & drop with a live preview.
 
+use crate::config::Config;
 use crate::platform::{hwnd_of, id_of, set_snap, snap_enabled, Platform, SurfaceKey};
+use std::time::{Duration, Instant};
 use crate::tree::{zone_at, DropZone, Edge, Hwnd, Rect, Tree};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -13,8 +15,9 @@ use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
 use windows::Win32::Graphics::Gdi::{BeginPaint, CreateBitmap, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
-use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, MOD_NOREPEAT, MOD_WIN};
-use windows::Win32::UI::Shell::{Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW};
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, RegisterHotKey, MOD_NOREPEAT, MOD_WIN, VK_LBUTTON, VK_RBUTTON};
+use windows::Win32::UI::Shell::{ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const WM_EVENT: u32 = WM_APP + 1;
@@ -22,9 +25,14 @@ const WM_TRAY: u32 = WM_APP + 2;
 const TIMER_RECONCILE: usize = 1;
 const TIMER_DRAG: usize = 2;
 const TIMER_POLL: usize = 3;
+const TIMER_HOVER: usize = 4;
 const HOTKEY_TOGGLE: i32 = 1;
 const MENU_TOGGLE: usize = 1;
 const MENU_EXIT: usize = 2;
+const MENU_OPEN_CONFIG: usize = 3;
+const MENU_FFM_OFF: usize = 10;
+const MENU_FFM_BASE: usize = 20;
+const FFM_PRESETS: [u64; 5] = [150, 300, 500, 800, 1200];
 const ACCENT: u32 = 0x00FF823C; // BGR: a clear blue
 const DWMWA_BORDER_COLOR: DWMWINDOWATTRIBUTE = DWMWINDOWATTRIBUTE(34);
 const COLOR_DEFAULT: u32 = 0xFFFF_FFFF;
@@ -56,6 +64,9 @@ pub struct App {
     disabled: HashSet<u128>,
     /// State of Windows' own snapping before we started; restored on exit and on desktops without tiling.
     snap_original: bool,
+    cfg: Config,
+    /// Window under the cursor, the focused window at that moment, and since when.
+    hover: Option<(Hwnd, Hwnd, Instant)>,
     /// The virtual desktop that is currently shown.
     shown: u128,
     /// Minimum sizes some windows insist on, learned from windows that refuse to shrink.
@@ -480,6 +491,68 @@ impl App {
         }
     }
 
+    // ---------- focus follows mouse ----------
+
+    fn is_tracked_here(&self, h: Hwnd) -> bool {
+        self.surfaces.iter().any(|(k, s)| k.desktop == self.shown && s.tree.contains(h))
+    }
+
+    /// Gives the keyboard focus to the tiled window under the cursor once the cursor has rested
+    /// on it for the configured time. Does nothing while a menu, the Start menu, a dialog or any
+    /// window we do not manage has the focus, while a mouse button is held, or while dragging.
+    fn hover_tick(&mut self) {
+        if !self.cfg.focus_follows_mouse || self.drag.is_some() {
+            self.hover = None;
+            return;
+        }
+        unsafe {
+            if GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 || GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0 {
+                self.hover = None;
+                return;
+            }
+            let mut pt = POINT::default();
+            if GetCursorPos(&mut pt).is_err() {
+                return;
+            }
+            let under = id_of(GetAncestor(WindowFromPoint(pt), GA_ROOT));
+            let fg = id_of(GetForegroundWindow());
+            if under == 0 || under == fg || !self.is_tracked_here(under) {
+                self.hover = None;
+                return;
+            }
+            let fg_ok = fg == 0 || self.is_tracked_here(fg) || matches!(self.p.class_name(fg).as_str(), "Progman" | "WorkerW");
+            if !fg_ok {
+                self.hover = None;
+                return;
+            }
+            match self.hover {
+                Some((h, f, since)) if h == under && f == fg => {
+                    if since.elapsed() >= Duration::from_millis(self.cfg.focus_delay_ms) {
+                        let ok = self.focus_window(under);
+                        log(&format!("hover focus {under:x} ({})", if ok { "ok" } else { "refused by Windows" }));
+                        self.hover = Some((under, fg, Instant::now()));
+                    }
+                }
+                _ => self.hover = Some((under, fg, Instant::now())),
+            }
+        }
+    }
+
+    fn focus_window(&self, h: Hwnd) -> bool {
+        unsafe {
+            let fg = GetForegroundWindow();
+            let fg_thread = GetWindowThreadProcessId(fg, None);
+            let me = GetCurrentThreadId();
+            // Windows only lets the thread that owns the focus hand it on; joining its input queue allows it.
+            let attached = fg_thread != 0 && fg_thread != me && AttachThreadInput(me, fg_thread, true).as_bool();
+            let ok = SetForegroundWindow(hwnd_of(h)).as_bool();
+            if attached {
+                let _ = AttachThreadInput(me, fg_thread, false);
+            }
+            ok
+        }
+    }
+
     // ---------- overlay & tray ----------
 
     /// Shows the complete layout that a drop would produce: every window as a thin frame, the
@@ -529,8 +602,19 @@ impl App {
     fn show_menu(&mut self) {
         unsafe {
             let menu = CreatePopupMenu().unwrap();
+            let focus_menu = CreatePopupMenu().unwrap();
+            let check = |on: bool| if on { MF_STRING | MF_CHECKED } else { MF_STRING };
+            let _ = AppendMenuW(focus_menu, check(!self.cfg.focus_follows_mouse), MENU_FFM_OFF, w!("Off"));
+            for (i, ms) in FFM_PRESETS.iter().enumerate() {
+                let label = wide(&format!("After {ms} ms{}", if *ms == 300 { " (default)" } else { "" }));
+                let on = self.cfg.focus_follows_mouse && self.cfg.focus_delay_ms == *ms;
+                let _ = AppendMenuW(focus_menu, check(on), MENU_FFM_BASE + i, PCWSTR(label.as_ptr()));
+            }
             let label = if self.desktop_on(self.shown) { w!("Turn tiling off for this desktop") } else { w!("Turn tiling on for this desktop") };
             let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE, label);
+            let _ = AppendMenuW(menu, MF_POPUP, focus_menu.0 as usize, w!("Focus follows mouse"));
+            let _ = AppendMenuW(menu, MF_STRING, MENU_OPEN_CONFIG, w!("Open settings file"));
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Exit CosmicTile"));
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
@@ -539,6 +623,21 @@ impl App {
             let _ = DestroyMenu(menu);
             match cmd {
                 MENU_TOGGLE => self.toggle(),
+                MENU_OPEN_CONFIG => {
+                    self.cfg.save();
+                    let path = wide(&Config::path().to_string_lossy());
+                    ShellExecuteW(None, w!("open"), PCWSTR(path.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+                }
+                MENU_FFM_OFF => {
+                    self.cfg.focus_follows_mouse = false;
+                    self.cfg.save();
+                }
+                c if (MENU_FFM_BASE..MENU_FFM_BASE + FFM_PRESETS.len()).contains(&c) => {
+                    self.cfg.focus_follows_mouse = true;
+                    self.cfg.focus_delay_ms = FFM_PRESETS[c - MENU_FFM_BASE];
+                    self.cfg.save();
+                    log(&format!("focus follows mouse after {} ms", self.cfg.focus_delay_ms));
+                }
                 MENU_EXIT => {
                     self.shutdown();
                     PostQuitMessage(0);
@@ -647,6 +746,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                     }
                 }
                 TIMER_DRAG => app.drag_tick(),
+                TIMER_HOVER => app.hover_tick(),
                 TIMER_POLL => {
                     if app.drag.is_none() {
                         app.reconcile(false);
@@ -672,6 +772,8 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 }
 
 pub fn run(filter: Option<String>) {
+    let cfg = Config::load();
+    crate::tree::set_min_zone(cfg.min_zone_width, cfg.min_zone_height);
     unsafe {
         let hinst = GetModuleHandleW(None).unwrap();
         let class_main = w!("CosmicTileMain");
@@ -702,6 +804,8 @@ pub fn run(filter: Option<String>) {
             p: platform,
             disabled: HashSet::new(),
             snap_original: snap_enabled(),
+            cfg,
+            hover: None,
             shown: 0,
             mins: HashMap::new(),
             placed: HashMap::new(),
@@ -728,6 +832,7 @@ pub fn run(filter: Option<String>) {
             log("could not register Win+Y");
         }
         SetTimer(Some(main), TIMER_POLL, 1500, None);
+        SetTimer(Some(main), TIMER_HOVER, 50, None);
         log("started");
         APP.with(|a| {
             if let Some(app) = a.borrow_mut().as_mut() {

@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 #![allow(dead_code)]
 mod app;
+mod config;
 mod platform;
 mod tree;
 
