@@ -52,11 +52,12 @@ A new window is placed without questions:
    has 4 columns.
 2. After that, columns are split in two (at most **2 windows per column** by default), starting at
    the focused window's column.
-3. Anything denser (3â€“4 zones in one column, deep splits) is the user's choice through drag & drop;
-   the program never assumes it.
-4. If a window cannot be placed without squeezing anybody below their minimum size, the spot with
-   the fewest violations is used. A window is never left out of the layout (except full-screen
-   windows, see 8).
+3. Existing containers with a free slot are used next (up to **4 zones per container**), before
+   creating deeper splits. Second rows take precedence over these denser slots.
+4. Only when every existing container is full may automatic placement split another leaf. It
+   checks all such fallback candidates and takes the one with the fewest minimum-size violations.
+   Earlier placement choices also account for minima; a window is never left out of the layout
+   (except full-screen windows, see 8).
 
 Closing, minimising or moving a window to another desktop removes it; its neighbours grow into the
 space. Restoring it places it like a new window.
@@ -98,7 +99,7 @@ program does not fight them:
 - Every zone has a global floor (default 260Ã—160 px, configurable) so that part of the title bar
   always stays grabbable.
 - Placement requests are asynchronous and skip hung windows; maximized adoption uses an
-  asynchronous restore. After a 500 ms settling interval, two identical poll measurements are
+  asynchronous restore without activation, followed by normal geometry calculation on a later poll. After a 500 ms settling interval, two identical poll measurements are
   required before a refused size is learned. When a window remains larger than its zone, its real
   minimum is **learned** and
   the layout gives its zone exactly that size; the others share the rest. The layout engine
@@ -120,7 +121,8 @@ out.
   with tiling on and off can coexist. Paused trees preserve their manual weights for the process
   lifetime; enabling reconciles windows that have since closed or moved.
 - Desktop identity requires a successful COM query confirming a visible, uncloaked window on the
-  current desktop with a nonzero desktop ID. If identity is unavailable, no windows are moved.
+  current desktop with a nonzero desktop ID. Conflicting IDs are treated as unavailable. If identity
+  is unavailable, placement and hover focus pause and owned Snap changes are restored.
 - A desktop switch or disabling tiling cancels any active drag. Display/work-area notifications
   rebuild surface monitor keys from live windows and trigger a full reconcile.
 - Windows that Windows itself hides (cloaked, ghost UWP frames on the shown desktop) are ignored.
@@ -201,7 +203,7 @@ Tray menu and `config.ini`:
 
 Near term (before a public 0.2):
 
-- live verification of the hardening changes (see `HARDENING.md`), especially desktop and Snap paths
+- live verification of the hardening changes (see section 15), especially desktop and Snap paths
 - autostart as administrator without a UAC prompt (scheduled task) and a clean uninstall
 - the thin colour frame around the focused window as a real 4 px overlay
 - persisted learned minimum sizes; per-app overrides and an ignore list
@@ -224,3 +226,51 @@ Later:
 - Security: the program runs elevated to manage elevated windows. It reads no network data,
   executes nothing from configuration files and only writes its log and settings under
   `%LOCALAPPDATA%`.
+
+
+## 15. Hardening
+
+The review was checked item by item against inherited commit `b4b814f`, then completed in four
+verified slices. The initial baseline had 61 passing tests; the final suite has 74. Pure tree,
+placement, drag observation, pending-event, identity-consensus and filesystem helpers are tested.
+Actual Windows interactions still need the live checks below. Tests never invoke Snap SPI writes.
+
+| Review items | Offline status / evidence |
+|---|---|
+| A, K, M17 | Done: normalization uses original child index; deterministic PRNG mixes add/remove/swap/insert/divider operations, checks invariants; minimum settings are isolated across test threads (`src/tree.rs:547,838,878`). |
+| B, decision 1 | Done: placement reservation is checked before force; a legitimate monitor-filling tile remains managed (`src/app.rs:317,1275`). |
+| C, M6; D, M8; E | Done: early DPI with error logging, direct foreground request without input attachment, invalid/duplicate filters rejected before run (`src/main.rs:12,88`, `src/app.rs:658`). |
+| F, M3, M4 | Done: release uses the same fresh geometry/target path as ticks; failed observations clear old targets; live target membership is rechecked (`src/app.rs:528,1045,1173`). |
+| G, M5; H9, H10, H11, decisions 2/3 | Done: real subtree minima clamp only adjacent divider pair; bounded reseat, ordered automatic slots, minimum-violation fallback, target-only manual split (`src/tree.rs:161,276,580,729,926,977,984`). |
+| H, M15; I; J, H8 | Done: preserve existing settings, atomic saves, Explorer tray recovery, prune dead handles, two consecutive eligible settled measurements; minima never decrease during a window lifetime (`src/config.rs:95,112,125`, `src/app.rs:232,323,890`). |
+| H1, H2 | Done: checked Snap SPI with pvParam, read-only status, flushed original-state marker, panic/control/session-end recovery; marker tests cover absent, corrupt, mismatching and failed restoration (`src/platform.rs:307,344,412`). |
+| H4, M9, M10; H5, H7 | Done: skip hung/iconic windows; async nonactivating restore before later placement, async positioning, released modal borrow, typed pending causes, lost-end timeout, desktop recheck (`src/platform.rs:239`, `src/app.rs:440,763,869,1127`). |
+| H6 | Partly: confirmed uncloaked application windows and nonzero consistent COM IDs are required; missing/conflicting identity pauses placement, hover focus and Snap ownership (`src/platform.rs:166,281`, `src/app.rs:232`). See pinned-window limitation below. |
+| M1, M2 | Done: cross-monitor center inserts below; preview includes the changed source layout (`src/app.rs:1045,1201`, section 4). |
+| M7, M11, M12 | Done: five-button/menu/fullscreen focus guards; display/work-area events rederive monitor keys, including deferred callbacks, and force placement; paused desktop trees retain weights (`src/app.rs:85,271,410,464,616,1082,1112`). |
+| M13, M14, M16 | Done: bounded sanitized rotating log, no absent/empty/relative app-data writes, named mutex and checked registration results (`src/app.rs:150,162,998,1002`, `src/config.rs:89`, `src/main.rs:49`). |
+| L1, L2, L3 | Done: original DWM borders restored, including unmanaged focus; hooks/COM/icons/timers/hotkey cleaned up; menu and message-loop errors handled (`src/app.rs:381,398,780,1016,1025`, `src/platform.rs:435`). |
+| L4, L5 | Done: saturating/i64 minimum arithmetic; dump uses config minima and excludes untracked fullscreen/unknown desktop (`src/tree.rs:648,660`, `src/main.rs:60`). |
+| Open source | Done: MIT/package metadata, dependency-free embedded MSVC manifest, Windows PR/main/tag test/clippy/release workflow (`Cargo.toml:1`, `build.rs:1`, `app.manifest:1`, `.github/workflows/ci.yml:1`). |
+
+The supplied list has no H3 or standalone bug-hunt L/M; no finding was inferred for those labels.
+
+**Pinned-window limitation (H6):** the documented [IVirtualDesktopManager interface](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nn-shobjidl_core-ivirtualdesktopmanager)
+has no pin-status query. We deliberately avoid version-sensitive private shell interfaces. Conflicting
+visible-window IDs suspend tiling instead of selecting one arbitrarily. A pinned window alone (or
+several reporting the same stale ID) cannot be identified reliably by this implementation; reliable
+exclusion of every pinned window is skipped. This remains a live compatibility limitation.
+
+**Live checks still required:** normal/maximized/F11 reservation and restore (including auto-hide
+ taskbar and mixed DPI); asynchronous/hung-app placement and focus preservation; fast moves/resizes,
+ invalidated targets and both cross-monitor previews; desktop changes during drags and unavailable
+ COM identity; pinned windows; manual layout across off/on; foreground menus and all mouse buttons;
+ display hot-plug/work-area changes; Explorer tray recreation; Snap status, original-off/on recovery,
+ panic/session-end paths and failed recovery; single-instance/hotkey conflicts; DWM border restoration
+ and resource cleanup. Use isolated test windows with `--filter`; a forced kill can require manual
+ Snap recovery. No live manager test, installation, push or merge was performed in this continuation.
+
+Release verification: `cargo test` (74 passed), `cargo clippy --all-targets` (clean),
+`cargo build --release` (successful). Five invalid-filter process probes returned exit code 2
+and console errors; read-only `--dump` and `--snap-status --dump` succeeded with app-data redirected
+inside `target/`. The release PE resource contains the asInvoker application manifest.

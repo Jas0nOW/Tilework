@@ -161,24 +161,26 @@ impl Platform {
         }
     }
 
-    /// The desktop that is currently shown, taken from any visible (not cloaked) window.
+    /// Use confirmed visible application windows, rejecting conflicting IDs rather than trusting
+    /// the first one (a pinned window may report its original desktop).
     pub fn current_desktop(&self) -> u128 {
         let Some(vdm) = &self.vdm else { return 0 };
+        let mut ids = Vec::new();
         for h in self.all_top_level() {
             unsafe {
                 let hw = hwnd_of(h);
                 let mut cloak = 0u32;
-                if IsWindowVisible(hw).as_bool() && !IsIconic(hw).as_bool()
+                if self.is_manageable(h, 0) && IsWindowVisible(hw).as_bool() && !IsIconic(hw).as_bool()
                     && DwmGetWindowAttribute(hw, DWMWA_CLOAKED, &mut cloak as *mut u32 as *mut c_void, 4).is_ok() && cloak == 0
                     && vdm.IsWindowOnCurrentVirtualDesktop(hw).map(|v| v.as_bool()).unwrap_or(false) {
                     let id = self.raw_desktop_id(h);
                     if id != 0 {
-                        return id;
+                        ids.push(id);
                     }
                 }
             }
         }
-        0
+        desktop_consensus(ids)
     }
 
     /// Monitor handle and the usable work area (without the taskbar) for a window.
@@ -237,9 +239,15 @@ impl Platform {
     pub fn place(&self, h: isize, target: Rect) -> bool {
         unsafe {
             let hw = hwnd_of(h);
-            if self.is_hung(h) { return false; }
-            if IsZoomed(hw).as_bool() {
-                let _ = ShowWindowAsync(hw, SW_RESTORE);
+            match placement_step(self.is_hung(h), self.is_minimized(h), self.is_maximized(h)) {
+                PlacementStep::Wait => return false,
+                PlacementStep::Restore => {
+                    // Restore without activation, then let a later poll measure normal borders.
+                    // The queued restore has not placed the window at `target` yet.
+                    let _ = ShowWindowAsync(hw, SW_SHOWNOACTIVATE);
+                    return false;
+                }
+                PlacementStep::Position => {}
             }
             let mut outer = RECT::default();
             if GetWindowRect(hw, &mut outer).is_err() {
@@ -259,6 +267,24 @@ impl Platform {
             ).is_ok()
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PlacementStep { Wait, Restore, Position }
+
+fn placement_step(hung: bool, minimized: bool, maximized: bool) -> PlacementStep {
+    if hung || minimized { PlacementStep::Wait }
+    else if maximized { PlacementStep::Restore }
+    else { PlacementStep::Position }
+}
+
+fn desktop_consensus(ids: impl IntoIterator<Item = u128>) -> u128 {
+    let mut current = 0;
+    for id in ids.into_iter().filter(|&id| id != 0) {
+        if current != 0 && current != id { return 0; }
+        current = id;
+    }
+    current
 }
 
 const SPI_GETWINARRANGING: u32 = 0x0082;
@@ -415,7 +441,24 @@ impl Drop for Platform {
 
 #[cfg(test)]
 mod snap_tests {
-    use super::{parse_marker, restore_marker};
+    use super::{desktop_consensus, parse_marker, placement_step, restore_marker, PlacementStep};
+
+    #[test]
+    fn maximized_adoption_restores_before_a_later_normal_placement() {
+        assert_eq!(placement_step(true, false, true), PlacementStep::Wait);
+        assert_eq!(placement_step(false, true, false), PlacementStep::Wait);
+        assert_eq!(placement_step(false, false, true), PlacementStep::Restore);
+        assert_eq!(placement_step(false, false, false), PlacementStep::Position);
+    }
+
+    #[test]
+    fn desktop_identity_requires_consistent_nonzero_evidence() {
+        assert_eq!(desktop_consensus([]), 0);
+        assert_eq!(desktop_consensus([0, 0]), 0);
+        assert_eq!(desktop_consensus([0, 42, 42]), 42);
+        assert_eq!(desktop_consensus([42, 99]), 0);
+        assert_eq!(desktop_consensus([99, 42, 42]), 0);
+    }
 
     #[test]
     fn recovery_only_changes_snap_for_a_valid_marker_and_retains_failed_recovery() {
@@ -431,6 +474,10 @@ mod snap_tests {
         std::fs::write(&path, "0").unwrap();
         assert!(restore_marker(&path, None, |value| { assert!(!value); true }));
         assert!(!path.exists());
+        std::fs::write(&path, "truncated marker").unwrap();
+        assert!(!restore_marker(&path, None, |_| panic!("corrupt marker must not change Snap")));
+        assert!(path.exists());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

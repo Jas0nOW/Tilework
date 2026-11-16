@@ -86,13 +86,15 @@ fn dump() {
 }
 
 fn parse_filter(args: &[String]) -> Result<Option<String>, &'static str> {
-    match args.iter().position(|a| a == "--filter") {
-        None => Ok(None),
-        Some(i) => match args.get(i + 1) {
-            Some(value) if !value.trim().is_empty() && !value.starts_with("--") => Ok(Some(value.clone())),
-            _ => Err("--filter requires a non-empty value"),
-        },
+    let mut filter = None;
+    for (i, _) in args.iter().enumerate().filter(|(_, arg)| *arg == "--filter") {
+        if filter.is_some() { return Err("--filter may only be supplied once"); }
+        match args.get(i + 1) {
+            Some(value) if !value.trim().is_empty() && !value.starts_with("--") => filter = Some(value.clone()),
+            _ => return Err("--filter requires a non-empty value"),
+        }
     }
+    Ok(filter)
 }
 
 #[cfg(test)]
@@ -100,7 +102,7 @@ mod tests {
     use super::*;
     #[test]
     fn filter_requires_a_nonempty_value() {
-        for args in [vec!["app", "--filter"], vec!["app", "--filter", ""], vec!["app", "--filter", "  "], vec!["app", "--filter", "--dump"]] {
+        for args in [vec!["app", "--filter"], vec!["app", "--filter", ""], vec!["app", "--filter", "  "], vec!["app", "--filter", "--dump"], vec!["app", "--filter", "test", "--filter"], vec!["app", "--filter", "test", "--filter", "other"]] {
             assert!(parse_filter(&args.into_iter().map(String::from).collect::<Vec<_>>()).is_err());
         }
         assert_eq!(parse_filter(&["app".into(), "--filter".into(), "test".into()]), Ok(Some("test".into())));

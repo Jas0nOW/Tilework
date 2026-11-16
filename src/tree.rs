@@ -170,6 +170,7 @@ impl Tree {
         let leaves = self.leaves();
         let focus = focused.filter(|f| leaves.contains(f)).or_else(|| leaves.last().copied()).expect("tree is not empty");
         let (mut cands, has_slot) = self.auto_candidates(focus);
+        let preferred_len = cands.len();
         // A leaf split is the final fallback after all existing slots have been considered.
         let mut order = leaves;
         order.sort_by_key(|l| *l != focus);
@@ -181,11 +182,11 @@ impl Tree {
             }
         }
         let mut best: Option<(usize, Tree)> = None;
-        for c in cands {
+        for (index, c) in cands.into_iter().enumerate() {
             let mut t = self.clone();
             t.apply_cand(h, c);
             let v = t.violations(area);
-            if v <= base {
+            if v == 0 || (index < preferred_len && v <= base) {
                 *self = t;
                 return true;
             }
@@ -813,6 +814,7 @@ mod tests {
         assert_eq!(layout.len(), leaves.len());
         for (i, (_, a)) in layout.iter().enumerate() {
             assert!(a.w >= 0 && a.h >= 0);
+            assert!(a.x >= area.x && a.y >= area.y && a.right() <= area.right() && a.bottom() <= area.bottom());
             for (_, b) in layout.iter().skip(i + 1) {
                 assert!(a.right() <= b.x || b.right() <= a.x || a.bottom() <= b.y || b.bottom() <= a.y);
             }
@@ -834,20 +836,57 @@ mod tests {
 
     #[test]
     fn deterministic_mutations_preserve_tree_and_layout_invariants() {
-        for seed in 0..12 {
+        let mut counts = [0; 5];
+        for seed in 1..=12_u32 {
+            let mut state = seed;
+            let mut random = || {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as usize
+            };
             let mut t = tree_of(&[1]);
-            for id in 2..=16 {
+            let mut next = 2;
+            let area = Rect::new(-800, -600, 16000, 12000);
+            for _ in 0..300 {
                 let leaves = t.leaves();
-                let target = leaves[(seed + id as usize * 7) % leaves.len()];
+                if leaves.is_empty() { t.add(next, area, None); next += 1; continue; }
+                let target = leaves[random() % leaves.len()];
                 let zones = [DropZone::Left, DropZone::Right, DropZone::Top, DropZone::Bottom];
-                t.insert(id, target, zones[(seed + id as usize) % zones.len()]);
-                assert_invariants(&t, Rect::new(0, 0, 16000, 12000));
-            }
-            for id in (2..=16).step_by(2) {
-                assert!(t.remove(id));
-                assert_invariants(&t, Rect::new(0, 0, 16000, 12000));
+                let operation = if leaves.len() >= 24 { 1 } else { random() % 5 };
+                counts[operation] += 1;
+                match operation {
+                    0 => { assert!(t.add(next, area, Some(target))); next += 1; }
+                    1 => { assert!(t.remove(target)); }
+                    2 => { t.swap(target, leaves[random() % leaves.len()]); }
+                    3 => { t.insert(next, target, zones[random() % zones.len()]); next += 1; }
+                    _ => {
+                        let edges = [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom];
+                        let edge = edges[random() % edges.len()];
+                        let coord = if matches!(edge, Edge::Left | Edge::Right) { area.x + (random() % area.w as usize) as i32 }
+                            else { area.y + (random() % area.h as usize) as i32 };
+                        t.set_edge(area, target, edge, coord);
+                    }
+                }
+                if !t.is_empty() { assert_invariants(&t, area); }
             }
         }
+        assert!(counts.iter().all(|&count| count > 0));
+    }
+
+    #[test]
+    fn configured_minima_are_isolated_between_test_threads() {
+        let first = std::thread::spawn(|| {
+            set_min_zone(120, 90);
+            (min_w(), min_h())
+        });
+        let second = std::thread::spawn(|| {
+            assert_eq!((min_w(), min_h()), (260, 160));
+            set_min_zone(400, 300);
+            (min_w(), min_h())
+        });
+        assert_eq!(first.join().unwrap(), (120, 90));
+        assert_eq!(second.join().unwrap(), (400, 300));
     }
 
     #[test]
@@ -881,6 +920,33 @@ mod tests {
         }
         assert_eq!(depth(t.root.as_ref().unwrap()), 2);
         assert_invariants(&t, area);
+    }
+
+    #[test]
+    fn full_containers_choose_the_least_violating_leaf_split() {
+        // Every existing container is full, so only final-resort leaf splits remain.
+        for seed in 1..=80 {
+            let mut t = Tree {
+                root: Some(Node::Container {
+                    orient: Orientation::Horizontal,
+                    children: (0..4).map(|column| Node::Container {
+                        orient: Orientation::Vertical, children: (1..=4).map(|row| Node::Leaf(column * 4 + row)).collect(),
+                        weights: equal(4), auto: true,
+                    }).collect(),
+                    weights: equal(4), auto: true,
+                }),
+                mins: HashMap::new(),
+            };
+            for id in 1..=17 { t.mins.insert(id, (260 + (seed * id as i32 * 137) % 1000, 160 + (seed * id as i32 * 91) % 500)); }
+            let best = (1..=16).flat_map(|id| [DropZone::Right, DropZone::Bottom, DropZone::Left, DropZone::Top].map(|zone| (id, zone)))
+                .map(|(id, zone)| {
+                    let mut candidate = t.clone();
+                    candidate.apply_cand(17, Cand::Around(id, zone));
+                    candidate.violations(SCREEN)
+                }).min().unwrap();
+            assert!(t.add(17, SCREEN, Some(16)));
+            assert_eq!(t.violations(SCREEN), best, "seed {seed}");
+        }
     }
 
     #[test]

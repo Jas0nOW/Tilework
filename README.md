@@ -32,15 +32,15 @@ cargo test
 
 `cosmictile.exe --dump` prints what would be tiled without touching any window;
 `--snap-status` reports Windows Snap without changing it.
-`--filter TEXT` requires a non-empty value and manages only windows whose title contains TEXT (safe testing).
+`--filter TEXT` accepts a single non-empty value, cannot be repeated and manages only windows whose title contains TEXT (safe testing).
 
 Run it as administrator if you also want to tile elevated windows (e.g. admin terminals).
 
 ## Status
 
-Tree and helper logic have unit and invariant tests; Windows desktop interactions require live checks.
+Tree and helper logic have 74 unit and invariant tests; Windows desktop interactions require live checks.
 Windows CI tests, checks Clippy and builds release artifacts on pull requests, main updates and tags.
 
 Early development. Not yet implemented: autostart, keyboard shortcuts for moving/focusing, workspaces.
 
-Hardening details and remaining live checks: [docs/HARDENING.md](docs/HARDENING.md).
+Hardening status, the pinned-window limitation and required desktop checks: [Design: Hardening](docs/DESIGN.md#15-hardening).

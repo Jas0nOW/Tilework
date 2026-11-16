@@ -22,10 +22,7 @@ impl Default for Config {
 impl Config {
     /// Returns the config path when Windows supplied a usable local app-data directory.
     pub fn path() -> Option<PathBuf> {
-        std::env::var_os("LOCALAPPDATA")
-            .filter(|p| !p.is_empty())
-            .map(PathBuf::from)
-            .map(|base| base.join("CosmicTile").join("config.ini"))
+        config_path(std::env::var_os("LOCALAPPDATA"))
     }
 
     pub fn parse(text: &str) -> Self {
@@ -87,6 +84,12 @@ impl Config {
             crate::app::log(&format!("could not create config: {e}"));
         }
     }
+}
+
+fn config_path(base: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let base = PathBuf::from(base?);
+    // A malformed environment variable must not redirect writes into the working directory.
+    base.is_absolute().then(|| base.join("CosmicTile").join("config.ini"))
 }
 
 fn load_from_path(path: &Path) -> Config {
@@ -164,6 +167,15 @@ fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> { std::fs::rename
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_or_relative_app_data_never_produces_a_write_path() {
+        assert_eq!(config_path(None), None);
+        assert_eq!(config_path(Some("".into())), None);
+        assert_eq!(config_path(Some("relative-app-data".into())), None);
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        assert_eq!(config_path(Some(base.clone().into_os_string())), Some(base.join("CosmicTile").join("config.ini")));
+    }
 
     fn test_file(label: &str) -> PathBuf {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");

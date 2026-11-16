@@ -52,6 +52,11 @@ struct Placement {
 impl Placement {
     fn new(target: Rect) -> Self { Self { target, measured: None, requested: Instant::now() } }
 
+    fn suspend(&mut self) {
+        self.measured = None;
+        self.requested = Instant::now();
+    }
+
     /// Ignore early async results; require two later polls with identical visible geometry.
     fn observe(&mut self, visible: Option<Rect>, elapsed: Duration) -> bool {
         if elapsed < Duration::from_millis(500) { self.measured = None; return false; }
@@ -74,6 +79,25 @@ struct Drag {
     released_since: Option<Instant>,
     /// (surface, window under the cursor or None for an outer edge / empty monitor, zone)
     target: Option<(SurfaceKey, Option<Hwnd>, DropZone)>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct PendingEvents {
+    reconcile: bool,
+    refresh: bool,
+    tray: bool,
+}
+
+impl PendingEvents {
+    const fn new() -> Self { Self { reconcile: false, refresh: false, tray: false } }
+
+    fn record(&mut self, msg: u32, taskbar_created: u32) {
+        self.reconcile |= matches!(msg, WM_EVENT | WM_TIMER | WM_PENDING);
+        self.refresh |= matches!(msg, WM_DISPLAYCHANGE | WM_SETTINGCHANGE);
+        self.tray |= taskbar_created != 0 && msg == taskbar_created;
+    }
+
+    fn any(self) -> bool { self.reconcile || self.refresh || self.tray }
 }
 
 pub struct App {
@@ -108,7 +132,8 @@ pub struct App {
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
     static MAIN_HANDLE: Cell<HWND> = const { Cell::new(HWND(std::ptr::null_mut())) };
-    static PENDING: Cell<bool> = const { Cell::new(false) };
+    static PENDING: Cell<PendingEvents> = const { Cell::new(PendingEvents::new()) };
+    static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
     static MENU_OPEN: Cell<bool> = const { Cell::new(false) };
     /// What the drag overlay paints: the screen area and (rectangle, is the dragged window) pairs.
     static OVERLAY: RefCell<(Rect, Vec<(Rect, bool)>)> = const { RefCell::new((Rect::new(0, 0, 0, 0), Vec::new())) };
@@ -200,7 +225,7 @@ impl App {
     }
 
     fn surface_containing(&self, h: Hwnd) -> Option<SurfaceKey> {
-        self.surfaces.iter().find(|(_, s)| s.tree.contains(h)).map(|(k, _)| *k)
+        find_enabled_surface(&self.surfaces, &self.disabled, h)
     }
 
     /// Brings the trees in line with the windows that really exist, then lays out what changed.
@@ -208,6 +233,12 @@ impl App {
         let cur = self.p.current_desktop();
         if cur == 0 {
             self.cancel_drag();
+            let was_known = self.shown != 0;
+            self.shown = 0;
+            self.hover = None;
+            if let Some(h) = self.bordered.take() { self.set_border(h, COLOR_DEFAULT); }
+            self.sync_snap();
+            if was_known { self.update_tray(); }
             if !self.desktop_error_logged { log("current virtual desktop unavailable; tiling suspended"); self.desktop_error_logged = true; }
             return;
         }
@@ -279,7 +310,7 @@ impl App {
         // system moved while the windows were hidden.
         let keys: Vec<SurfaceKey> = self.surfaces.keys().copied().filter(|k| dirty.contains(k) || k.desktop == cur).collect();
         for key in keys {
-            self.apply(key, false);
+            self.apply(key, force_all);
         }
     }
 
@@ -292,6 +323,7 @@ impl App {
             let vis = self.p.visible_rect(h);
             let was_placed = self.placed.get(&h).map(|p| p.target);
             if suspend_placement(self.p.is_maximized(h), self.p.is_fullscreen(h), was_placed, vis) || self.p.is_minimized(h) || self.p.is_hung(h) {
+                if let Some(placement) = self.placed.get_mut(&h) { placement.suspend(); }
                 continue;
             }
             if force {
@@ -407,7 +439,7 @@ impl App {
     }
 
     fn drag_desktop_valid(&self, desktop: u128) -> bool {
-        desktop != 0 && desktop == self.shown && self.desktop_on(desktop) && self.p.current_desktop() == desktop
+        valid_drag_desktop(desktop, self.shown, self.p.current_desktop(), self.desktop_on(desktop))
     }
 
     fn poll_drag_release(&mut self) {
@@ -416,8 +448,7 @@ impl App {
             else {
                 let down = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 };
                 let d = self.drag.as_mut().expect("drag was checked");
-                if down { d.released_since = None; }
-                else if d.released_since.get_or_insert_with(Instant::now).elapsed() >= Duration::from_millis(500) {
+                if released_for_timeout(&mut d.released_since, down, Instant::now()) {
                     let h = d.hwnd;
                     self.drag_end(h);
                 }
@@ -483,56 +514,13 @@ impl App {
 
     fn drag_tick(&mut self) {
         let Some(d) = &self.drag else { return };
-        let (h, start, home) = (d.hwnd, d.start, d.key);
+        let (h, home) = (d.hwnd, d.key);
         if !self.drag_desktop_valid(home.desktop) { self.cancel_drag(); return; }
-        if d.resize {
-            return;
-        }
-        if let Some(v) = self.p.visible_rect(h) && is_resize(start, v) {
-                if let Some(d) = &mut self.drag {
-                    d.resize = true;
-                }
-                self.hide_overlay();
-                return;
-        }
-        let Some((key, area, cx, cy)) = self.cursor_surface(self.shown) else { return };
-        let mut target = None;
-        let mut preview: Option<Vec<(Hwnd, Rect)>> = None;
-        match self.surfaces.get(&key) {
-            Some(s) => {
-                if let Some(side) = Self::edge_at(area, cx, cy) {
-                    preview = s.tree.preview_edge_layout(area, h, side);
-                    if preview.is_some() {
-                        target = Some((key, None, side));
-                    }
-                } else if let Some((t, r)) = s.tree.layout(area).into_iter().find(|(id, r)| *id != h && r.contains(cx, cy)) {
-                    let zone = zone_at(r, cx, cy);
-                    preview = if key == home { s.tree.preview_layout(area, h, t, zone) } else { s.tree.preview_insert_layout(area, h, t, zone) };
-                    if preview.is_some() {
-                        target = Some((key, Some(t), zone));
-                    }
-                }
-            }
-            None => {
-                // empty monitor: the window would fill it
-                preview = Some(vec![(h, area)]);
-                target = Some((key, None, DropZone::Center));
-            }
-        }
-        if let Some(d) = &mut self.drag {
-            d.target = target;
-        }
+        let visible = self.p.visible_rect(h);
+        let cursor = self.cursor_surface(self.shown);
+        let preview = update_drag(self.drag.as_mut().expect("drag was checked"), visible, cursor, &self.surfaces);
         match preview {
-            Some(mut l) => {
-                let mut bounds = area;
-                if key != home && let Some(source) = self.surfaces.get(&home) {
-                    let mut tree = source.tree.clone();
-                    tree.remove(h);
-                    l.extend(tree.layout(source.area));
-                    bounds = union(area, source.area);
-                }
-                self.show_overlay(bounds, &l, h);
-            }
+            Some((bounds, layout)) => self.show_overlay(bounds, &layout, h),
             None => self.hide_overlay(),
         }
     }
@@ -626,7 +614,7 @@ impl App {
     /// on it for the configured time. Does nothing while a menu, the Start menu, a dialog or any
     /// window we do not manage has the focus, while a mouse button is held, or while dragging.
     fn hover_tick(&mut self) {
-        if !self.cfg.focus_follows_mouse || !self.desktop_on(self.shown) || self.drag.is_some() || MENU_OPEN.with(Cell::get) {
+        if self.shown == 0 || !self.cfg.focus_follows_mouse || !self.desktop_on(self.shown) || self.drag.is_some() || MENU_OPEN.with(Cell::get) {
             self.hover = None;
             return;
         }
@@ -657,6 +645,7 @@ impl App {
             match self.hover {
                 Some((h, f, since)) if h == under && f == fg => {
                     if since.elapsed() >= Duration::from_millis(self.cfg.focus_delay_ms) {
+                        if self.p.current_desktop() != self.shown { self.hover = None; return; }
                         self.focus_window(under);
                         self.hover = Some((under, fg, Instant::now()));
                     }
@@ -701,9 +690,11 @@ impl App {
 
     fn tray_data(&self) -> NOTIFYICONDATAW {
         let mut nid = NOTIFYICONDATAW { cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32, hWnd: self.main, uID: 1, uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP, uCallbackMessage: WM_TRAY, ..Default::default() };
-        let on = self.desktop_on(self.shown);
+        let on = self.shown != 0 && self.desktop_on(self.shown);
         nid.hIcon = if on { self.icon_on } else { self.icon_off };
-        let tip = if on { "CosmicTile: ON for this desktop (click to turn off)" } else { "CosmicTile: OFF for this desktop (click to turn on)" };
+        let tip = if self.shown == 0 { "CosmicTile: paused (desktop identity unavailable)" }
+            else if on { "CosmicTile: ON for this desktop (click to turn off)" }
+            else { "CosmicTile: OFF for this desktop (click to turn on)" };
         for (i, c) in tip.encode_utf16().take(127).enumerate() {
             nid.szTip[i] = c;
         }
@@ -792,7 +783,11 @@ unsafe fn build_and_track_menu(cfg: &Config, main: HWND, on: bool) -> usize {
             }
             let label = if on { w!("Turn tiling off for this desktop") } else { w!("Turn tiling on for this desktop") };
             if let Err(e) = AppendMenuW(menu, MF_STRING, MENU_TOGGLE, label) { log(&format!("could not append tray menu item: {e}")); }
-            if let Err(e) = AppendMenuW(menu, MF_POPUP, focus_menu.0 as usize, w!("Focus follows mouse")) { log(&format!("could not append tray menu item: {e}")); }
+            if let Err(e) = AppendMenuW(menu, MF_POPUP, focus_menu.0 as usize, w!("Focus follows mouse")) {
+                // The parent owns the submenu only after a successful append.
+                let _ = DestroyMenu(focus_menu);
+                log(&format!("could not append tray menu item: {e}"));
+            }
             if let Err(e) = AppendMenuW(menu, MF_STRING, MENU_OPEN_CONFIG, w!("Open settings file")) { log(&format!("could not append tray menu item: {e}")); }
             if let Err(e) = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) { log(&format!("could not append tray menu item: {e}")); }
             if let Err(e) = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Exit CosmicTile")) { log(&format!("could not append tray menu item: {e}")); }
@@ -811,7 +806,7 @@ unsafe extern "system" fn win_event_proc(_h: HWINEVENTHOOK, event: u32, hwnd: HW
     }
     let main = MAIN_HANDLE.with(Cell::get);
     if !main.is_invalid() {
-        unsafe { if PostMessageW(Some(main), WM_EVENT, WPARAM(event as usize), LPARAM(hwnd.0 as isize)).is_err() { PENDING.with(|p| p.set(true)); } }
+        unsafe { if PostMessageW(Some(main), WM_EVENT, WPARAM(event as usize), LPARAM(hwnd.0 as isize)).is_err() { queue_pending(WM_EVENT); } }
     }
 }
 
@@ -863,6 +858,23 @@ fn paint_overlay(hwnd: HWND) {
     }
 }
 
+fn queue_pending(msg: u32) {
+    PENDING.with(|p| {
+        let mut pending = p.get();
+        pending.record(msg, TASKBAR_CREATED.with(Cell::get));
+        p.set(pending);
+    });
+}
+
+fn drain_pending(app: &mut App) {
+    let pending = PENDING.with(Cell::take);
+    if pending.tray { notify(NIM_ADD, &app.tray_data()); }
+    if pending.refresh { app.refresh_surfaces(); }
+    else { app.poll_tick(); }
+    // A deferred foreground event should also repair the accent on an unmanaged window.
+    app.on_focus(id_of(unsafe { GetForegroundWindow() }));
+}
+
 unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if msg == WM_QUERYENDSESSION { return LRESULT(1); }
     if msg == WM_ENDSESSION && wp.0 != 0 { restore_owned_snap(); unsafe { PostQuitMessage(0); } return LRESULT(0); }
@@ -870,7 +882,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
     if msg == WM_TRAY && lp.0 as u32 == WM_RBUTTONUP { show_menu(); return LRESULT(0); }
     let handled = APP.with(|a| {
         let Ok(mut guard) = a.try_borrow_mut() else {
-            if matches!(msg, WM_EVENT | WM_TIMER | WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_PENDING) { PENDING.with(|p| p.set(true)); }
+            queue_pending(msg);
             return false;
         };
         let Some(app) = guard.as_mut() else { return false };
@@ -899,10 +911,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 }
                 TIMER_DRAG => { app.drag_tick(); app.poll_drag_release(); },
                 TIMER_HOVER => app.hover_tick(),
-                TIMER_POLL => app.poll_tick(),
+                TIMER_POLL => { if PENDING.with(|p| p.get().any()) { drain_pending(app); } else { app.poll_tick(); } },
                 _ => {}
             },
-            WM_PENDING => app.poll_tick(),
+            WM_PENDING => drain_pending(app),
             WM_DISPLAYCHANGE | WM_SETTINGCHANGE => app.refresh_surfaces(),
             WM_HOTKEY => app.toggle(),
             WM_TRAY if lp.0 as u32 == WM_LBUTTONUP => app.toggle(),
@@ -910,7 +922,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }
         true
     });
-    if handled && PENDING.with(|p| p.replace(false)) {
+    if handled && PENDING.with(|p| p.get().any()) {
         unsafe { let _ = PostMessageW(Some(hwnd), WM_PENDING, WPARAM(0), LPARAM(0)); }
     }
     if handled {
@@ -951,6 +963,9 @@ pub fn run(filter: Option<String>) {
         let _ = SetLayeredWindowAttributes(overlay, COLORREF(0x00FF00FF), 200, LWA_COLORKEY | LWA_ALPHA);
 
         let platform = Platform::new();
+        let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
+        if taskbar_created == 0 { log("could not register TaskbarCreated message"); }
+        TASKBAR_CREATED.with(|id| id.set(taskbar_created));
         let app = App {
             p: platform,
             disabled: HashSet::new(),
@@ -965,7 +980,7 @@ pub fn run(filter: Option<String>) {
             focused: None,
             bordered: None,
             border_original: HashMap::new(),
-            taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
+            taskbar_created,
             drag: None,
             overlay,
             main,
@@ -1007,6 +1022,8 @@ pub fn run(filter: Option<String>) {
             DispatchMessageW(&msg);
         }
         for hook in hooks { let _ = UnhookWinEvent(hook); }
+        let _ = windows::Win32::UI::Input::KeyboardAndMouse::UnregisterHotKey(Some(main), HOTKEY_TOGGLE);
+        for timer in [TIMER_RECONCILE, TIMER_DRAG, TIMER_POLL, TIMER_HOVER] { let _ = KillTimer(Some(main), timer); }
         APP.with(|a| { if let Some(mut app) = a.borrow_mut().take() {
             app.shutdown();
             let _ = DestroyIcon(app.icon_on);
@@ -1024,8 +1041,55 @@ fn suspend_placement(maximized: bool, fullscreen: bool, placed: Option<Rect>, vi
     (maximized && placed.is_some()) || (fullscreen && !placed.zip(visible).map(|(p, v)| close(p, v)).unwrap_or(false))
 }
 
+/// Shared by timer updates and release: failed observations invalidate the previous target.
+fn update_drag(d: &mut Drag, visible: Option<Rect>, cursor: Option<(SurfaceKey, Rect, i32, i32)>, surfaces: &HashMap<SurfaceKey, Surface>) -> Option<(Rect, Vec<(Hwnd, Rect)>)> {
+    d.target = None;
+    let visible = visible?;
+    d.resize |= is_resize(d.start, visible);
+    if d.resize { return None; }
+    let (key, area, cx, cy) = cursor?;
+    let h = d.hwnd;
+    let (target, mut layout) = match surfaces.get(&key) {
+        Some(s) => {
+            if let Some(side) = App::edge_at(area, cx, cy) {
+                ((key, None, side), s.tree.preview_edge_layout(area, h, side)?)
+            } else {
+                let (target, rect) = s.tree.layout(area).into_iter().find(|(id, r)| *id != h && r.contains(cx, cy))?;
+                let zone = zone_at(rect, cx, cy);
+                let preview = if key == d.key { s.tree.preview_layout(area, h, target, zone) }
+                    else { s.tree.preview_insert_layout(area, h, target, zone) };
+                ((key, Some(target), zone), preview?)
+            }
+        }
+        None => ((key, None, DropZone::Center), vec![(h, area)]),
+    };
+    d.target = Some(target);
+    let mut bounds = area;
+    if key != d.key && let Some(source) = surfaces.get(&d.key) {
+        let mut tree = source.tree.clone();
+        tree.remove(h);
+        layout.extend(tree.layout(source.area));
+        bounds = union(area, source.area);
+    }
+    Some((bounds, layout))
+}
+
 fn target_in_tree(tree: Option<&Tree>, target: Option<Hwnd>) -> bool {
     target.map(|h| tree.is_some_and(|tree| tree.contains(h))).unwrap_or(true)
+}
+
+/// Paused trees keep their reserved layout but must not claim windows on an enabled desktop.
+fn find_enabled_surface(surfaces: &HashMap<SurfaceKey, Surface>, disabled: &HashSet<u128>, h: Hwnd) -> Option<SurfaceKey> {
+    surfaces.iter().find(|(key, surface)| !disabled.contains(&key.desktop) && surface.tree.contains(h)).map(|(key, _)| *key)
+}
+
+fn valid_drag_desktop(home: u128, shown: u128, current: u128, enabled: bool) -> bool {
+    home != 0 && home == shown && home == current && enabled
+}
+
+fn released_for_timeout(since: &mut Option<Instant>, down: bool, now: Instant) -> bool {
+    if down { *since = None; return false; }
+    now.saturating_duration_since(*since.get_or_insert(now)) >= Duration::from_millis(500)
 }
 
 fn is_resize(start: Rect, now: Rect) -> bool {
@@ -1044,6 +1108,106 @@ fn union(a: Rect, b: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn paused_layout_does_not_block_adoption_after_a_window_changes_desktop() {
+        let (drag, mut surfaces, area) = drag_fixture();
+        let home = drag.key;
+        let disabled = HashSet::from([home.desktop]);
+        surfaces.get_mut(&home).unwrap().tree.set_edge(area, drag.hwnd, Edge::Right, 700);
+        let reserved = surfaces[&home].tree.layout(area);
+        assert_eq!(find_enabled_surface(&surfaces, &disabled, drag.hwnd), None);
+        let new_key = SurfaceKey { desktop: 2, ..home };
+        let mut tree = Tree::new();
+        tree.add(drag.hwnd, area, None);
+        surfaces.insert(new_key, Surface { tree, area });
+        assert_eq!(find_enabled_surface(&surfaces, &disabled, drag.hwnd), Some(new_key));
+        assert_eq!(surfaces[&home].tree.layout(area), reserved);
+    }
+    #[test]
+    fn busy_callbacks_preserve_geometry_and_explorer_recovery_until_drained() {
+        let mut pending = PendingEvents::new();
+        pending.record(WM_DISPLAYCHANGE, 40000);
+        pending.record(WM_TIMER, 40000);
+        pending.record(40000, 40000);
+        pending.record(WM_EVENT, 40000);
+        assert!(pending.refresh && pending.reconcile && pending.tray);
+        let cell = Cell::new(pending);
+        let drained = cell.take();
+        assert!(drained.refresh && drained.tray);
+        assert!(!cell.get().any());
+        let mut next = cell.get();
+        next.record(WM_SETTINGCHANGE, 40000);
+        cell.set(next);
+        assert!(cell.get().refresh); // events arriving during drain belong to the next drain
+    }
+    #[test]
+    fn lost_drag_end_is_recovered_only_after_continuous_button_release() {
+        let now = Instant::now();
+        let mut since = None;
+        assert!(!released_for_timeout(&mut since, false, now));
+        assert!(!released_for_timeout(&mut since, false, now + Duration::from_millis(499)));
+        assert!(released_for_timeout(&mut since, false, now + Duration::from_millis(500)));
+        assert!(!released_for_timeout(&mut since, true, now + Duration::from_millis(501)));
+        assert!(since.is_none());
+        assert!(!released_for_timeout(&mut since, false, now + Duration::from_millis(600)));
+    }
+    #[test]
+    fn desktop_switch_unavailable_identity_or_pausing_invalidates_drag() {
+        assert!(valid_drag_desktop(1, 1, 1, true));
+        assert!(!valid_drag_desktop(1, 1, 2, true));
+        assert!(!valid_drag_desktop(1, 2, 2, true));
+        assert!(!valid_drag_desktop(1, 1, 0, true));
+        assert!(!valid_drag_desktop(0, 0, 0, true));
+        assert!(!valid_drag_desktop(1, 1, 1, false));
+    }
+    fn drag_fixture() -> (Drag, HashMap<SurfaceKey, Surface>, Rect) {
+        let area = Rect::new(0, 0, 1920, 1080);
+        let key = SurfaceKey { desktop: 1, monitor: 1 };
+        let mut tree = Tree::new();
+        tree.add(1, area, None);
+        tree.add(2, area, None);
+        let drag = Drag { hwnd: 1, key, start: tree.rect_of(area, 1).unwrap(), resize: false, released_since: None, target: None };
+        (drag, HashMap::from([(key, Surface { tree, area })]), area)
+    }
+    #[test]
+    fn release_without_a_timer_tick_uses_current_cursor_and_geometry() {
+        let (mut drag, surfaces, area) = drag_fixture();
+        let key = drag.key;
+        let start = drag.start;
+        let preview = update_drag(&mut drag, Some(start), Some((key, area, 1440, 540)), &surfaces).unwrap();
+        assert_eq!(drag.target, Some((key, Some(2), DropZone::Center)));
+        assert_eq!(preview.1.iter().find(|(id, _)| *id == 1).unwrap().1.x, 960);
+        // A final cursor movement replaces the old target before committing.
+        update_drag(&mut drag, Some(start), Some((key, area, 1440, 100)), &surfaces).unwrap();
+        assert_eq!(drag.target, Some((key, Some(2), DropZone::Top)));
+    }
+    #[test]
+    fn short_resize_and_failed_release_observations_clear_stale_targets() {
+        let (mut drag, surfaces, area) = drag_fixture();
+        let key = drag.key;
+        let start = drag.start;
+        update_drag(&mut drag, Some(start), Some((key, area, 1440, 540)), &surfaces).unwrap();
+        assert!(update_drag(&mut drag, Some(start), None, &surfaces).is_none());
+        assert!(drag.target.is_none());
+        update_drag(&mut drag, Some(start), Some((key, area, 1440, 540)), &surfaces).unwrap();
+        assert!(update_drag(&mut drag, None, Some((key, area, 1440, 540)), &surfaces).is_none());
+        assert!(drag.target.is_none());
+        let resized = Rect { w: start.w + 8, ..start };
+        assert!(update_drag(&mut drag, Some(resized), Some((key, area, 1440, 540)), &surfaces).is_none());
+        assert!(drag.resize);
+        assert!(drag.target.is_none());
+    }
+    #[test]
+    fn cross_monitor_preview_includes_the_reflowed_source() {
+        let (mut drag, surfaces, area) = drag_fixture();
+        let dest = SurfaceKey { monitor: 2, ..drag.key };
+        let dest_area = Rect::new(1920, 0, area.w, area.h);
+        let start = drag.start;
+        let (bounds, layout) = update_drag(&mut drag, Some(start), Some((dest, dest_area, 2500, 500)), &surfaces).unwrap();
+        assert_eq!(bounds, Rect::new(0, 0, 3840, 1080));
+        assert!(layout.contains(&(1, dest_area)));
+        assert!(layout.contains(&(2, area)));
+    }
     #[test]
     fn log_rotation_keeps_one_backup_and_caps_the_active_file() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("log-test-{}.log", std::process::id()));
@@ -1080,6 +1244,18 @@ mod tests {
         let refused = Rect::new(0, 0, 800, 500);
         assert!(!p.observe(Some(refused), Duration::from_millis(3000)));
         assert!(p.observe(Some(refused), Duration::from_millis(4500)));
+    }
+    #[test]
+    fn suspended_measurements_do_not_count_as_consecutive_eligible_polls() {
+        let target = Rect::new(0, 0, 600, 500);
+        let refused = Rect::new(0, 0, 800, 500);
+        let mut placement = Placement::new(target);
+        assert!(!placement.observe(Some(refused), Duration::from_secs(1)));
+        // A maximized, minimized or hung poll interrupts the measurement sequence.
+        placement.suspend();
+        assert!(!placement.observe(Some(refused), Duration::from_millis(100)));
+        assert!(!placement.observe(Some(refused), Duration::from_secs(1)));
+        assert!(placement.observe(Some(refused), Duration::from_secs(2)));
     }
     #[test]
     fn log_text_has_no_controls_and_titles_are_bounded() {
