@@ -204,6 +204,21 @@ impl Platform {
         }
     }
 
+    /// True for a window that covers its whole monitor including the taskbar area (F11 in a
+    /// browser, a video or a game in full screen). Such windows must be left alone.
+    pub fn is_fullscreen(&self, h: isize) -> bool {
+        let Some(v) = self.visible_rect(h) else { return false };
+        unsafe {
+            let m = MonitorFromWindow(hwnd_of(h), MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            if !GetMonitorInfoW(m, &mut mi).as_bool() {
+                return false;
+            }
+            let r = mi.rcMonitor;
+            v.x <= r.left && v.y <= r.top && v.right() >= r.right && v.bottom() >= r.bottom
+        }
+    }
+
     /// Moves a window so that its *visible* edges match `target`.
     pub fn place(&self, h: isize, target: Rect) {
         unsafe {

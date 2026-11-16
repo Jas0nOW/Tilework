@@ -236,6 +236,38 @@ impl Tree {
         true
     }
 
+    /// Complete layout after moving `dragged` next to `target` (None if that squeezes a window).
+    pub fn preview_layout(&self, area: Rect, dragged: Hwnd, target: Hwnd, zone: DropZone) -> Option<Vec<(Hwnd, Rect)>> {
+        let mut c = self.clone();
+        if !c.move_to(dragged, target, zone) || c.violations(area) > self.violations(area) {
+            return None;
+        }
+        Some(c.layout(area))
+    }
+
+    /// Complete layout after inserting a foreign window next to `target`.
+    pub fn preview_insert_layout(&self, area: Rect, added: Hwnd, target: Hwnd, zone: DropZone) -> Option<Vec<(Hwnd, Rect)>> {
+        let mut c = self.clone();
+        c.insert(added, target, zone);
+        if c.violations(area) > self.violations(area) {
+            return None;
+        }
+        Some(c.layout(area))
+    }
+
+    /// Complete layout after putting a window on an outer edge.
+    pub fn preview_edge_layout(&self, area: Rect, added: Hwnd, side: DropZone) -> Option<Vec<(Hwnd, Rect)>> {
+        let mut c = self.clone();
+        if c.contains(added) {
+            c.remove(added);
+        }
+        c.insert_edge(added, side);
+        if c.violations(area) > self.violations(area) {
+            return None;
+        }
+        Some(c.layout(area))
+    }
+
     /// Rectangle the window would get at the outer edge (None if that violates minimum sizes).
     pub fn preview_edge(&self, area: Rect, added: Hwnd, side: DropZone) -> Option<Rect> {
         let mut c = self.clone();
@@ -316,7 +348,7 @@ impl Tree {
     pub fn layout(&self, area: Rect) -> Vec<(Hwnd, Rect)> {
         let mut out = Vec::new();
         if let Some(n) = &self.root {
-            layout_node(n, area, &mut out);
+            layout_node(n, area, &mut out, &self.mins);
         }
         out
     }
@@ -340,8 +372,9 @@ impl Tree {
     /// Moves the divider that forms the given edge of a window (or of the whole zone the window
     /// is part of) to a new coordinate. Returns false for outer edges without a divider.
     pub fn set_edge(&mut self, area: Rect, h: Hwnd, edge: Edge, coordinate: i32) -> bool {
+        let mins = self.mins.clone();
         match &mut self.root {
-            Some(root) => matches!(set_edge_node(root, area, h, edge, coordinate), EdgeState::Done),
+            Some(root) => matches!(set_edge_node(root, area, h, edge, coordinate, &mins), EdgeState::Done),
             None => false,
         }
     }
@@ -509,25 +542,74 @@ fn equalize_node(n: &mut Node) {
     }
 }
 
+type Mins = HashMap<Hwnd, (i32, i32)>;
+
+fn leaf_min(mins: &Mins, h: Hwnd) -> (i32, i32) {
+    let (mw, mh) = mins.get(&h).copied().unwrap_or((0, 0));
+    (MIN_W.max(mw), MIN_H.max(mh))
+}
+
+/// Smallest (width, height) a node needs so that no window inside is squeezed below its minimum.
+fn min_size(n: &Node, mins: &Mins) -> (i32, i32) {
+    match n {
+        Node::Leaf(h) => leaf_min(mins, *h),
+        Node::Container { orient, children, .. } => {
+            let ms: Vec<(i32, i32)> = children.iter().map(|c| min_size(c, mins)).collect();
+            match orient {
+                Orientation::Horizontal => (ms.iter().map(|m| m.0).sum(), ms.iter().map(|m| m.1).max().unwrap_or(0)),
+                Orientation::Vertical => (ms.iter().map(|m| m.0).max().unwrap_or(0), ms.iter().map(|m| m.1).sum()),
+            }
+        }
+    }
+}
+
+/// Shares `total` between zones by weight, but never below a zone's minimum: zones that need
+/// more get exactly what they need, the others share the rest. If even the minimums do not fit,
+/// everybody is scaled down evenly.
+fn distribute(weights: &[f64], mins: &[i32], total: i32) -> Vec<f64> {
+    let n = weights.len();
+    let msum: i32 = mins.iter().sum();
+    if msum >= total {
+        return mins.iter().map(|m| total as f64 * *m as f64 / msum.max(1) as f64).collect();
+    }
+    let mut fixed = vec![false; n];
+    loop {
+        let fixed_sum: f64 = (0..n).filter(|i| fixed[*i]).map(|i| mins[i] as f64).sum();
+        let free = total as f64 - fixed_sum;
+        let wsum: f64 = (0..n).filter(|i| !fixed[*i]).map(|i| weights[i]).sum();
+        let mut changed = false;
+        for i in 0..n {
+            if !fixed[i] && free * weights[i] / wsum < mins[i] as f64 {
+                fixed[i] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            return (0..n).map(|i| if fixed[i] { mins[i] as f64 } else { free * weights[i] / wsum }).collect();
+        }
+    }
+}
+
 /// Pixel size of every zone along the container's axis; the last zone takes the rounding rest.
-fn zone_sizes(weights: &[f64], total: i32) -> Vec<i32> {
-    let sum: f64 = weights.iter().sum();
-    let mut sizes = Vec::with_capacity(weights.len());
+fn zone_sizes(weights: &[f64], mins: &[i32], total: i32) -> Vec<i32> {
+    let f = distribute(weights, mins, total);
+    let mut sizes = Vec::with_capacity(f.len());
     let mut used = 0;
     let mut acc = 0.0;
-    for (i, w) in weights.iter().enumerate() {
+    for (i, w) in f.iter().enumerate() {
         acc += w;
-        let end = if i + 1 == weights.len() { total } else { (total as f64 * acc / sum).round() as i32 };
+        let end = if i + 1 == f.len() { total } else { acc.round() as i32 };
         sizes.push(end - used);
         used = end;
     }
     sizes
 }
 
-fn child_rects(orient: Orientation, weights: &[f64], r: Rect) -> Vec<Rect> {
+fn child_rects(orient: Orientation, children: &[Node], weights: &[f64], r: Rect, mins: &Mins) -> Vec<Rect> {
     let total = if orient == Orientation::Horizontal { r.w } else { r.h };
+    let axis_mins: Vec<i32> = children.iter().map(|c| { let m = min_size(c, mins); if orient == Orientation::Horizontal { m.0 } else { m.1 } }).collect();
     let mut pos = 0;
-    zone_sizes(weights, total)
+    zone_sizes(weights, &axis_mins, total)
         .into_iter()
         .map(|s| {
             let cr = if orient == Orientation::Horizontal { Rect::new(r.x + pos, r.y, s, r.h) } else { Rect::new(r.x, r.y + pos, r.w, s) };
@@ -537,12 +619,12 @@ fn child_rects(orient: Orientation, weights: &[f64], r: Rect) -> Vec<Rect> {
         .collect()
 }
 
-fn layout_node(n: &Node, r: Rect, out: &mut Vec<(Hwnd, Rect)>) {
+fn layout_node(n: &Node, r: Rect, out: &mut Vec<(Hwnd, Rect)>, mins: &Mins) {
     match n {
         Node::Leaf(h) => out.push((*h, r)),
         Node::Container { orient, children, weights, .. } => {
-            for (c, cr) in children.iter().zip(child_rects(*orient, weights, r)) {
-                layout_node(c, cr, out);
+            for (c, cr) in children.iter().zip(child_rects(*orient, children, weights, r, mins)) {
+                layout_node(c, cr, out, mins);
             }
         }
     }
@@ -555,15 +637,15 @@ enum EdgeState {
     Done,
 }
 
-fn set_edge_node(n: &mut Node, r: Rect, h: Hwnd, edge: Edge, coord: i32) -> EdgeState {
+fn set_edge_node(n: &mut Node, r: Rect, h: Hwnd, edge: Edge, coord: i32, mins: &Mins) -> EdgeState {
     match n {
         Node::Leaf(id) => {
             if *id == h { EdgeState::Pending } else { EdgeState::NotHere }
         }
         Node::Container { orient, children, weights, auto } => {
-            let rects = child_rects(*orient, weights, r);
+            let rects = child_rects(*orient, children, weights, r, mins);
             for i in 0..children.len() {
-                match set_edge_node(&mut children[i], rects[i], h, edge, coord) {
+                match set_edge_node(&mut children[i], rects[i], h, edge, coord, mins) {
                     EdgeState::NotHere => continue,
                     EdgeState::Done => return EdgeState::Done,
                     EdgeState::Pending => {
@@ -760,9 +842,12 @@ mod tests {
         let mut t = tree_of(&[1, 2, 3, 4]);
         t.add(5, SCREEN, Some(1)); // 5 attaches to window 1 (full row -> nested)
         assert!(t.move_to(5, 3, DropZone::Left)); // row is full again after the move -> nested in 3's zone
-        assert_eq!(rect(&t, 1), Rect::new(0, 0, 480, 1080));
-        assert_eq!(rect(&t, 5), Rect::new(960, 0, 240, 1080));
-        assert_eq!(rect(&t, 3), Rect::new(1200, 0, 240, 1080));
+        // the nested pair needs 2 x 260 px, the other three columns share what is left
+        assert_eq!(rect(&t, 5).w, 260);
+        assert_eq!(rect(&t, 3).w, 260);
+        assert_eq!(rect(&t, 3).x, rect(&t, 5).right());
+        assert_eq!(rect(&t, 5).h, 1080);
+        assert!(rect(&t, 1).w > 440 && rect(&t, 1).w < 480);
     }
 
     #[test]
@@ -879,5 +964,35 @@ mod tests {
         let mut t = tree_of(&[1, 2]);
         t.add(2, SCREEN, None);
         assert_eq!(t.leaves().len(), 2);
+    }
+
+    #[test]
+    fn a_wide_window_gets_the_width_it_needs_and_the_others_share_the_rest() {
+        let mut t = tree_of(&[1, 2, 3, 4]);
+        t.mins.insert(2, (802, 0));
+        let r2 = rect(&t, 2);
+        assert_eq!(r2.w, 802);
+        let others: Vec<i32> = [1, 3, 4].iter().map(|id| rect(&t, *id).w).collect();
+        assert_eq!(others.iter().sum::<i32>() + 802, 1920);
+        assert!(others.iter().all(|w| (w - 372).abs() <= 1), "the others shrink evenly: {others:?}");
+        assert_eq!(t.violations(SCREEN), 0);
+    }
+
+    #[test]
+    fn a_tall_window_gets_its_height_inside_a_stack() {
+        let mut t = tree_of(&[1, 2, 3, 4, 5]);
+        t.mins.insert(5, (0, 700));
+        assert_eq!(rect(&t, 5).h, 700);
+        assert_eq!(rect(&t, 4).h, 380);
+    }
+
+    #[test]
+    fn previews_show_the_whole_resulting_layout() {
+        let t = tree_of(&[1, 2, 3, 4]);
+        let l = t.preview_layout(SCREEN, 4, 1, DropZone::Bottom).unwrap();
+        assert_eq!(l.len(), 4);
+        let get = |id: Hwnd| l.iter().find(|(i, _)| *i == id).unwrap().1;
+        assert_eq!(get(4), Rect::new(0, 540, 640, 540));
+        assert_eq!(get(2), Rect::new(640, 0, 640, 1080), "the neighbours grow into the freed space");
     }
 }

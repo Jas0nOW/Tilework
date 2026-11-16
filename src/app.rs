@@ -8,9 +8,9 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::io::Write;
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
-use windows::Win32::Graphics::Gdi::{CreateBitmap, CreateSolidBrush, DeleteObject, GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+use windows::Win32::Graphics::Gdi::{BeginPaint, CreateBitmap, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, MOD_NOREPEAT, MOD_WIN};
@@ -77,6 +77,8 @@ pub struct App {
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
+    /// What the drag overlay paints: the screen area and (rectangle, is the dragged window) pairs.
+    static OVERLAY: RefCell<(Rect, Vec<(Rect, bool)>)> = const { RefCell::new((Rect::new(0, 0, 0, 0), Vec::new())) };
 }
 
 pub fn log(msg: &str) {
@@ -150,7 +152,7 @@ impl App {
             .iter()
             .rev()
             .copied()
-            .filter(|&h| self.managed(h, cur))
+            .filter(|&h| self.managed(h, cur) && (!self.p.is_fullscreen(h) || self.surface_containing(h).is_some()))
             .map(|h| (h, self.p.surface_of(h)))
             .filter(|&(_, (k, _))| self.desktop_on(k.desktop))
             .collect();
@@ -209,8 +211,11 @@ impl App {
     fn apply(&mut self, key: SurfaceKey, force: bool) {
         let Some(s) = self.surfaces.get(&key) else { return };
         let layout = s.tree.layout(s.area);
-        let mut eject = Vec::new();
+        let mut learned = false;
         for (h, r) in layout {
+            if self.p.is_fullscreen(h) {
+                continue; // full screen stays full screen: never pull it back into its tile
+            }
             if force {
                 self.placed.remove(&h);
             }
@@ -222,6 +227,7 @@ impl App {
             if let Some((pr, pv)) = self.placed.get(&h) {
                 if *pr == r && *pv == vis {
                     // Same target, same result as last time: the window refuses this size.
+                    // Remember what it needs; the layout then gives it a zone of that size.
                     if let Some(v) = vis {
                         let old = self.mins.get(&h).copied().unwrap_or((0, 0));
                         let mut new = old;
@@ -233,8 +239,8 @@ impl App {
                         }
                         if new != old {
                             self.mins.insert(h, new);
-                            log(&format!("{h:x} {} insists on at least {}x{} (zone was {}x{})", self.p.title(h), new.0, new.1, r.w, r.h));
-                            eject.push(h);
+                            log(&format!("{h:x} {} needs at least {}x{} (zone was {}x{})", self.p.title(h), new.0, new.1, r.w, r.h));
+                            learned = true;
                         }
                     }
                     continue;
@@ -243,16 +249,33 @@ impl App {
             self.p.place(h, r);
             self.placed.insert(h, (r, self.p.visible_rect(h)));
         }
-        if !eject.is_empty() {
+        if learned {
+            for s in self.surfaces.values_mut() {
+                s.tree.mins = self.mins.clone();
+            }
+            // If the learned minimums do not fit the current arrangement, re-seat the demanding
+            // windows (biggest first) where they squeeze nobody.
+            let mins = &self.mins;
             if let Some(s) = self.surfaces.get_mut(&key) {
-                for h in eject {
-                    s.tree.remove(h);
-                    self.placed.remove(&h);
+                let area = s.area;
+                if s.tree.violations(area) > 0 {
+                    let mut movers: Vec<Hwnd> = s.tree.leaves().into_iter().filter(|h| mins.contains_key(h)).collect();
+                    movers.sort_by_key(|h| std::cmp::Reverse(mins[h].0 as i64 * 2000 + mins[h].1 as i64 * 1000));
+                    for h in movers {
+                        let before = s.tree.violations(area);
+                        let mut c = s.tree.clone();
+                        c.remove(h);
+                        if c.add(h, area, None) && c.violations(area) < before {
+                            s.tree = c;
+                            log(&format!("re-seated {h:x} to respect minimum sizes"));
+                        }
+                        if s.tree.violations(area) == 0 {
+                            break;
+                        }
+                    }
                 }
             }
-            unsafe {
-                SetTimer(Some(self.main), TIMER_RECONCILE, 80, None);
-            }
+            self.apply(key, false);
         }
     }
 
@@ -360,17 +383,17 @@ impl App {
         }
         let Some((key, area, cx, cy)) = self.cursor_surface(home.desktop) else { return };
         let mut target = None;
-        let mut preview = None;
+        let mut preview: Option<Vec<(Hwnd, Rect)>> = None;
         match self.surfaces.get(&key) {
             Some(s) => {
                 if let Some(side) = Self::edge_at(area, cx, cy) {
-                    preview = s.tree.preview_edge(area, h, side);
+                    preview = s.tree.preview_edge_layout(area, h, side);
                     if preview.is_some() {
                         target = Some((key, None, side));
                     }
                 } else if let Some((t, r)) = s.tree.layout(area).into_iter().find(|(id, r)| *id != h && r.contains(cx, cy)) {
                     let zone = zone_at(r, cx, cy);
-                    preview = if key == home { s.tree.preview(area, h, t, zone) } else { s.tree.preview_insert(area, h, t, zone) };
+                    preview = if key == home { s.tree.preview_layout(area, h, t, zone) } else { s.tree.preview_insert_layout(area, h, t, zone) };
                     if preview.is_some() {
                         target = Some((key, Some(t), zone));
                     }
@@ -378,7 +401,7 @@ impl App {
             }
             None => {
                 // empty monitor: the window would fill it
-                preview = Some(area);
+                preview = Some(vec![(h, area)]);
                 target = Some((key, None, DropZone::Center));
             }
         }
@@ -386,7 +409,7 @@ impl App {
             d.target = target;
         }
         match preview {
-            Some(r) => self.show_overlay(r),
+            Some(l) => self.show_overlay(area, &l, h),
             None => self.hide_overlay(),
         }
     }
@@ -459,9 +482,24 @@ impl App {
 
     // ---------- overlay & tray ----------
 
-    fn show_overlay(&self, r: Rect) {
+    /// Shows the complete layout that a drop would produce: every window as a thin frame, the
+    /// dragged window highlighted. That way it is clear what happens to the neighbours too.
+    fn show_overlay(&self, area: Rect, layout: &[(Hwnd, Rect)], dragged: Hwnd) {
+        let items: Vec<(Rect, bool)> = layout.iter().map(|(h, r)| (*r, *h == dragged)).collect();
+        let changed = OVERLAY.with(|o| {
+            let mut o = o.borrow_mut();
+            if o.0 == area && o.1 == items {
+                false
+            } else {
+                *o = (area, items);
+                true
+            }
+        });
         unsafe {
-            let _ = SetWindowPos(self.overlay, Some(HWND_TOPMOST), r.x, r.y, r.w, r.h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            let _ = SetWindowPos(self.overlay, Some(HWND_TOPMOST), area.x, area.y, area.w, area.h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            if changed {
+                let _ = InvalidateRect(Some(self.overlay), None, true);
+            }
         }
     }
 
@@ -536,7 +574,51 @@ unsafe extern "system" fn win_event_proc(_h: HWINEVENTHOOK, event: u32, hwnd: HW
 }
 
 unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+    match msg {
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => {
+            paint_overlay(hwnd);
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    }
+}
+
+fn paint_overlay(hwnd: HWND) {
+    unsafe {
+        let mut ps = PAINTSTRUCT::default();
+        let hdc = BeginPaint(hwnd, &mut ps);
+        let mut rc = RECT::default();
+        let _ = GetClientRect(hwnd, &mut rc);
+        let key = CreateSolidBrush(COLORREF(0x00FF00FF)); // transparent colour key
+        let fill = CreateSolidBrush(COLORREF(ACCENT));
+        let grey = CreateSolidBrush(COLORREF(0x00E0E0E0));
+        let white = CreateSolidBrush(COLORREF(0x00FFFFFF));
+        FillRect(hdc, &rc, key);
+        OVERLAY.with(|o| {
+            let (origin, items) = &*o.borrow();
+            for (r, highlight) in items {
+                let inner = RECT { left: r.x - origin.x + 3, top: r.y - origin.y + 3, right: r.right() - origin.x - 3, bottom: r.bottom() - origin.y - 3 };
+                if *highlight {
+                    FillRect(hdc, &inner, fill);
+                }
+                let t = 3;
+                let line = if *highlight { white } else { grey };
+                for strip in [
+                    RECT { bottom: inner.top + t, ..inner },
+                    RECT { top: inner.bottom - t, ..inner },
+                    RECT { right: inner.left + t, ..inner },
+                    RECT { left: inner.right - t, ..inner },
+                ] {
+                    FillRect(hdc, &strip, line);
+                }
+            }
+        });
+        for b in [key, fill, grey, white] {
+            let _ = DeleteObject(b.into());
+        }
+        let _ = EndPaint(hwnd, &ps);
+    }
 }
 
 unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -613,7 +695,7 @@ pub fn run(filter: Option<String>) {
             None,
         )
         .unwrap();
-        let _ = SetLayeredWindowAttributes(overlay, COLORREF(0), 110, LWA_ALPHA);
+        let _ = SetLayeredWindowAttributes(overlay, COLORREF(0x00FF00FF), 200, LWA_COLORKEY | LWA_ALPHA);
 
         let platform = Platform::new();
         let app = App {
