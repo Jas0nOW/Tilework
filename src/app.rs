@@ -87,6 +87,8 @@ struct Drag {
     released_since: Option<Instant>,
     /// (surface, window under the cursor or None for an outer edge / empty monitor, zone)
     target: Option<(SurfaceKey, Option<Hwnd>, DropZone)>,
+    /// The last chosen target and where the cursor was when it was chosen (hysteresis against flicker).
+    last: Option<(DropTarget, (i32, i32))>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -552,7 +554,7 @@ impl<P: Win> App<P> {
         let move_only = self.p.is_maximized(h);
         let v = if move_only { self.surfaces[&key].tree.rect_of(self.surfaces[&key].area, h).unwrap_or(v) } else { v };
         log(&format!("drag start {h:x}"));
-        self.drag = Some(Drag { hwnd: h, key, start: v, resize: false, move_only, intent: self.p.resize_intent(h), dpi: self.p.dpi(h), monitor_changed: false, released_since: None, target: None });
+        self.drag = Some(Drag { hwnd: h, key, start: v, resize: false, move_only, intent: self.p.resize_intent(h), dpi: self.p.dpi(h), monitor_changed: false, released_since: None, target: None, last: None });
         set_timer(self.main, TIMER_DRAG, 30);
     }
 
@@ -1172,28 +1174,60 @@ fn suspend_placement(maximized: bool, fullscreen: bool, placed: Option<Rect>, vi
 }
 
 /// Shared by timer updates and release: failed observations invalidate the previous target.
+/// Cursor jitter within this many pixels of where a drop target was chosen does not change it.
+const STICKY_PX: i32 = 14;
+
+type DropTarget = (SurfaceKey, Option<Hwnd>, DropZone);
+
+fn preview_of(surfaces: &HashMap<SurfaceKey, Surface>, d: &Drag, area: Rect, target: DropTarget) -> Option<Vec<(Hwnd, Rect)>> {
+    let (key, over, zone) = target;
+    let h = d.hwnd;
+    match (surfaces.get(&key), over) {
+        (Some(s), None) => s.tree.preview_edge_layout(area, h, zone),
+        (Some(s), Some(t)) if key == d.key => s.tree.preview_layout(area, h, t, zone),
+        (Some(s), Some(t)) => s.tree.preview_insert_layout(area, h, t, zone),
+        (None, _) => Some(vec![(h, area)]),
+    }
+}
+
 fn update_drag(d: &mut Drag, visible: Option<Rect>, cursor: Option<(SurfaceKey, Rect, i32, i32)>, surfaces: &HashMap<SurfaceKey, Surface>) -> Option<(Rect, Vec<(Hwnd, Rect)>)> {
     d.target = None;
     let visible = visible?;
-    d.resize = !d.move_only && !d.monitor_changed && d.intent.unwrap_or_else(|| is_resize(d.start, visible));
+    // Move or resize is decided by what the window does and then kept for the whole drag: a resize
+    // that comes back to its start edge must not turn into a move (and a drop) half way.
+    if d.move_only || d.monitor_changed {
+        d.resize = false;
+    } else {
+        d.resize |= d.intent == Some(true) || is_resize(d.start, visible);
+    }
     if d.resize { return None; }
     let (key, area, cx, cy) = cursor?;
     let h = d.hwnd;
-    let (target, mut layout) = match surfaces.get(&key) {
+    let candidate: DropTarget = match surfaces.get(&key) {
         Some(s) => {
             if let Some(side) = App::<Platform>::edge_at(area, cx, cy) {
-                ((key, None, side), s.tree.preview_edge_layout(area, h, side)?)
+                (key, None, side)
             } else {
                 let (target, rect) = s.tree.layout(area).into_iter().find(|(id, r)| *id != h && r.contains(cx, cy))?;
-                let zone = zone_at(rect, cx, cy);
-                let preview = if key == d.key { s.tree.preview_layout(area, h, target, zone) }
-                    else { s.tree.preview_insert_layout(area, h, target, zone) };
-                ((key, Some(target), zone), preview?)
+                (key, Some(target), zone_at(rect, cx, cy))
             }
         }
-        None => ((key, None, DropZone::Center), vec![(h, area)]),
+        None => (key, None, DropZone::Center),
     };
-    d.target = Some(target);
+    // On the border between two zones the cursor jitters between two targets; keep the previous one
+    // until the cursor has clearly left the spot where it was chosen.
+    let (chosen, layout) = match d.last {
+        Some((prev, (px, py))) if prev != candidate && prev.0 == key && (cx - px).abs() <= STICKY_PX && (cy - py).abs() <= STICKY_PX => {
+            match preview_of(surfaces, d, area, prev) {
+                Some(layout) => (prev, layout),
+                None => (candidate, preview_of(surfaces, d, area, candidate)?),
+            }
+        }
+        _ => (candidate, preview_of(surfaces, d, area, candidate)?),
+    };
+    if d.last.map(|(t, _)| t) != Some(chosen) { d.last = Some((chosen, (cx, cy))); }
+    let mut layout = layout;
+    d.target = Some(chosen);
     let mut bounds = area;
     if key != d.key && let Some(source) = surfaces.get(&d.key) {
         let mut tree = source.tree.clone();
@@ -1284,9 +1318,36 @@ mod tests {
         let mut tree = Tree::new();
         tree.add(1, area, None);
         tree.add(2, area, None);
-        let drag = Drag { hwnd: 1, key, start: tree.rect_of(area, 1).unwrap(), resize: false, move_only: false, intent: None, dpi: 96, monitor_changed: false, released_since: None, target: None };
+        let drag = Drag { hwnd: 1, key, start: tree.rect_of(area, 1).unwrap(), resize: false, move_only: false, intent: None, dpi: 96, monitor_changed: false, released_since: None, target: None, last: None };
         (drag, HashMap::from([(key, Surface { tree, area })]), area)
     }
+    #[test]
+    fn target_does_not_flicker_on_a_zone_border() {
+        let (mut drag, surfaces, area) = drag_fixture();
+        let key = drag.key;
+        let start = drag.start;
+        // Window 2 fills the right half; x=1440,y=540 is its centre. Move to its left-edge zone and jitter.
+        update_drag(&mut drag, Some(start), Some((key, area, 1440, 540)), &surfaces).unwrap();
+        let first = drag.target;
+        for dx in [-6, 6, -10, 8, -4] {
+            update_drag(&mut drag, Some(start), Some((key, area, 1440 + dx, 540 + dx)), &surfaces).unwrap();
+            assert_eq!(drag.target, first, "small jitter must keep the chosen target");
+        }
+    }
+
+    #[test]
+    fn a_resize_stays_a_resize_when_it_returns_to_the_start_edge() {
+        let (mut drag, surfaces, area) = drag_fixture();
+        let key = drag.key;
+        let start = drag.start;
+        let grown = Rect::new(start.x, start.y - 80, start.w, start.h + 80);
+        assert!(update_drag(&mut drag, Some(grown), Some((key, area, 1440, 540)), &surfaces).is_none());
+        assert!(drag.resize);
+        // Back at the original size: still a resize, so no move preview and no drop target appears.
+        assert!(update_drag(&mut drag, Some(start), Some((key, area, 1440, 540)), &surfaces).is_none());
+        assert!(drag.resize && drag.target.is_none());
+    }
+
     #[test]
     fn release_without_a_timer_tick_uses_current_cursor_and_geometry() {
         let (mut drag, surfaces, area) = drag_fixture();
