@@ -29,8 +29,9 @@ fn dump() {
     let p = Platform::new();
     let mut trees: HashMap<platform::SurfaceKey, (Tree, tree::Rect)> = HashMap::new();
     let mut ignored = Vec::new();
+    let cur = p.current_desktop();
     for h in p.all_top_level().into_iter().rev() {
-        if p.is_manageable(h) {
+        if p.is_manageable(h, cur) {
             let (key, area) = p.surface_of(h);
             let e = trees.entry(key).or_insert_with(|| (Tree::new(), area));
             e.0.add(h, area, None);

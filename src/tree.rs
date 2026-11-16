@@ -6,7 +6,11 @@
 //! other windows keep their place. Zone sizes stay equal until the user resizes them.
 
 pub const MAX_ZONES: usize = 4;
-const MIN_ZONE_PX: i32 = 80;
+/// Smallest zone a window may get: enough of the title bar stays free to grab and move it.
+pub const MIN_W: i32 = 260;
+pub const MIN_H: i32 = 160;
+
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rect {
@@ -72,11 +76,32 @@ pub enum Node {
 #[derive(Clone, Debug, Default)]
 pub struct Tree {
     root: Option<Node>,
+    /// Minimum size some windows insist on (learned at runtime); used for placement checks.
+    pub mins: HashMap<Hwnd, (i32, i32)>,
+}
+
+/// Where an automatically placed window goes.
+#[derive(Clone, Copy, Debug)]
+enum Cand {
+    Around(Hwnd, DropZone),
+    /// A new full-length column at this index of a horizontal root.
+    Column(usize),
 }
 
 impl Tree {
     pub fn new() -> Self {
-        Self { root: None }
+        Self { root: None, mins: HashMap::new() }
+    }
+
+    /// Number of windows whose zone is smaller than allowed.
+    pub fn violations(&self, area: Rect) -> usize {
+        self.layout(area)
+            .iter()
+            .filter(|(h, r)| {
+                let (mw, mh) = self.mins.get(h).copied().unwrap_or((0, 0));
+                r.w < MIN_W.max(mw) || r.h < MIN_H.max(mh)
+            })
+            .count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -95,28 +120,121 @@ impl Tree {
         self.leaves().contains(&h)
     }
 
-    /// Adds a window next to the focused window (or the largest one), along its longer side.
-    pub fn add(&mut self, h: Hwnd, area: Rect, focused: Option<Hwnd>) {
+    /// Adds a window automatically: new columns first (up to 4), then at most 2 windows per
+    /// column. Anything else (a third window in a column, a bigger split) is up to the user via
+    /// drag & drop. Returns false when the window fits nowhere without violating minimum sizes.
+    pub fn add(&mut self, h: Hwnd, area: Rect, focused: Option<Hwnd>) -> bool {
         if self.contains(h) {
-            return;
+            return true;
         }
         if self.root.is_none() {
             self.root = Some(Node::Leaf(h));
-            return;
+            return true;
         }
-        let layout = self.layout(area);
-        let target = focused
-            .filter(|f| self.contains(*f))
-            .or_else(|| layout.iter().max_by_key(|(_, r)| r.w as i64 * r.h as i64).map(|(id, _)| *id))
-            .expect("tree is not empty");
-        let r = layout.iter().find(|(id, _)| *id == target).map(|(_, r)| *r).unwrap();
-        let zone = match self.root.as_ref().and_then(|n| parent_row(n, target)) {
-            Some((Orientation::Horizontal, n)) if n < MAX_ZONES => DropZone::Right,
-            Some((Orientation::Vertical, n)) if n < MAX_ZONES => DropZone::Bottom,
-            _ if r.w >= r.h => DropZone::Right,
-            _ => DropZone::Bottom,
+        let base = self.violations(area);
+        let leaves = self.leaves();
+        let focus = focused.filter(|f| leaves.contains(f)).or_else(|| leaves.last().copied()).expect("tree is not empty");
+        let mut cands: Vec<Cand> = self.auto_candidate(focus).into_iter().collect();
+        let mut order = leaves;
+        order.sort_by_key(|l| *l != focus);
+        for t in order {
+            for z in [DropZone::Right, DropZone::Bottom, DropZone::Left, DropZone::Top] {
+                cands.push(Cand::Around(t, z));
+            }
+        }
+        for c in cands {
+            let mut t = self.clone();
+            t.apply_cand(h, c);
+            if t.violations(area) <= base {
+                *self = t;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn auto_candidate(&self, focus: Hwnd) -> Option<Cand> {
+        match self.root.as_ref()? {
+            Node::Leaf(l) => Some(Cand::Around(*l, DropZone::Right)),
+            Node::Container { orient: Orientation::Horizontal, children, .. } => {
+                let n = children.len();
+                let fi = children.iter().position(|c| has(c, focus)).unwrap_or(n - 1);
+                if n < MAX_ZONES {
+                    return Some(Cand::Column(fi + 1));
+                }
+                (0..n).map(|k| (fi + k) % n).find_map(|i| match &children[i] {
+                    Node::Leaf(l) => Some(Cand::Around(*l, DropZone::Bottom)),
+                    _ => None,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn apply_cand(&mut self, h: Hwnd, c: Cand) {
+        match c {
+            Cand::Around(t, z) => self.insert_around(t, h, z),
+            Cand::Column(i) => {
+                if let Some(Node::Container { children, weights, auto, .. }) = &mut self.root {
+                    let i = i.min(children.len());
+                    let avg = weights.iter().sum::<f64>() / weights.len() as f64;
+                    children.insert(i, Node::Leaf(h));
+                    weights.insert(i, avg);
+                    if *auto {
+                        *weights = equal(children.len());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Adds a window as a new full-length zone along one outer edge of the screen.
+    pub fn insert_edge(&mut self, added: Hwnd, side: DropZone) {
+        let orient = if matches!(side, DropZone::Left | DropZone::Right) { Orientation::Horizontal } else { Orientation::Vertical };
+        let first = matches!(side, DropZone::Left | DropZone::Top);
+        let Some(root) = self.root.take() else {
+            self.root = Some(Node::Leaf(added));
+            return;
         };
-        self.insert_around(target, h, zone);
+        self.root = Some(match root {
+            Node::Container { orient: o, mut children, mut weights, auto } if o == orient && children.len() < MAX_ZONES => {
+                let avg = weights.iter().sum::<f64>() / weights.len() as f64;
+                let at = if first { 0 } else { children.len() };
+                children.insert(at, Node::Leaf(added));
+                weights.insert(at, avg);
+                if auto {
+                    weights = equal(children.len());
+                }
+                Node::Container { orient, children, weights, auto }
+            }
+            other => {
+                let pair = if first { vec![Node::Leaf(added), other] } else { vec![other, Node::Leaf(added)] };
+                Node::Container { orient, children: pair, weights: equal(2), auto: true }
+            }
+        });
+    }
+
+    /// Moves a window of this tree to an outer edge of the screen.
+    pub fn move_edge(&mut self, dragged: Hwnd, side: DropZone) -> bool {
+        if !self.contains(dragged) {
+            return false;
+        }
+        self.remove(dragged);
+        self.insert_edge(dragged, side);
+        true
+    }
+
+    /// Rectangle the window would get at the outer edge (None if that violates minimum sizes).
+    pub fn preview_edge(&self, area: Rect, added: Hwnd, side: DropZone) -> Option<Rect> {
+        let mut c = self.clone();
+        if c.contains(added) {
+            c.remove(added);
+        }
+        c.insert_edge(added, side);
+        if c.violations(area) > self.violations(area) {
+            return None;
+        }
+        c.rect_of(area, added)
     }
 
     /// Removes a window; the freed space goes to its neighbours.
@@ -170,6 +288,9 @@ impl Tree {
     pub fn preview_insert(&self, area: Rect, added: Hwnd, target: Hwnd, zone: DropZone) -> Option<Rect> {
         let mut c = self.clone();
         c.insert(added, target, zone);
+        if c.violations(area) > self.violations(area) {
+            return None;
+        }
         c.rect_of(area, added)
     }
 
@@ -196,6 +317,9 @@ impl Tree {
     pub fn preview(&self, area: Rect, dragged: Hwnd, target: Hwnd, zone: DropZone) -> Option<Rect> {
         let mut c = self.clone();
         if !c.move_to(dragged, target, zone) {
+            return None;
+        }
+        if c.violations(area) > self.violations(area) {
             return None;
         }
         c.rect_of(area, dragged)
@@ -247,6 +371,12 @@ fn parent_row(n: &Node, h: Hwnd) -> Option<(Orientation, usize)> {
         return children.iter().find_map(|c| parent_row(c, h));
     }
     None
+}
+
+fn has(n: &Node, h: Hwnd) -> bool {
+    let mut v = Vec::new();
+    collect(n, &mut v);
+    v.contains(&h)
 }
 
 fn collect(n: &Node, out: &mut Vec<Hwnd>) {
@@ -435,14 +565,13 @@ fn set_edge_node(n: &mut Node, r: Rect, h: Hwnd, edge: Edge, coord: i32) -> Edge
                             Edge::Left | Edge::Top if i > 0 => i - 1,
                             _ => return EdgeState::Pending,
                         };
-                        let (start, total) = if horizontal_edge { (rects[d].x, r.w) } else { (rects[d].y, r.h) };
+                        let start = if horizontal_edge { rects[d].x } else { rects[d].y };
                         let pair = if horizontal_edge { rects[d].w + rects[d + 1].w } else { rects[d].h + rects[d + 1].h };
-                        let min = MIN_ZONE_PX.min(pair / 2);
+                        let min = (if horizontal_edge { MIN_W } else { MIN_H }).min(pair / 2);
                         let left = (coord - start).clamp(min, pair - min);
                         let mut px: Vec<f64> = rects.iter().map(|rc| if horizontal_edge { rc.w as f64 } else { rc.h as f64 }).collect();
                         px[d] = left as f64;
                         px[d + 1] = (pair - left) as f64;
-                        let _ = total;
                         *weights = px;
                         *auto = false;
                         return EdgeState::Done;
@@ -514,12 +643,47 @@ mod tests {
     }
 
     #[test]
-    fn sixth_window_becomes_a_third_zone_below_window_four() {
+    fn sixth_window_goes_below_the_first_column_not_into_a_third_row() {
         let t = tree_of(&[1, 2, 3, 4, 5, 6]);
-        assert_eq!(rect(&t, 1), Rect::new(0, 0, 480, 1080));
-        assert_eq!(rect(&t, 4), Rect::new(1440, 0, 480, 360));
-        assert_eq!(rect(&t, 5), Rect::new(1440, 360, 480, 360));
-        assert_eq!(rect(&t, 6), Rect::new(1440, 720, 480, 360));
+        assert_eq!(rect(&t, 1), Rect::new(0, 0, 480, 540));
+        assert_eq!(rect(&t, 6), Rect::new(0, 540, 480, 540));
+        assert_eq!(rect(&t, 4), Rect::new(1440, 0, 480, 540));
+        assert_eq!(rect(&t, 5), Rect::new(1440, 540, 480, 540));
+    }
+
+    #[test]
+    fn few_windows_use_the_whole_screen() {
+        let t = tree_of(&[1, 2, 3]);
+        for id in [1, 2, 3] {
+            assert_eq!(rect(&t, id).h, 1080);
+        }
+    }
+
+    #[test]
+    fn dropping_on_the_outer_edge_creates_a_full_length_zone() {
+        let mut t = tree_of(&[1, 2, 3, 4, 5]); // 4 columns, 4 and 5 stacked
+        assert!(t.move_edge(5, DropZone::Bottom));
+        let r = rect(&t, 5);
+        assert_eq!((r.x, r.w, r.bottom()), (0, 1920, 1080), "full width strip along the bottom");
+        assert_eq!(rect(&t, 4).h, rect(&t, 1).h, "the other windows share the rest evenly");
+    }
+
+    #[test]
+    fn a_window_that_does_not_fit_is_rejected_instead_of_squeezed() {
+        let mut t = tree_of(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        t.mins.insert(9, (1000, 0)); // needs 1000 px, no zone is that wide
+        assert!(!t.add(9, SCREEN, Some(8)));
+        assert_eq!(t.leaves().len(), 8);
+        assert_eq!(t.violations(SCREEN), 0);
+    }
+
+    #[test]
+    fn a_wide_window_finds_a_zone_that_is_big_enough() {
+        let mut t = tree_of(&[1, 2]);
+        t.mins.insert(3, (700, 0));
+        assert!(t.add(3, SCREEN, Some(2)));
+        assert!(rect(&t, 3).w >= 700 || t.violations(SCREEN) == 0);
+        assert_eq!(t.violations(SCREEN), 0);
     }
 
     #[test]
@@ -603,7 +767,7 @@ mod tests {
         let t = tree_of(&[1, 2, 3, 4, 5]);
         for target in [1, 3, 4] {
             for zone in [DropZone::Left, DropZone::Right, DropZone::Top, DropZone::Bottom, DropZone::Center] {
-                let predicted = t.preview(SCREEN, 5, target, zone).unwrap();
+                let Some(predicted) = t.preview(SCREEN, 5, target, zone) else { continue }; // too small -> refused
                 let mut real = t.clone();
                 real.move_to(5, target, zone);
                 assert_eq!(predicted, rect(&real, 5), "target {target} zone {zone:?}");
@@ -658,18 +822,20 @@ mod tests {
 
     #[test]
     fn dragging_the_divider_of_a_whole_zone_moves_it_for_all_windows_in_it() {
-        let mut t = tree_of(&[1, 2, 3, 4, 5, 6]); // right-most zone holds 4, 5, 6 stacked
-        assert!(t.set_edge(SCREEN, 5, Edge::Left, 1200)); // left edge of a window inside the stack
+        let mut t = tree_of(&[1, 2, 3, 4, 5]);
+        t.insert(6, 5, DropZone::Bottom); // right-most zone holds 4, 5, 6 stacked
+        assert!(t.set_edge(SCREEN, 5, Edge::Left, 1250)); // left edge of a window inside the stack
         for id in [4, 5, 6] {
-            assert_eq!(rect(&t, id).x, 1200);
-            assert_eq!(rect(&t, id).w, 720);
+            assert_eq!(rect(&t, id).x, 1250);
+            assert_eq!(rect(&t, id).w, 670);
         }
-        assert_eq!(rect(&t, 3), Rect::new(960, 0, 240, 1080));
+        assert_eq!(rect(&t, 3), Rect::new(960, 0, 290, 1080));
     }
 
     #[test]
     fn inner_dividers_only_move_inside_their_own_zone() {
-        let mut t = tree_of(&[1, 2, 3, 4, 5, 6]);
+        let mut t = tree_of(&[1, 2, 3, 4, 5]);
+        t.insert(6, 5, DropZone::Bottom);
         assert!(t.set_edge(SCREEN, 4, Edge::Bottom, 200));
         assert_eq!(rect(&t, 4).h, 200);
         assert_eq!(rect(&t, 5).y, 200);
@@ -678,13 +844,13 @@ mod tests {
     }
 
     #[test]
-    fn zones_stay_equal_until_resized_then_new_windows_only_split_the_target() {
+    fn custom_sizes_are_kept_proportionally_when_a_window_is_added() {
         let mut t = tree_of(&[1, 2]);
         t.set_edge(SCREEN, 1, Edge::Right, 600);
-        t.add(3, SCREEN, Some(2)); // 2 is 1320 wide -> 3 attaches to the right, splitting only 2's zone
-        assert_eq!(rect(&t, 1), Rect::new(0, 0, 600, 1080), "custom size is kept");
-        assert_eq!(rect(&t, 2), Rect::new(600, 0, 660, 1080));
-        assert_eq!(rect(&t, 3), Rect::new(1260, 0, 660, 1080));
+        t.add(3, SCREEN, Some(2));
+        assert_eq!(rect(&t, 1), Rect::new(0, 0, 400, 1080));
+        assert_eq!(rect(&t, 2), Rect::new(400, 0, 880, 1080));
+        assert_eq!(rect(&t, 3), Rect::new(1280, 0, 640, 1080));
     }
 
     #[test]

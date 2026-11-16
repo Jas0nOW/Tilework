@@ -28,6 +28,12 @@ const MENU_EXIT: usize = 2;
 const ACCENT: u32 = 0x00FF823C; // BGR: a clear blue
 const DWMWA_BORDER_COLOR: DWMWINDOWATTRIBUTE = DWMWINDOWATTRIBUTE(34);
 const COLOR_DEFAULT: u32 = 0xFFFF_FFFF;
+/// Cursor distance from the screen border that counts as "drop at the outer edge".
+const EDGE_PX: i32 = 36;
+
+fn close(a: Rect, b: Rect) -> bool {
+    (a.x - b.x).abs() <= 1 && (a.y - b.y).abs() <= 1 && (a.w - b.w).abs() <= 1 && (a.h - b.h).abs() <= 1
+}
 
 struct Surface {
     tree: Tree,
@@ -40,12 +46,22 @@ struct Drag {
     w0: i32,
     h0: i32,
     resize: bool,
-    target: Option<(SurfaceKey, Hwnd, DropZone)>,
+    /// (surface, window under the cursor or None for an outer edge / empty monitor, zone)
+    target: Option<(SurfaceKey, Option<Hwnd>, DropZone)>,
 }
 
 pub struct App {
     p: Platform,
-    enabled: bool,
+    /// Virtual desktops on which tiling is switched off (every desktop is on by default).
+    disabled: HashSet<u128>,
+    /// The virtual desktop that is currently shown.
+    shown: u128,
+    /// Minimum sizes some windows insist on, learned from windows that refuse to shrink.
+    mins: HashMap<Hwnd, (i32, i32)>,
+    /// Last target we placed a window at, and what we measured afterwards.
+    placed: HashMap<Hwnd, (Rect, Option<Rect>)>,
+    /// Windows that currently fit nowhere (they stay floating).
+    floating: HashSet<Hwnd>,
     surfaces: HashMap<SurfaceKey, Surface>,
     focused: Option<Hwnd>,
     bordered: Option<Hwnd>,
@@ -100,8 +116,12 @@ fn make_icon(on: bool) -> HICON {
 }
 
 impl App {
-    fn managed(&self, h: Hwnd) -> bool {
-        if !self.p.is_manageable(h) {
+    fn desktop_on(&self, d: u128) -> bool {
+        !self.disabled.contains(&d)
+    }
+
+    fn managed(&self, h: Hwnd, cur: u128) -> bool {
+        if !self.p.is_manageable(h, cur) {
             return false;
         }
         match &self.filter {
@@ -116,17 +136,30 @@ impl App {
 
     /// Brings the trees in line with the windows that really exist, then lays out what changed.
     fn reconcile(&mut self, force_all: bool) {
-        if !self.enabled {
-            return;
+        let cur = self.p.current_desktop();
+        if cur != self.shown {
+            log(&format!("desktop switch {:x} -> {:x} (tiling {})", self.shown, cur, if self.desktop_on(cur) { "on" } else { "off" }));
+            self.shown = cur;
+            self.update_tray();
         }
-        let current: HashMap<Hwnd, (SurfaceKey, Rect)> =
-            self.p.all_top_level().into_iter().rev().filter(|&h| self.managed(h)).map(|h| (h, self.p.surface_of(h))).collect();
+        let tops = self.p.all_top_level();
+        let current: HashMap<Hwnd, (SurfaceKey, Rect)> = tops
+            .iter()
+            .rev()
+            .copied()
+            .filter(|&h| self.managed(h, cur))
+            .map(|h| (h, self.p.surface_of(h)))
+            .filter(|&(_, (k, _))| self.desktop_on(k.desktop))
+            .collect();
         let mut dirty: HashSet<SurfaceKey> = HashSet::new();
         if force_all {
             dirty.extend(self.surfaces.keys().copied());
         }
+        for s in self.surfaces.values_mut() {
+            s.tree.mins = self.mins.clone();
+        }
 
-        // Windows that vanished, were minimised or moved to another desktop/monitor.
+        // Windows that vanished, were minimised, moved to another desktop/monitor or whose desktop was switched off.
         for (key, s) in self.surfaces.iter_mut() {
             s.area = current.values().find(|(k, _)| k == key).map(|(_, a)| *a).unwrap_or(s.area);
             for h in s.tree.leaves() {
@@ -137,32 +170,83 @@ impl App {
                 }
             }
         }
+        self.placed.retain(|h, _| current.contains_key(h));
+        self.floating.retain(|h| current.contains_key(h));
+
         // New windows, in z-order from back to front.
-        let order: Vec<Hwnd> = self.p.all_top_level().into_iter().rev().filter(|h| current.contains_key(h)).collect();
+        let order: Vec<Hwnd> = tops.iter().rev().copied().filter(|h| current.contains_key(h)).collect();
         for h in order {
             let (key, area) = current[&h];
             if self.surface_containing(h).is_some() {
                 continue;
             }
             let focused = self.focused;
+            let info = format!("{h:x} {} ({})", self.p.title(h), self.p.exe_name(h));
+            let mins = self.mins.clone();
             let s = self.surfaces.entry(key).or_insert_with(|| Surface { tree: Tree::new(), area });
             s.area = area;
-            s.tree.add(h, area, focused);
-            dirty.insert(key);
-            log(&format!("added {h:x} {} ({})", self.p.title(h), self.p.exe_name(h)));
+            s.tree.mins = mins;
+            if s.tree.add(h, area, focused) {
+                dirty.insert(key);
+                self.floating.remove(&h);
+                log(&format!("added {info}"));
+            } else if self.floating.insert(h) {
+                log(&format!("no room, stays floating: {info}"));
+            }
         }
         self.surfaces.retain(|_, s| !s.tree.is_empty());
-        for key in dirty {
-            self.apply(key);
+        // Everything on the shown desktop is verified, so a desktop switch repairs what the
+        // system moved while the windows were hidden.
+        let keys: Vec<SurfaceKey> = self.surfaces.keys().copied().filter(|k| dirty.contains(k) || k.desktop == cur).collect();
+        for key in keys {
+            self.apply(key, false);
         }
     }
 
-    fn apply(&self, key: SurfaceKey) {
+    fn apply(&mut self, key: SurfaceKey, force: bool) {
         let Some(s) = self.surfaces.get(&key) else { return };
-        for (h, r) in s.tree.layout(s.area) {
-            let same = self.p.visible_rect(h).map(|v| (v.x - r.x).abs() <= 1 && (v.y - r.y).abs() <= 1 && (v.w - r.w).abs() <= 1 && (v.h - r.h).abs() <= 1).unwrap_or(false);
-            if !same {
-                self.p.place(h, r);
+        let layout = s.tree.layout(s.area);
+        let mut eject = Vec::new();
+        for (h, r) in layout {
+            if force {
+                self.placed.remove(&h);
+            }
+            let vis = self.p.visible_rect(h);
+            if vis.map(|v| close(v, r)).unwrap_or(false) {
+                self.placed.insert(h, (r, vis));
+                continue;
+            }
+            if let Some((pr, pv)) = self.placed.get(&h) {
+                if *pr == r && *pv == vis {
+                    // Same target, same result as last time: the window refuses this size.
+                    if let Some(v) = vis {
+                        if v.w > r.w + 2 || v.h > r.h + 2 {
+                            let e = self.mins.entry(h).or_insert((0, 0));
+                            if v.w > r.w + 2 {
+                                e.0 = e.0.max(v.w);
+                            }
+                            if v.h > r.h + 2 {
+                                e.1 = e.1.max(v.h);
+                            }
+                            log(&format!("{h:x} {} insists on at least {}x{} (zone was {}x{})", self.p.title(h), e.0, e.1, r.w, r.h));
+                            eject.push(h);
+                        }
+                    }
+                    continue;
+                }
+            }
+            self.p.place(h, r);
+            self.placed.insert(h, (r, self.p.visible_rect(h)));
+        }
+        if !eject.is_empty() {
+            if let Some(s) = self.surfaces.get_mut(&key) {
+                for h in eject {
+                    s.tree.remove(h);
+                    self.placed.remove(&h);
+                }
+            }
+            unsafe {
+                SetTimer(Some(self.main), TIMER_RECONCILE, 80, None);
             }
         }
     }
@@ -175,7 +259,7 @@ impl App {
     }
 
     fn on_focus(&mut self, h: Hwnd) {
-        if !self.enabled || self.surface_containing(h).is_none() {
+        if self.surface_containing(h).is_none() {
             return;
         }
         self.focused = Some(h);
@@ -188,16 +272,26 @@ impl App {
         self.bordered = Some(h);
     }
 
+    /// Switches tiling on or off for the desktop that is shown right now.
     fn toggle(&mut self) {
-        self.enabled = !self.enabled;
-        log(&format!("tiling {}", if self.enabled { "ON" } else { "OFF" }));
+        let d = self.p.current_desktop();
+        if !self.disabled.remove(&d) {
+            self.disabled.insert(d);
+        }
+        let on = self.desktop_on(d);
+        log(&format!("tiling {} for desktop {d:x}", if on { "ON" } else { "OFF" }));
+        self.shown = d;
         self.drag = None;
+        unsafe {
+            let _ = KillTimer(Some(self.main), TIMER_DRAG);
+        }
         self.hide_overlay();
         if let Some(b) = self.bordered.take() {
             self.set_border(b, COLOR_DEFAULT);
         }
-        if self.enabled {
-            self.surfaces.clear();
+        self.surfaces.retain(|k, _| k.desktop != d);
+        self.placed.clear();
+        if on {
             self.reconcile(true);
         }
         self.update_tray();
@@ -206,9 +300,6 @@ impl App {
     // ---------- drag & drop ----------
 
     fn drag_start(&mut self, h: Hwnd) {
-        if !self.enabled {
-            return;
-        }
         let Some(key) = self.surface_containing(h) else { return };
         let Some(v) = self.p.visible_rect(h) else { return };
         log(&format!("drag start {h:x}"));
@@ -228,6 +319,17 @@ impl App {
             let w = mi.rcWork;
             Some((SurfaceKey { desktop, monitor: m.0 as isize }, Rect::new(w.left, w.top, w.right - w.left, w.bottom - w.top), pt.x, pt.y))
         }
+    }
+
+    /// Outer screen edge the cursor is at (if any): dropping there creates a full-length zone.
+    fn edge_at(area: Rect, cx: i32, cy: i32) -> Option<DropZone> {
+        let cands = [
+            (cx - area.x, DropZone::Left),
+            (area.right() - 1 - cx, DropZone::Right),
+            (cy - area.y, DropZone::Top),
+            (area.bottom() - 1 - cy, DropZone::Bottom),
+        ];
+        cands.into_iter().filter(|(d, _)| *d < EDGE_PX).min_by_key(|(d, _)| *d).map(|(_, z)| z)
     }
 
     fn drag_tick(&mut self) {
@@ -250,16 +352,23 @@ impl App {
         let mut preview = None;
         match self.surfaces.get(&key) {
             Some(s) => {
-                let hit = s.tree.layout(area).into_iter().find(|(id, r)| *id != h && r.contains(cx, cy));
-                if let Some((t, r)) = hit {
+                if let Some(side) = Self::edge_at(area, cx, cy) {
+                    preview = s.tree.preview_edge(area, h, side);
+                    if preview.is_some() {
+                        target = Some((key, None, side));
+                    }
+                } else if let Some((t, r)) = s.tree.layout(area).into_iter().find(|(id, r)| *id != h && r.contains(cx, cy)) {
                     let zone = zone_at(r, cx, cy);
                     preview = if key == home { s.tree.preview(area, h, t, zone) } else { s.tree.preview_insert(area, h, t, zone) };
-                    target = Some((key, t, zone));
+                    if preview.is_some() {
+                        target = Some((key, Some(t), zone));
+                    }
                 }
             }
             None => {
                 // empty monitor: the window would fill it
                 preview = Some(area);
+                target = Some((key, None, DropZone::Center));
             }
         }
         if let Some(d) = &mut self.drag {
@@ -293,30 +402,46 @@ impl App {
                 }
             }
             log(&format!("resize end {h:x}"));
-            self.apply(home);
+            self.apply(home, true);
             return;
         }
-        match d.target {
-            Some((key, t, zone)) if key == home => {
+        let Some((key, target, zone)) = d.target else {
+            self.apply(home, true); // snap back
+            return;
+        };
+        log(&format!("drop {h:x} -> surface {:x} target {:?} {zone:?}", key.monitor, target.map(|t| format!("{t:x}"))));
+        match (target, zone) {
+            (Some(t), z) if key == home => {
                 if let Some(s) = self.surfaces.get_mut(&home) {
-                    s.tree.move_to(h, t, zone);
+                    s.tree.move_to(h, t, z);
                 }
-                log(&format!("drop {h:x} -> {t:x} {zone:?}"));
-                self.apply(home);
             }
-            Some((key, t, zone)) => {
+            (None, z) if key == home && z != DropZone::Center => {
+                if let Some(s) = self.surfaces.get_mut(&home) {
+                    s.tree.move_edge(h, z);
+                }
+            }
+            (t, z) => {
                 if let Some(s) = self.surfaces.get_mut(&home) {
                     s.tree.remove(h);
                 }
-                if let Some(s) = self.surfaces.get_mut(&key) {
-                    s.tree.insert(h, t, zone);
+                match (self.surfaces.get_mut(&key), t) {
+                    (Some(s), Some(t)) => s.tree.insert(h, t, z),
+                    (Some(s), None) => s.tree.insert_edge(h, z),
+                    (None, _) => {
+                        if let Some((_, area, _, _)) = self.cursor_surface(key.desktop) {
+                            let mut tree = Tree::new();
+                            tree.add(h, area, None);
+                            self.surfaces.insert(key, Surface { tree, area });
+                        }
+                    }
                 }
-                log(&format!("drop {h:x} on other monitor -> {t:x} {zone:?}"));
-                self.surfaces.retain(|_, s| !s.tree.is_empty());
-                self.apply(home);
-                self.apply(key);
             }
-            None => self.apply(home), // snap back
+        }
+        self.surfaces.retain(|_, s| !s.tree.is_empty());
+        self.apply(home, true);
+        if key != home {
+            self.apply(key, true);
         }
     }
 
@@ -336,8 +461,9 @@ impl App {
 
     fn tray_data(&self) -> NOTIFYICONDATAW {
         let mut nid = NOTIFYICONDATAW { cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32, hWnd: self.main, uID: 1, uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP, uCallbackMessage: WM_TRAY, ..Default::default() };
-        nid.hIcon = if self.enabled { self.icon_on } else { self.icon_off };
-        let tip = if self.enabled { "CosmicTile: ON (click to turn off)" } else { "CosmicTile: OFF (click to turn on)" };
+        let on = self.desktop_on(self.shown);
+        nid.hIcon = if on { self.icon_on } else { self.icon_off };
+        let tip = if on { "CosmicTile: ON for this desktop (click to turn off)" } else { "CosmicTile: OFF for this desktop (click to turn on)" };
         for (i, c) in tip.encode_utf16().take(127).enumerate() {
             nid.szTip[i] = c;
         }
@@ -353,7 +479,7 @@ impl App {
     fn show_menu(&mut self) {
         unsafe {
             let menu = CreatePopupMenu().unwrap();
-            let label = if self.enabled { w!("Turn tiling off") } else { w!("Turn tiling on") };
+            let label = if self.desktop_on(self.shown) { w!("Turn tiling off for this desktop") } else { w!("Turn tiling on for this desktop") };
             let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE, label);
             let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Exit CosmicTile"));
             let mut pt = POINT::default();
@@ -479,7 +605,11 @@ pub fn run(filter: Option<String>) {
         let platform = Platform::new();
         let app = App {
             p: platform,
-            enabled: true,
+            disabled: HashSet::new(),
+            shown: 0,
+            mins: HashMap::new(),
+            placed: HashMap::new(),
+            floating: HashSet::new(),
             surfaces: HashMap::new(),
             focused: None,
             bordered: None,

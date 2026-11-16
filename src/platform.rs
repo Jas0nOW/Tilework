@@ -79,7 +79,7 @@ impl Platform {
     }
 
     /// True for normal application windows that should be tiled.
-    pub fn is_manageable(&self, h: isize) -> bool {
+    pub fn is_manageable(&self, h: isize, current_desktop: u128) -> bool {
         unsafe {
             let hw = hwnd_of(h);
             if !IsWindow(Some(hw)).as_bool() || !IsWindowVisible(hw).as_bool() && self.cloaked(h) != 2 {
@@ -92,6 +92,13 @@ impl Platform {
             let cloak = self.cloaked(h);
             if cloak != 0 && cloak != 2 {
                 return false;
+            }
+            // Cloaked but on the desktop that is shown: a suspended/ghost frame, not a real window.
+            if cloak == 2 {
+                let d = self.raw_desktop_id(h);
+                if d == 0 || d == current_desktop {
+                    return false;
+                }
             }
             let style = GetWindowLongW(hw, GWL_STYLE) as u32;
             let ex = GetWindowLongW(hw, GWL_EXSTYLE) as u32;
