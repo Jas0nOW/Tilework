@@ -18,6 +18,10 @@ fn main() {
         dump();
         return;
     }
+    if args.iter().any(|a| a == "--restore-snap") {
+        platform::set_snap(true);
+        return;
+    }
     // `--filter TEXT` manages only windows whose title contains TEXT (or whose exe equals TEXT);
     // used for safe tests without touching real windows.
     let filter = args.iter().position(|a| a == "--filter").and_then(|i| args.get(i + 1)).cloned();

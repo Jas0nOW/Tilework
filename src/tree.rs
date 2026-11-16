@@ -122,7 +122,7 @@ impl Tree {
 
     /// Adds a window automatically: new columns first (up to 4), then at most 2 windows per
     /// column. Anything else (a third window in a column, a bigger split) is up to the user via
-    /// drag & drop. Returns false when the window fits nowhere without violating minimum sizes.
+    /// drag & drop. Prefers spots that respect all minimum sizes, otherwise the least bad one.
     pub fn add(&mut self, h: Hwnd, area: Rect, focused: Option<Hwnd>) -> bool {
         if self.contains(h) {
             return true;
@@ -142,13 +142,25 @@ impl Tree {
                 cands.push(Cand::Around(t, z));
             }
         }
+        // First choice: a spot where nobody is squeezed below a minimum. If there is none, the
+        // spot with the fewest violations: a window that is too big for its zone overlaps a
+        // neighbour a little, which is better than leaving it out of the layout.
+        let mut best: Option<(usize, Tree)> = None;
         for c in cands {
             let mut t = self.clone();
             t.apply_cand(h, c);
-            if t.violations(area) <= base {
+            let v = t.violations(area);
+            if v <= base {
                 *self = t;
                 return true;
             }
+            if best.as_ref().map(|(bv, _)| v < *bv).unwrap_or(true) {
+                best = Some((v, t));
+            }
+        }
+        if let Some((_, t)) = best {
+            *self = t;
+            return true;
         }
         false
     }
@@ -669,12 +681,12 @@ mod tests {
     }
 
     #[test]
-    fn a_window_that_does_not_fit_is_rejected_instead_of_squeezed() {
+    fn a_window_that_fits_nowhere_is_still_tiled_at_the_least_bad_spot() {
         let mut t = tree_of(&[1, 2, 3, 4, 5, 6, 7, 8]);
         t.mins.insert(9, (1000, 0)); // needs 1000 px, no zone is that wide
-        assert!(!t.add(9, SCREEN, Some(8)));
-        assert_eq!(t.leaves().len(), 8);
-        assert_eq!(t.violations(SCREEN), 0);
+        assert!(t.add(9, SCREEN, Some(8)));
+        assert_eq!(t.leaves().len(), 9);
+        assert!(t.violations(SCREEN) <= 2, "the squeeze stays small");
     }
 
     #[test]

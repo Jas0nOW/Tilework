@@ -230,3 +230,23 @@ impl Platform {
         }
     }
 }
+
+const SPI_GETWINARRANGING: u32 = 0x0082;
+const SPI_SETWINARRANGING: u32 = 0x0083;
+
+/// Whether Windows' own window snapping (drag to an edge) is currently active.
+pub fn snap_enabled() -> bool {
+    let mut v: i32 = 1;
+    unsafe {
+        let _ = SystemParametersInfoW(SYSTEM_PARAMETERS_INFO_ACTION(SPI_GETWINARRANGING), 0, Some(&mut v as *mut i32 as *mut c_void), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
+    }
+    v != 0
+}
+
+/// Turns Windows' own snapping on or off for this session. Not written to the registry, so a
+/// crash can never leave the setting broken for good (it is back to normal after sign-out).
+pub fn set_snap(on: bool) {
+    unsafe {
+        let _ = SystemParametersInfoW(SYSTEM_PARAMETERS_INFO_ACTION(SPI_SETWINARRANGING), on as u32, None, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
+    }
+}

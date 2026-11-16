@@ -1,7 +1,7 @@
 //! The tiling manager: reacts to window events, keeps one tree per surface (virtual desktop x
 //! monitor), applies the layout and handles drag & drop with a live preview.
 
-use crate::platform::{hwnd_of, id_of, Platform, SurfaceKey};
+use crate::platform::{hwnd_of, id_of, set_snap, snap_enabled, Platform, SurfaceKey};
 use crate::tree::{zone_at, DropZone, Edge, Hwnd, Rect, Tree};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -54,6 +54,8 @@ pub struct App {
     p: Platform,
     /// Virtual desktops on which tiling is switched off (every desktop is on by default).
     disabled: HashSet<u128>,
+    /// State of Windows' own snapping before we started; restored on exit and on desktops without tiling.
+    snap_original: bool,
     /// The virtual desktop that is currently shown.
     shown: u128,
     /// Minimum sizes some windows insist on, learned from windows that refuse to shrink.
@@ -140,6 +142,7 @@ impl App {
         if cur != self.shown {
             log(&format!("desktop switch {:x} -> {:x} (tiling {})", self.shown, cur, if self.desktop_on(cur) { "on" } else { "off" }));
             self.shown = cur;
+            self.sync_snap();
             self.update_tray();
         }
         let tops = self.p.all_top_level();
@@ -220,15 +223,17 @@ impl App {
                 if *pr == r && *pv == vis {
                     // Same target, same result as last time: the window refuses this size.
                     if let Some(v) = vis {
-                        if v.w > r.w + 2 || v.h > r.h + 2 {
-                            let e = self.mins.entry(h).or_insert((0, 0));
-                            if v.w > r.w + 2 {
-                                e.0 = e.0.max(v.w);
-                            }
-                            if v.h > r.h + 2 {
-                                e.1 = e.1.max(v.h);
-                            }
-                            log(&format!("{h:x} {} insists on at least {}x{} (zone was {}x{})", self.p.title(h), e.0, e.1, r.w, r.h));
+                        let old = self.mins.get(&h).copied().unwrap_or((0, 0));
+                        let mut new = old;
+                        if v.w > r.w + 2 {
+                            new.0 = new.0.max(v.w);
+                        }
+                        if v.h > r.h + 2 {
+                            new.1 = new.1.max(v.h);
+                        }
+                        if new != old {
+                            self.mins.insert(h, new);
+                            log(&format!("{h:x} {} insists on at least {}x{} (zone was {}x{})", self.p.title(h), new.0, new.1, r.w, r.h));
                             eject.push(h);
                         }
                     }
@@ -249,6 +254,11 @@ impl App {
                 SetTimer(Some(self.main), TIMER_RECONCILE, 80, None);
             }
         }
+    }
+
+    /// Windows' own snapping must not fight with us: it is off while tiling is on for the shown desktop.
+    fn sync_snap(&self) {
+        set_snap(if self.desktop_on(self.shown) { false } else { self.snap_original });
     }
 
     fn set_border(&mut self, h: Hwnd, color: u32) {
@@ -291,6 +301,7 @@ impl App {
         }
         self.surfaces.retain(|k, _| k.desktop != d);
         self.placed.clear();
+        self.sync_snap();
         if on {
             self.reconcile(true);
         }
@@ -406,7 +417,8 @@ impl App {
             return;
         }
         let Some((key, target, zone)) = d.target else {
-            self.apply(home, true); // snap back
+            log(&format!("drop {h:x}: no valid target, window goes back"));
+            self.apply(home, true);
             return;
         };
         log(&format!("drop {h:x} -> surface {:x} target {:?} {zone:?}", key.monitor, target.map(|t| format!("{t:x}"))));
@@ -499,6 +511,7 @@ impl App {
     }
 
     fn shutdown(&mut self) {
+        set_snap(self.snap_original);
         if let Some(b) = self.bordered.take() {
             self.set_border(b, COLOR_DEFAULT);
         }
@@ -606,6 +619,7 @@ pub fn run(filter: Option<String>) {
         let app = App {
             p: platform,
             disabled: HashSet::new(),
+            snap_original: snap_enabled(),
             shown: 0,
             mins: HashMap::new(),
             placed: HashMap::new(),
