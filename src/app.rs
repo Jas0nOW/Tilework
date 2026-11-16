@@ -373,6 +373,7 @@ impl<P: Win> App<P> {
                 self.reserved.insert(h);
             }
             if self.p.is_minimized(h) || self.p.is_hung(h) || self.reserved.contains(&h) && (self.p.is_maximized(h) || self.p.is_fullscreen(h)) {
+                if force { log(&format!("apply skipped {h:x}: minimized={} hung={} reserved={}", self.p.is_minimized(h), self.p.is_hung(h), self.reserved.contains(&h))); }
                 if let Some(p) = self.placed.get_mut(&h) { p.suspend(); }
                 continue;
             }
@@ -381,7 +382,11 @@ impl<P: Win> App<P> {
                 self.placed.insert(h, Placement::new(r));
                 continue;
             }
-            if force { self.placed.remove(&h); }
+            if force {
+                self.placed.remove(&h);
+                log(&format!("apply forced {h:x} target={}x{}@{},{} now={}", r.w, r.h, r.x, r.y,
+                    vis.map(|v| format!("{}x{}@{},{}", v.w, v.h, v.x, v.y)).unwrap_or_else(|| "none".into())));
+            }
             if let Some(p) = self.placed.get_mut(&h) && p.target == r {
                 let elapsed = p.requested.elapsed();
                 let stable = p.observe(vis, elapsed); // Exactly one observation per poll.
@@ -406,7 +411,9 @@ impl<P: Win> App<P> {
                 }
                 continue;
             }
-            if self.p.place(h, r) { self.placed.insert(h, Placement::new(r)); }
+            let placed_ok = self.p.place(h, r);
+            if force || !placed_ok { log(&format!("place {h:x} -> {}x{}@{},{} accepted={placed_ok}", r.w, r.h, r.x, r.y)); }
+            if placed_ok { self.placed.insert(h, Placement::new(r)); }
         }
         if learned {
             for s in self.surfaces.values_mut() { s.tree.mins = self.mins.clone(); }
