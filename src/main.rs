@@ -1,3 +1,4 @@
+#![windows_subsystem = "windows"]
 #![allow(dead_code)]
 mod app;
 mod platform;
@@ -8,6 +9,10 @@ use std::collections::HashMap;
 use tree::Tree;
 
 fn main() {
+    // GUI subsystem has no console; attach to the parent's so that --dump can print.
+    unsafe {
+        let _ = windows::Win32::System::Console::AttachConsole(windows::Win32::System::Console::ATTACH_PARENT_PROCESS);
+    }
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--dump") {
         dump();
