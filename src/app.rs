@@ -1270,8 +1270,10 @@ fn cursor_moved(a: (i32, i32), b: (i32, i32)) -> bool {
     (i64::from(a.0) - i64::from(b.0)).abs() > 4 || (i64::from(a.1) - i64::from(b.1)).abs() > 4
 }
 
+/// A drag is over only when neither the window's own move/size loop nor the mouse button says it
+/// continues. Console windows do not report GUI_INMOVESIZE while the button is held.
 fn drag_released(move_size_active: Option<bool>, primary_down: bool) -> bool {
-    !move_size_active.unwrap_or(primary_down)
+    !(move_size_active.unwrap_or(false) || primary_down)
 }
 
 fn is_resize(start: Rect, now: Rect) -> bool {
@@ -1331,6 +1333,15 @@ mod tests {
         let drag = Drag { hwnd: 1, key, start: tree.rect_of(area, 1).unwrap(), resize: false, move_only: false, intent: None, dpi: 96, monitor_changed: false, released_since: None, target: None, last: None };
         (drag, HashMap::from([(key, Surface { tree, area })]), area)
     }
+    #[test]
+    fn a_held_button_keeps_the_drag_alive_even_if_the_window_reports_no_move_loop() {
+        assert!(!drag_released(Some(false), true), "console windows: loop flag false, button down");
+        assert!(!drag_released(Some(true), false), "touch or pen: loop active, no button");
+        assert!(!drag_released(None, true));
+        assert!(drag_released(Some(false), false));
+        assert!(drag_released(None, false));
+    }
+
     #[test]
     fn target_does_not_flicker_on_a_zone_border() {
         let (mut drag, surfaces, area) = drag_fixture();
