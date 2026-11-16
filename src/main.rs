@@ -39,10 +39,6 @@ fn main() {
         dump();
         return;
     }
-    if args.iter().any(|a| a == "--restore-snap") {
-        platform::restore_snap_explicit();
-        return;
-    }
     // `--filter TEXT` manages only windows whose title contains TEXT (or whose exe equals TEXT);
     // used for safe tests without touching real windows.
     unsafe {
@@ -52,8 +48,23 @@ fn main() {
             Ok(m) => m,
             Err(e) => { app::log(&format!("could not create single-instance mutex: {e}")); return; }
         };
-        if GetLastError() == ERROR_ALREADY_EXISTS { let _ = CloseHandle(mutex); return; }
-        app::run(filter);
+        let running = GetLastError() == ERROR_ALREADY_EXISTS;
+        let restore = args.iter().any(|a| a == "--restore-snap");
+        let force = args.iter().any(|a| a == "--force");
+        if restore_refused(restore, running, force) {
+            eprintln!("CosmicTile is running; close it first or use --force to restore Snap.");
+            let _ = CloseHandle(mutex);
+            std::process::exit(3);
+        }
+        if restore {
+            if !platform::restore_snap_explicit() {
+                eprintln!("Could not restore Windows Snap");
+                let _ = CloseHandle(mutex);
+                std::process::exit(1);
+            }
+        } else if !running {
+            app::run(filter);
+        }
         let _ = CloseHandle(mutex);
     }
 }
@@ -90,6 +101,8 @@ fn dump() {
 fn parse_filter(args: &[String]) -> Result<Option<String>, &'static str> {
     let mut filter = None;
     let mut mode = false;
+    let mut restore = false;
+    let mut force = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -104,13 +117,18 @@ fn parse_filter(args: &[String]) -> Result<Option<String>, &'static str> {
             "--dump" | "--snap-status" | "--restore-snap" => {
                 if mode { return Err("only one diagnostic mode may be supplied"); }
                 mode = true;
+                restore = args[i] == "--restore-snap";
             }
+            "--force" => { if force { return Err("--force may only be supplied once"); } force = true; }
             _ => return Err("unknown argument"),
         }
         i += 1;
     }
+    if force && !restore { return Err("--force requires --restore-snap"); }
     Ok(filter)
 }
+
+fn restore_refused(restore: bool, running: bool, force: bool) -> bool { restore && running && !force }
 
 #[cfg(test)]
 mod tests {
@@ -123,5 +141,14 @@ mod tests {
         assert_eq!(parse_filter(&["app".into(), "--filter".into(), "test".into()]), Ok(Some("test".into())));
         assert!(parse_filter(&["app".into(), "--unknown".into()]).is_err());
         assert!(parse_filter(&["app".into(), "--dump".into(), "--snap-status".into()]).is_err());
+    }
+    #[test]
+    fn restore_requires_force_when_a_manager_is_running() {
+        assert!(restore_refused(true, true, false));
+        assert!(!restore_refused(true, true, true));
+        assert!(!restore_refused(true, false, false));
+        assert!(!restore_refused(false, true, false));
+        assert!(parse_filter(&["app".into(), "--force".into()]).is_err());
+        assert!(parse_filter(&["app".into(), "--force".into(), "--restore-snap".into()]).is_ok());
     }
 }

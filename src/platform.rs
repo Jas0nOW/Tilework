@@ -25,6 +25,12 @@ pub struct SurfaceKey {
 /// The window operations used by the tiler. Implementations can simulate window behavior.
 pub trait Win {
     fn visible_rect(&self, h: isize) -> Option<Rect>;
+    fn is_visible(&self, h: isize, current: u128) -> bool;
+    fn is_ghost(&self, _h: isize, _current: u128) -> bool { false }
+    fn cursor_position(&self) -> Option<(i32, i32)> { None }
+    fn resize_intent(&self, _h: isize) -> Option<bool> { None }
+    fn dpi(&self, _h: isize) -> u32 { 96 }
+    fn move_size_active(&self, _h: isize) -> Option<bool> { None }
     fn is_maximized(&self, h: isize) -> bool;
     fn is_minimized(&self, h: isize) -> bool;
     fn is_fullscreen(&self, h: isize) -> bool;
@@ -103,6 +109,12 @@ impl Platform {
             let _ = DwmGetWindowAttribute(hwnd_of(h), DWMWA_CLOAKED, &mut v as *mut u32 as *mut c_void, 4);
         }
         v
+    }
+
+    pub fn is_visible(&self, h: isize, current: u128) -> bool {
+        let cloak = self.cloaked(h);
+        tracked_visibility(unsafe { IsWindowVisible(hwnd_of(h)).as_bool() }, cloak,
+            if cloak == 2 { self.raw_desktop_id(h) } else { 0 }, current)
     }
 
     /// True for normal application windows that should be tiled.
@@ -249,7 +261,7 @@ impl Platform {
         // Full-screen coverage requires a borderless style. A normal maximized
         // window can cover a taskbar-free monitor and still needs adoption.
         let style = unsafe { GetWindowLongW(hwnd_of(h), GWL_STYLE) } as u32;
-        if style & WS_CAPTION.0 == WS_CAPTION.0 { return false; }
+        if !fullscreen_style(unsafe { IsZoomed(hwnd_of(h)).as_bool() }, style) { return false; }
         let Some(v) = self.visible_rect(h) else { return false };
         unsafe {
             let m = MonitorFromWindow(hwnd_of(h), MONITOR_DEFAULTTONEAREST);
@@ -310,6 +322,40 @@ impl Platform {
 
 impl Win for Platform {
     fn visible_rect(&self, h: isize) -> Option<Rect> { Platform::visible_rect(self, h) }
+    fn is_visible(&self, h: isize, current: u128) -> bool { Platform::is_visible(self, h, current) }
+    fn is_ghost(&self, h: isize, current: u128) -> bool {
+        if self.cloaked(h) != 2 { return false; }
+        let desktop = self.raw_desktop_id(h);
+        desktop == 0 || desktop == current
+    }
+    fn cursor_position(&self) -> Option<(i32, i32)> {
+        let mut pt = windows::Win32::Foundation::POINT::default();
+        unsafe { GetCursorPos(&mut pt).ok()?; }
+        Some((pt.x, pt.y))
+    }
+    fn resize_intent(&self, h: isize) -> Option<bool> {
+        use windows::Win32::Foundation::WPARAM;
+        let (x, y) = self.cursor_position()?;
+        let packed = ((x as u16 as u32) | ((y as u16 as u32) << 16)) as i32 as isize;
+        let mut result = 0usize;
+        let sent = unsafe { SendMessageTimeoutW(hwnd_of(h), WM_NCHITTEST, WPARAM(0), LPARAM(packed), SMTO_ABORTIFHUNG, 100, Some(&mut result)) };
+        if sent.0 == 0 { return None; }
+        match result as u32 {
+            HTCAPTION => Some(false),
+            HTLEFT..=HTBOTTOMRIGHT => Some(true),
+            _ => None,
+        }
+    }
+    fn dpi(&self, h: isize) -> u32 {
+        unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd_of(h)) }
+    }
+    fn move_size_active(&self, h: isize) -> Option<bool> {
+        let thread = unsafe { GetWindowThreadProcessId(hwnd_of(h), None) };
+        if thread == 0 { return None; }
+        let mut info = GUITHREADINFO { cbSize: std::mem::size_of::<GUITHREADINFO>() as u32, ..Default::default() };
+        unsafe { GetGUIThreadInfo(thread, &mut info).ok()?; }
+        Some(info.flags.0 & GUI_INMOVESIZE.0 != 0)
+    }
     fn is_maximized(&self, h: isize) -> bool { Platform::is_maximized(self, h) }
     fn is_minimized(&self, h: isize) -> bool { Platform::is_minimized(self, h) }
     fn is_fullscreen(&self, h: isize) -> bool { Platform::is_fullscreen(self, h) }
@@ -359,20 +405,30 @@ fn explorer_current_desktop() -> Option<u128> {
     None
 }
 
-fn identify_desktop(foreground: isize, evidence: &[(isize, u128)], empty: impl FnOnce() -> u128) -> u128 {
-    if let Some((_, id)) = evidence.iter().find(|(h, id)| *h == foreground && *id != 0) { return *id; }
-    if evidence.is_empty() { return empty(); }
-    desktop_consensus(evidence.iter().map(|(_, id)| *id))
+fn tracked_visibility(visible: bool, cloak: u32, desktop: u128, current: u128) -> bool {
+    if cloak == 2 {
+        // Unknown identity must not evict a possibly valid window on another desktop.
+        desktop == 0 || current == 0 || desktop != current
+    } else {
+        visible
+    }
 }
 
-fn desktop_consensus(ids: impl IntoIterator<Item = u128>) -> u128 {
+fn fullscreen_style(maximized: bool, style: u32) -> bool {
+    !maximized && style & WS_CAPTION.0 != WS_CAPTION.0 && style & WS_THICKFRAME.0 == 0
+}
+
+fn identify_desktop(foreground: isize, evidence: &[(isize, u128)], empty: impl FnOnce() -> u128) -> u128 {
     let mut counts = std::collections::HashMap::new();
-    let mut total = 0usize;
-    for id in ids.into_iter().filter(|&id| id != 0) {
+    for &(_, id) in evidence.iter().filter(|(_, id)| *id != 0) {
         *counts.entry(id).or_insert(0usize) += 1;
-        total += 1;
     }
-    counts.into_iter().find_map(|(id, count)| (count > total / 2).then_some(id)).unwrap_or(0)
+    let highest = counts.values().copied().max().unwrap_or(0);
+    if highest < 2 { return empty(); }
+    let winners: Vec<_> = counts.into_iter().filter_map(|(id, n)| (n == highest).then_some(id)).collect();
+    if winners.len() == 1 { return winners[0]; }
+    if let Some((_, id)) = evidence.iter().find(|(h, id)| *h == foreground && winners.contains(id)) { return *id; }
+    empty()
 }
 
 const SPI_GETWINARRANGING: u32 = 0x0082;
@@ -611,16 +667,38 @@ mod snap_tests {
         assert_eq!(parse_marker(b"other"), None);
     }
     #[test]
-    fn pinned_window_evidence_does_not_pause_other_desktops_and_foreground_wins() {
+    fn desktop_evidence_uses_agreement_before_foreground_and_registry_fallback() {
         use super::identify_desktop;
         let mut windows = vec![(1, 99), (2, 42), (3, 42)]; // Window 1 is pinned from desktop 99.
         assert_eq!(identify_desktop(0, &windows, || panic!("visible evidence exists")), 42);
+        assert_eq!(identify_desktop(1, &windows, || 99), 42);
         windows[1].1 = 7; windows[2].1 = 7; // Switch desktop; the pinned window stays.
         assert_eq!(identify_desktop(2, &windows, || 0), 7);
-        windows[2].1 = 99; // A conflict cannot override an explicit foreground window.
-        assert_eq!(identify_desktop(2, &windows, || 0), 7);
+        windows[2].1 = 99;
+        assert_eq!(identify_desktop(2, &windows, || 0), 99);
+        assert_eq!(identify_desktop(0, &[(1, 99)], || 42), 42);
+        assert_eq!(identify_desktop(3, &[(1, 42), (2, 42), (3, 99), (4, 99)], || 7), 99);
+        assert_eq!(identify_desktop(0, &[(1, 42), (2, 42), (3, 99), (4, 99)], || 7), 7);
         windows.clear(); // The empty desktop is resolved through shell evidence.
         assert_eq!(identify_desktop(0, &windows, || 7), 7);
+    }
+
+    #[test]
+    fn tracked_visibility_preserves_other_desktop_windows() {
+        use super::tracked_visibility;
+        assert!(!tracked_visibility(false, 0, 0, 42));
+        assert!(tracked_visibility(true, 0, 0, 42));
+        assert!(tracked_visibility(false, 2, 99, 42));
+        assert!(!tracked_visibility(true, 2, 42, 42));
+    }
+
+    #[test]
+    fn maximized_or_resizable_borderless_windows_are_not_fullscreen() {
+        use super::{fullscreen_style, WS_CAPTION, WS_THICKFRAME};
+        assert!(!fullscreen_style(true, 0));
+        assert!(!fullscreen_style(false, WS_THICKFRAME.0));
+        assert!(!fullscreen_style(false, WS_CAPTION.0));
+        assert!(fullscreen_style(false, 0));
     }
 
 }

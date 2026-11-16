@@ -42,7 +42,7 @@ pub fn set_min_zone(w: i32, h: i32) {
     TEST_MIN_ZONE.with(|min| min.set((w, h)));
 }
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(not(test))]
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -112,6 +112,8 @@ pub struct Tree {
     root: Option<Node>,
     /// Minimum size some windows insist on (learned at runtime); used for placement checks.
     pub mins: HashMap<Hwnd, (i32, i32)>,
+    /// Leaves temporarily omitted from layout without changing their positions or weights.
+    pub skipped: HashSet<Hwnd>,
 }
 
 /// Where an automatically placed window goes.
@@ -126,7 +128,7 @@ enum Cand {
 
 impl Tree {
     pub fn new() -> Self {
-        Self { root: None, mins: HashMap::new() }
+        Self { root: None, mins: HashMap::new(), skipped: HashSet::new() }
     }
 
     /// Number of windows whose zone is smaller than allowed.
@@ -439,8 +441,8 @@ impl Tree {
     /// Rectangle of every window.
     pub fn layout(&self, area: Rect) -> Vec<(Hwnd, Rect)> {
         let mut out = Vec::new();
-        if let Some(n) = &self.root {
-            layout_node(n, area, &mut out, &self.mins);
+        if let Some(n) = self.root.as_ref().and_then(|n| visible_node(n, &self.skipped)) {
+            layout_node(&n, area, &mut out, &self.mins);
         }
         out
     }
@@ -477,6 +479,24 @@ impl Tree {
     pub fn equalize(&mut self) {
         if let Some(root) = &mut self.root {
             equalize_node(root);
+        }
+    }
+}
+
+/// Project the tree for layout while preserving the weights of every visible sibling.
+fn visible_node(node: &Node, skipped: &HashSet<Hwnd>) -> Option<Node> {
+    match node {
+        Node::Leaf(h) => (!skipped.contains(h)).then_some(Node::Leaf(*h)),
+        Node::Container { orient, children, weights, auto } => {
+            let visible: Vec<_> = children.iter().zip(weights).filter_map(|(child, weight)| {
+                visible_node(child, skipped).map(|child| (child, *weight))
+            }).collect();
+            let (mut children, weights): (Vec<_>, Vec<_>) = visible.into_iter().unzip();
+            match children.len() {
+                0 => None,
+                1 => children.pop(),
+                _ => Some(Node::Container { orient: *orient, children, weights, auto: *auto }),
+            }
         }
     }
 }
@@ -825,7 +845,7 @@ mod tests {
             assert!(a.w >= 0 && a.h >= 0);
             assert!(a.x >= area.x && a.y >= area.y && a.right() <= area.right() && a.bottom() <= area.bottom());
             for (_, b) in layout.iter().skip(i + 1) {
-                assert!(a.right() <= b.x || b.right() <= a.x || a.bottom() <= b.y || b.bottom() <= a.y);
+                assert!(a.w == 0 || a.h == 0 || b.w == 0 || b.h == 0 || a.right() <= b.x || b.right() <= a.x || a.bottom() <= b.y || b.bottom() <= a.y);
             }
         }
         assert_eq!(layout.iter().map(|(_, r)| i64::from(r.w) * i64::from(r.h)).sum::<i64>(),
@@ -856,11 +876,16 @@ mod tests {
             };
             let mut t = tree_of(&[1]);
             let mut next = 2;
-            let area = Rect::new(-800, -600, 16000, 12000);
+            let area = match seed % 3 {
+                0 => Rect::new(-800, -600, 320, 200),
+                1 => Rect::new(-800, -600, 16000, 12000),
+                _ => Rect::new(0, 0, 640, 360),
+            };
             for _ in 0..300 {
                 let leaves = t.leaves();
                 if leaves.is_empty() { t.add(next, area, None); next += 1; continue; }
                 let target = leaves[random() % leaves.len()];
+                t.mins.insert(target, ((random() % 900) as i32, (random() % 600) as i32));
                 let zones = [DropZone::Left, DropZone::Right, DropZone::Top, DropZone::Bottom];
                 let operation = if leaves.len() >= 24 { 1 } else { random() % 5 };
                 counts[operation] += 1;
@@ -945,6 +970,7 @@ mod tests {
                     weights: equal(4), auto: true,
                 }),
                 mins: HashMap::new(),
+                skipped: HashSet::new(),
             };
             for id in 1..=17 { t.mins.insert(id, (260 + (seed * id as i32 * 137) % 1000, 160 + (seed * id as i32 * 91) % 500)); }
             let best = (1..=16).flat_map(|id| [DropZone::Right, DropZone::Bottom, DropZone::Left, DropZone::Top].map(|zone| (id, zone)))
@@ -970,6 +996,7 @@ mod tests {
                 weights: equal(2), auto: true,
             }),
             mins: HashMap::new(),
+            skipped: HashSet::new(),
         };
         t.mins.insert(5, (3000, 3000));
         assert!(t.add(5, SCREEN, Some(4)));
@@ -1201,15 +1228,37 @@ mod tests {
     #[test]
     fn preview_matches_the_real_result_exactly() {
         let t = tree_of(&[1, 2, 3, 4, 5]);
+        let mut compared = 0;
         for target in [1, 3, 4] {
             for zone in [DropZone::Left, DropZone::Right, DropZone::Top, DropZone::Bottom, DropZone::Center] {
-                let Some(predicted) = t.preview(SCREEN, 5, target, zone) else { continue }; // too small -> refused
+                let Some(predicted) = t.preview_layout(SCREEN, 5, target, zone) else { continue }; // too small -> refused
                 let mut real = t.clone();
                 real.move_to(5, target, zone);
-                assert_eq!(predicted, rect(&real, 5), "target {target} zone {zone:?}");
+                assert_eq!(predicted, real.layout(SCREEN), "target {target} zone {zone:?}");
+                assert_eq!(t.preview(SCREEN, 5, target, zone), real.rect_of(SCREEN, 5));
+                compared += 1;
             }
         }
+        assert!(compared >= 10, "only {compared} previews compared");
         assert_eq!(rect(&t, 5), Rect::new(1440, 540, 480, 540), "preview must not change the tree");
+    }
+
+    #[test]
+    fn minimized_leaves_free_space_without_losing_manual_weights() {
+        let mut tree = tree_of(&[1, 2]);
+        assert!(tree.set_edge(SCREEN, 1, Edge::Right, 700));
+        let original = tree.root.clone().unwrap();
+        tree.skipped.extend([1, 2]);
+        assert!(tree.layout(SCREEN).is_empty());
+        assert!(tree.add(3, SCREEN, Some(1)));
+        assert_eq!(tree.layout(SCREEN), vec![(3, SCREEN)]);
+        tree.skipped.remove(&1);
+        assert_eq!(tree.leaves(), vec![1, 3, 2]);
+        let Node::Container { weights: before, .. } = original else { panic!("expected container") };
+        let Node::Container { weights: after, .. } = tree.root.as_ref().unwrap() else { panic!("expected container") };
+        assert_eq!(before[0], after[0]);
+        assert_eq!(before[1], after[2]);
+        assert_eq!(tree.layout(SCREEN).iter().map(|(h, _)| *h).collect::<Vec<_>>(), vec![1, 3]);
     }
 
     #[test]

@@ -81,6 +81,9 @@ struct Drag {
     start: Rect,
     resize: bool,
     move_only: bool,
+    intent: Option<bool>,
+    dpi: u32,
+    monitor_changed: bool,
     released_since: Option<Instant>,
     /// (surface, window under the cursor or None for an outer edge / empty monitor, zone)
     target: Option<(SurfaceKey, Option<Hwnd>, DropZone)>,
@@ -97,11 +100,15 @@ pub struct App<P: Win = Platform> {
     /// Window under the cursor, the focused window at that moment, and since when.
     hover: Option<(Hwnd, Hwnd, Instant)>,
     hover_attempted: Option<Hwnd>,
+    hover_foreground: Option<(Hwnd, (i32, i32))>,
+    hover_attempt_position: Option<(i32, i32)>,
+    ghost_seen: HashSet<Hwnd>,
     reserved: HashSet<Hwnd>,
     /// The virtual desktop that is currently shown.
     shown: u128,
     desktop_error_logged: bool,
-    dispatch_desktop: Option<u128>,
+    dispatch_desktop: Cell<Option<u128>>,
+    dispatching: bool,
     /// Minimum sizes some windows insist on, learned from windows that refuse to shrink.
     mins: HashMap<Hwnd, (i32, i32)>,
     /// Last target we placed a window at, and what we measured afterwards.
@@ -110,6 +117,7 @@ pub struct App<P: Win = Platform> {
     floating: HashSet<Hwnd>,
     surfaces: HashMap<SurfaceKey, Surface>,
     focused: Option<Hwnd>,
+    last_tracked_focus: Option<Hwnd>,
     bordered: Option<Hwnd>,
     border_original: HashMap<Hwnd, u32>,
     taskbar_created: u32,
@@ -218,7 +226,12 @@ fn make_icon(on: bool) -> HICON {
 }
 
 impl<P: Win> App<P> {
-    fn current_desktop(&self) -> u128 { self.dispatch_desktop.unwrap_or_else(|| self.p.current_desktop()) }
+    fn current_desktop(&self) -> u128 {
+        if let Some(d) = self.dispatch_desktop.get() { return d; }
+        let d = self.p.current_desktop();
+        if self.dispatching { self.dispatch_desktop.set(Some(d)); }
+        d
+    }
     fn desktop_on(&self, d: u128) -> bool {
         !self.disabled.contains(&d)
     }
@@ -260,8 +273,13 @@ impl<P: Win> App<P> {
             self.update_tray();
         }
         let tops = self.p.all_top_level();
-        self.reserved.retain(|h| tops.contains(h));
-        for h in self.placed.keys().copied().filter(|h| tops.contains(h)) {
+        let ghosts: HashSet<_> = tops.iter().copied().filter(|h| self.p.is_ghost(*h, cur)).collect();
+        let gone_ghosts: HashSet<_> = ghosts.intersection(&self.ghost_seen).copied().collect();
+        self.ghost_seen = ghosts;
+        let live: HashSet<_> = tops.iter().copied().filter(|h| !gone_ghosts.contains(h)
+            && (self.p.is_visible(*h, cur) || self.ghost_seen.contains(h))).collect();
+        self.reserved.retain(|h| live.contains(h));
+        for h in self.placed.keys().copied().filter(|h| live.contains(h)) {
             if suspend_placement(self.p.is_maximized(h), self.p.is_fullscreen(h), self.placed.get(&h).map(|p| p.target), self.p.visible_rect(h)) {
                 self.reserved.insert(h);
             }
@@ -274,8 +292,8 @@ impl<P: Win> App<P> {
             .copied()
             .filter(|&h| {
                 let tracked = self.surfaces.values().any(|s| s.tree.contains(h));
-                (tracked && (self.p.is_minimized(h) || self.p.is_maximized(h) || self.p.is_fullscreen(h) || self.reserved.contains(&h)))
-                    || self.managed(h, cur) && !self.p.is_fullscreen(h)
+                live.contains(&h) && ((tracked && (self.p.is_minimized(h) || self.p.is_maximized(h) || self.p.is_fullscreen(h) || self.reserved.contains(&h)))
+                    || tracked && self.ghost_seen.contains(&h) || self.managed(h, cur) && !self.p.is_fullscreen(h))
             })
             .map(|h| (h, self.p.surface_of(h)))
             .filter(|&(_, (k, _))| self.desktop_on(k.desktop))
@@ -286,11 +304,15 @@ impl<P: Win> App<P> {
         }
         for s in self.surfaces.values_mut() {
             s.tree.mins = self.mins.clone();
+            s.tree.skipped = tops.iter().copied().filter(|h| self.p.is_minimized(*h)).collect();
         }
 
         // Paused desktops retain their manual trees until enabled again.
         for (key, s) in self.surfaces.iter_mut() {
-            if self.disabled.contains(&key.desktop) { continue; }
+            if self.disabled.contains(&key.desktop) {
+                for h in s.tree.leaves() { if !tops.contains(&h) { s.tree.remove(h); } }
+                continue;
+            }
             s.area = current.values().find(|(k, _)| k == key).map(|(_, a)| *a).unwrap_or(s.area);
             for h in s.tree.leaves() {
                 if current.get(&h).map(|(k, _)| k) != Some(key) {
@@ -311,12 +333,13 @@ impl<P: Win> App<P> {
             if self.surface_containing(h).is_some() {
                 continue;
             }
-            let focused = self.focused;
+            let focused = self.last_tracked_focus;
             let info = if self.cfg.verbose_log { format!("{h:x} {} ({})", clean_text(&self.p.title(h), 40), self.p.exe_name(h)) } else { format!("{h:x}") };
             let mins = self.mins.clone();
             let s = self.surfaces.entry(key).or_insert_with(|| Surface { tree: Tree::new(), area });
             s.area = area;
             s.tree.mins = mins;
+            s.tree.skipped = tops.iter().copied().filter(|h| self.p.is_minimized(*h)).collect();
             if s.tree.add(h, area, focused) {
                 dirty.insert(key);
                 self.floating.remove(&h);
@@ -336,7 +359,8 @@ impl<P: Win> App<P> {
 
     fn apply(&mut self, key: SurfaceKey, force: bool) {
         if self.shown == 0 || key.desktop != self.shown || !self.desktop_on(key.desktop) { return; }
-        let Some(s) = self.surfaces.get(&key) else { return };
+        let Some(s) = self.surfaces.get_mut(&key) else { return };
+        s.tree.skipped = s.tree.leaves().into_iter().filter(|h| self.p.is_minimized(*h)).collect();
         let area = s.area;
         let layout = s.tree.layout(area);
         let mut learned = false;
@@ -419,13 +443,22 @@ impl<P: Win> App<P> {
         }
     }
 
+    fn observe_foreground(&mut self, h: Hwnd) {
+        if self.hover_foreground.map(|(fg, _)| fg) != Some(h) {
+            self.hover_foreground = self.p.cursor_position().map(|pos| (h, pos));
+            self.hover = None;
+        }
+    }
+
     fn on_focus(&mut self, h: Hwnd) {
+        self.observe_foreground(h);
         if !self.desktop_on(self.shown) || self.surface_containing(h).is_none() {
             self.focused = None;
             if let Some(prev) = self.bordered.take() { self.set_border(prev, COLOR_DEFAULT); }
             return;
         }
         self.focused = Some(h);
+        self.last_tracked_focus = Some(h);
         if let Some(prev) = self.bordered.take() && prev != h { self.set_border(prev, COLOR_DEFAULT); }
         self.set_border(h, ACCENT);
         self.bordered = Some(h);
@@ -470,9 +503,12 @@ impl<P: Win> App<P> {
         if let Some(d) = &self.drag {
             if !self.drag_desktop_valid(d.key.desktop) { self.cancel_drag(); }
             else {
-                let down = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 };
+                let swapped = unsafe { GetSystemMetrics(SM_SWAPBUTTON) != 0 };
+                let button = if swapped { VK_RBUTTON } else { VK_LBUTTON };
+                let down = unsafe { GetAsyncKeyState(button.0 as i32) < 0 };
+                let released = drag_released(self.p.move_size_active(d.hwnd), down);
                 let d = self.drag.as_mut().expect("drag was checked");
-                if released_for_timeout(&mut d.released_since, down, Instant::now()) {
+                if released_for_timeout(&mut d.released_since, !released, Instant::now()) {
                     let h = d.hwnd;
                     self.drag_end(h);
                 }
@@ -490,6 +526,11 @@ impl<P: Win> App<P> {
         self.cancel_drag();
         let tops = self.p.all_top_level();
         let old = std::mem::take(&mut self.surfaces);
+        let mut old: Vec<_> = old.into_iter().collect();
+        old.sort_by_key(|(old_key, surface)| {
+            !surface.tree.leaves().into_iter().find(|h| tops.contains(h))
+                .is_some_and(|h| self.p.surface_of(h).0 == *old_key)
+        });
         for (_, mut surface) in old {
             let Some(h) = surface.tree.leaves().into_iter().find(|h| tops.contains(h)) else { continue };
             let (key, area) = self.p.surface_of(h);
@@ -511,7 +552,7 @@ impl<P: Win> App<P> {
         let move_only = self.p.is_maximized(h);
         let v = if move_only { self.surfaces[&key].tree.rect_of(self.surfaces[&key].area, h).unwrap_or(v) } else { v };
         log(&format!("drag start {h:x}"));
-        self.drag = Some(Drag { hwnd: h, key, start: v, resize: false, move_only, released_since: None, target: None });
+        self.drag = Some(Drag { hwnd: h, key, start: v, resize: false, move_only, intent: self.p.resize_intent(h), dpi: self.p.dpi(h), monitor_changed: false, released_since: None, target: None });
         set_timer(self.main, TIMER_DRAG, 30);
     }
 
@@ -543,6 +584,11 @@ impl<P: Win> App<P> {
         let (h, home) = (d.hwnd, d.key);
         if !self.drag_desktop_valid(home.desktop) { self.cancel_drag(); return; }
         let visible = self.p.visible_rect(h);
+        let changed = self.p.monitor_of(h).0 != home.monitor || self.p.dpi(h) != d.dpi;
+        if let Some(d) = self.drag.as_mut() {
+            d.monitor_changed |= changed;
+            if d.monitor_changed { d.resize = false; }
+        }
         let cursor = self.cursor_surface(self.shown);
         let preview = update_drag(self.drag.as_mut().expect("drag was checked"), visible, cursor, &self.surfaces);
         match preview {
@@ -655,6 +701,7 @@ impl<P: Win> App<P> {
             }
             let under = id_of(GetAncestor(WindowFromPoint(pt), GA_ROOT));
             let fg = id_of(GetForegroundWindow());
+            self.observe_foreground(fg);
             if self.hover_attempted != Some(under) { self.hover_attempted = None; }
             if self.p.is_fullscreen(fg) || self.p.is_maximized(fg) || foreground_has_menu(hwnd_of(fg)) {
                 self.hover = None;
@@ -674,12 +721,21 @@ impl<P: Win> App<P> {
     }
 
     fn hover_ready(&mut self, under: Hwnd, fg: Hwnd, now: Instant) -> bool {
+        self.observe_foreground(fg);
+        if self.hover_attempted != Some(under) { self.hover_attempted = None; }
+        let Some(pos) = self.p.cursor_position() else { self.hover = None; return false };
+        if self.hover_foreground.is_none_or(|(_, anchor)| !cursor_moved(anchor, pos))
+            || self.hover_attempt_position.is_some_and(|anchor| !cursor_moved(anchor, pos)) {
+            self.hover = None;
+            return false;
+        }
         if self.hover_attempted != Some(under) { self.hover_attempted = None; }
         match self.hover {
             Some((h, f, since)) if h == under && f == fg => {
                 if now.saturating_duration_since(since) < Duration::from_millis(self.cfg.focus_delay_ms) || self.hover_attempted == Some(under) { return false; }
                 if self.current_desktop() != self.shown { self.hover = None; return false; }
                 self.hover_attempted = Some(under);
+                self.hover_attempt_position = Some(pos);
                 true
             }
             _ => { self.hover = Some((under, fg, now)); false }
@@ -743,6 +799,10 @@ impl<P: Win> App<P> {
         notify(NIM_MODIFY, &self.tray_data());
     }
 
+    fn reload_saved_settings(&mut self, result: std::io::Result<()>) {
+        match result { Ok(()) => self.cfg = Config::load(), Err(e) => log(&format!("settings update failed: {e}")) }
+    }
+
     fn menu_command(&mut self, cmd: usize) -> Option<std::path::PathBuf> {
         let app = self;
         unsafe {
@@ -754,14 +814,12 @@ impl<P: Win> App<P> {
                 }
                 MENU_FFM_OFF => {
                     app.cfg.focus_follows_mouse = false;
-                    if let Err(e) = Config::update_keys(&[("focus_follows_mouse", "false")]) { log(&format!("settings update failed: {e}")); }
-                    app.cfg = Config::load();
+                    app.reload_saved_settings(Config::update_keys(&[("focus_follows_mouse", "false")]));
                 }
                 c if (MENU_FFM_BASE..MENU_FFM_BASE + FFM_PRESETS.len()).contains(&c) => {
                     app.cfg.focus_follows_mouse = true;
                     app.cfg.focus_delay_ms = FFM_PRESETS[c - MENU_FFM_BASE];
-                    if let Err(e) = Config::update_keys(&[("focus_follows_mouse", "true"), ("focus_delay_ms", &app.cfg.focus_delay_ms.to_string())]) { log(&format!("settings update failed: {e}")); }
-                    app.cfg = Config::load();
+                    app.reload_saved_settings(Config::update_keys(&[("focus_follows_mouse", "true"), ("focus_delay_ms", &app.cfg.focus_delay_ms.to_string())]));
                     log(&format!("focus follows mouse after {} ms", app.cfg.focus_delay_ms));
                 }
                 MENU_EXIT => {
@@ -912,17 +970,21 @@ fn paint_overlay(hwnd: HWND) {
     }
 }
 
-fn queue_pending(msg: u32, wp: WPARAM, lp: LPARAM) {
+fn queue_pending(msg: u32, wp: WPARAM, lp: LPARAM) -> bool {
     if matches!(msg, WM_EVENT | WM_TIMER | WM_HOTKEY | WM_TRAY | WM_DISPLAYCHANGE | WM_SETTINGCHANGE) || msg == TASKBAR_CREATED.with(Cell::get) && msg != 0 {
         PENDING.with(|p| p.borrow_mut().push_back(PendingEvent { msg, wp: wp.0, lp: lp.0 }));
+        return true;
     }
+    false
 }
 
 fn dispatch<P: Win>(app: &mut App<P>, event: PendingEvent) -> bool {
     let PendingEvent { msg, wp, lp } = event;
     if app.taskbar_created != 0 && msg == app.taskbar_created { notify(NIM_ADD, &app.tray_data()); return true; }
-    if msg == WM_EVENT && matches!(wp as u32, 0x0003 | 0x0020) { app.p.invalidate_desktop(); }
-    app.dispatch_desktop = Some(app.p.current_desktop());
+    if msg == WM_EVENT && matches!(wp as u32, 0x0003 | 0x0020 | 0x8017 | 0x8018) { app.p.invalidate_desktop(); }
+    if msg == WM_TIMER && wp == TIMER_HOVER && !app.cfg.focus_follows_mouse { return true; }
+    app.dispatch_desktop.set(None);
+    app.dispatching = true;
     match msg {
         WM_EVENT => match wp as u32 {
             0x0003 => { app.on_focus(lp); set_timer(app.main, TIMER_RECONCILE, 80); },
@@ -942,9 +1004,9 @@ fn dispatch<P: Win>(app: &mut App<P>, event: PendingEvent) -> bool {
         WM_SETTINGCHANGE if wp == SPI_SETWORKAREA.0 as usize => app.refresh_surfaces(),
         WM_HOTKEY if wp == HOTKEY_TOGGLE as usize => app.toggle(),
         WM_TRAY if lp as u32 == WM_LBUTTONUP => app.toggle(),
-        _ => { app.dispatch_desktop = None; return false; },
+        _ => { app.dispatch_desktop.set(None); app.dispatching = false; return false; },
     };
-    app.dispatch_desktop = None;
+    app.dispatch_desktop.set(None); app.dispatching = false;
     true
 }
 
@@ -985,7 +1047,7 @@ fn main_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         return LRESULT(0);
     }
     let handled = APP.with(|a| {
-        let Ok(mut guard) = a.try_borrow_mut() else { queue_pending(msg, wp, lp); return true; };
+        let Ok(mut guard) = a.try_borrow_mut() else { return queue_pending(msg, wp, lp); };
         guard.as_mut().is_some_and(|app| dispatch(app, PendingEvent { msg, wp: wp.0, lp: lp.0 }))
     });
     if PENDING.with(|p| !p.borrow().is_empty()) && APP.with(|a| a.try_borrow_mut().is_ok()) {
@@ -1027,22 +1089,25 @@ pub fn run(filter: Option<String>) {
         let platform = Platform::new();
         let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
         if taskbar_created == 0 { log("could not register TaskbarCreated message"); }
+        else if ChangeWindowMessageFilterEx(main, taskbar_created, MSGFLT_ALLOW, None).is_err() {
+            log("could not allow TaskbarCreated through the elevated message filter");
+        }
         TASKBAR_CREATED.with(|id| id.set(taskbar_created));
         let app = App {
             p: platform,
             disabled: HashSet::new(),
             cfg,
             hover: None,
-            hover_attempted: None,
+            hover_attempted: None, hover_foreground: None, hover_attempt_position: None, ghost_seen: HashSet::new(),
             reserved: HashSet::new(),
             shown: 0,
             desktop_error_logged: false,
-            dispatch_desktop: None,
+            dispatch_desktop: Cell::new(None), dispatching: false,
             mins: HashMap::new(),
             placed: HashMap::new(),
             floating: HashSet::new(),
             surfaces: HashMap::new(),
-            focused: None,
+            focused: None, last_tracked_focus: None,
             bordered: None,
             border_original: HashMap::new(),
             taskbar_created,
@@ -1110,7 +1175,7 @@ fn suspend_placement(maximized: bool, fullscreen: bool, placed: Option<Rect>, vi
 fn update_drag(d: &mut Drag, visible: Option<Rect>, cursor: Option<(SurfaceKey, Rect, i32, i32)>, surfaces: &HashMap<SurfaceKey, Surface>) -> Option<(Rect, Vec<(Hwnd, Rect)>)> {
     d.target = None;
     let visible = visible?;
-    d.resize |= !d.move_only && is_resize(d.start, visible);
+    d.resize = !d.move_only && !d.monitor_changed && d.intent.unwrap_or_else(|| is_resize(d.start, visible));
     if d.resize { return None; }
     let (key, area, cx, cy) = cursor?;
     let h = d.hwnd;
@@ -1157,7 +1222,19 @@ fn released_for_timeout(since: &mut Option<Instant>, down: bool, now: Instant) -
     now.saturating_duration_since(*since.get_or_insert(now)) >= Duration::from_millis(500)
 }
 
+fn cursor_moved(a: (i32, i32), b: (i32, i32)) -> bool {
+    (i64::from(a.0) - i64::from(b.0)).abs() > 4 || (i64::from(a.1) - i64::from(b.1)).abs() > 4
+}
+
+fn drag_released(move_size_active: Option<bool>, primary_down: bool) -> bool {
+    !move_size_active.unwrap_or(primary_down)
+}
+
 fn is_resize(start: Rect, now: Rect) -> bool {
+    // Uniform DPI scaling can leave a top/bottom edge fixed during a move.
+    if start.w != now.w && start.h != now.h
+        && (i64::from(start.w) * i64::from(now.h) - i64::from(now.w) * i64::from(start.h)).abs()
+            <= i64::from(start.w.max(start.h)).max(1) * 3 { return false; }
     let moved = |a: i32, b: i32| (i64::from(a) - i64::from(b)).abs() > 3;
     (moved(start.x, now.x) && !moved(start.right(), now.right()))
         || (moved(start.right(), now.right()) && !moved(start.x, now.x))
@@ -1207,7 +1284,7 @@ mod tests {
         let mut tree = Tree::new();
         tree.add(1, area, None);
         tree.add(2, area, None);
-        let drag = Drag { hwnd: 1, key, start: tree.rect_of(area, 1).unwrap(), resize: false, move_only: false, released_since: None, target: None };
+        let drag = Drag { hwnd: 1, key, start: tree.rect_of(area, 1).unwrap(), resize: false, move_only: false, intent: None, dpi: 96, monitor_changed: false, released_since: None, target: None };
         (drag, HashMap::from([(key, Surface { tree, area })]), area)
     }
     #[test]
@@ -1326,11 +1403,11 @@ mod scenarios {
     #[derive(Clone)]
     struct Window {
         rect: Rect, minimum: (i32, i32), maximized: bool, minimized: bool,
-        fullscreen: bool, hung: bool, styled: bool, desktop: u128, ignores: bool,
+        fullscreen: bool, hung: bool, styled: bool, desktop: u128, ignores: bool, hidden: bool,
     }
     struct FakeWin {
         windows: RefCell<HashMap<Hwnd, Window>>,
-        area: Cell<Rect>, desktop: Cell<u128>, desktop_queries: Cell<usize>, requests: RefCell<Vec<(Hwnd, Rect)>>,
+        area: Cell<Rect>, desktop: Cell<u128>, desktop_queries: Cell<usize>, requests: RefCell<Vec<(Hwnd, Rect)>>, cursor: Cell<(i32, i32)>,
     }
     impl Win for FakeWin {
         fn visible_rect(&self, h: Hwnd) -> Option<Rect> { self.windows.borrow().get(&h).map(|w| w.rect) }
@@ -1350,20 +1427,22 @@ mod scenarios {
         fn all_top_level(&self) -> Vec<Hwnd> { let mut v: Vec<_> = self.windows.borrow().keys().copied().collect(); v.sort(); v }
         fn monitor_of(&self, _: Hwnd) -> (isize, Rect) { (1, self.area.get()) }
         fn is_manageable(&self, h: Hwnd, _: u128) -> bool { let w = &self.windows.borrow()[&h]; w.styled && !w.minimized }
+        fn is_visible(&self, h: Hwnd, _: u128) -> bool { !self.windows.borrow()[&h].hidden }
         fn title(&self, _: Hwnd) -> String { "test".into() }
         fn exe_name(&self, _: Hwnd) -> String { "test.exe".into() }
         fn class_name(&self, _: Hwnd) -> String { "test".into() }
         fn current_desktop(&self) -> u128 { self.desktop_queries.set(self.desktop_queries.get() + 1); self.desktop.get() }
         fn invalidate_desktop(&self) {}
+        fn cursor_position(&self) -> Option<(i32, i32)> { Some(self.cursor.get()) }
     }
     fn app() -> (App<FakeWin>, SurfaceKey) {
         let area = Rect::new(0, 0, 1920, 1080);
         let mut windows = HashMap::new();
-        for h in [1, 2] { windows.insert(h, Window { rect: Rect::new(50, 50, 1000, 700), minimum: (0, 0), maximized: false, minimized: false, fullscreen: false, hung: false, styled: true, desktop: 1, ignores: false }); }
-        let p = FakeWin { windows: RefCell::new(windows), area: Cell::new(area), desktop: Cell::new(1), desktop_queries: Cell::new(0), requests: RefCell::new(Vec::new()) };
+        for h in [1, 2] { windows.insert(h, Window { rect: Rect::new(50, 50, 1000, 700), minimum: (0, 0), maximized: false, minimized: false, fullscreen: false, hung: false, styled: true, desktop: 1, ignores: false, hidden: false }); }
+        let p = FakeWin { windows: RefCell::new(windows), area: Cell::new(area), desktop: Cell::new(1), desktop_queries: Cell::new(0), requests: RefCell::new(Vec::new()), cursor: Cell::new((0, 0)) };
         let (drag, surfaces, _) = super::tests::drag_fixture();
         let key = drag.key;
-        (App { p, disabled: HashSet::new(), cfg: Config::default(), hover: None, hover_attempted: None, reserved: HashSet::new(), shown: 1, desktop_error_logged: false, dispatch_desktop: None, mins: HashMap::new(), placed: HashMap::new(), floating: HashSet::new(), surfaces, focused: None, bordered: None, border_original: HashMap::new(), taskbar_created: 0, drag: None, overlay: HWND::default(), main: HWND::default(), filter: None, icon_on: HICON::default(), icon_off: HICON::default() }, key)
+        (App { p, disabled: HashSet::new(), cfg: Config::default(), hover: None, hover_attempted: None, hover_foreground: None, hover_attempt_position: None, ghost_seen: HashSet::new(), reserved: HashSet::new(), shown: 1, desktop_error_logged: false, dispatch_desktop: Cell::new(None), dispatching: false, mins: HashMap::new(), placed: HashMap::new(), floating: HashSet::new(), surfaces, focused: None, last_tracked_focus: None, bordered: None, border_original: HashMap::new(), taskbar_created: 0, drag: None, overlay: HWND::default(), main: HWND::default(), filter: None, icon_on: HICON::default(), icon_off: HICON::default() }, key)
     }
     fn poll(app: &mut App<FakeWin>, key: SurfaceKey) {
         for p in app.placed.values_mut() { p.requested = Instant::now() - Duration::from_secs(1); }
@@ -1443,7 +1522,9 @@ mod scenarios {
         let count = a.p.requests.borrow().len();
         { let mut w = a.p.windows.borrow_mut(); for window in w.values_mut() { window.minimized = true; window.maximized = false; } }
         a.reconcile(false);
-        assert_eq!(a.surfaces[&key].tree.layout(area), layout);
+        // Minimised windows keep their place and weights but take no space.
+        assert!(a.surfaces[&key].tree.layout(area).is_empty());
+        assert_eq!(a.surfaces[&key].tree.leaves().len(), 2);
         { let mut w = a.p.windows.borrow_mut(); for window in w.values_mut() { window.minimized = false; } w.get_mut(&1).unwrap().maximized = true; }
         a.reconcile(false);
         assert_eq!(a.p.requests.borrow().len(), count);
@@ -1509,13 +1590,18 @@ mod scenarios {
     #[test]
     fn failed_hover_focus_is_attempted_once_until_a_different_window_is_hovered() {
         let (mut a, _) = app(); let now = Instant::now();
-        assert!(!a.hover_ready(1, 2, now));
-        assert!(a.hover_ready(1, 2, now + Duration::from_millis(300)));
+        a.p.cursor.set((0, 0));
+        assert!(!a.hover_ready(1, 2, now)); // anchors the cursor at the foreground change
+        a.p.cursor.set((50, 50));
+        assert!(!a.hover_ready(1, 2, now + Duration::from_millis(10))); // cursor moved: arms
+        assert!(a.hover_ready(1, 2, now + Duration::from_millis(310)));
         // Simulate Windows refusing focus: the foreground remains unchanged over many ticks.
         for seconds in 1..20 { assert!(!a.hover_ready(1, 2, now + Duration::from_secs(seconds))); }
         assert!(!a.hover_ready(2, 1, now + Duration::from_secs(21)));
         assert!(!a.hover_ready(1, 2, now + Duration::from_secs(22)));
-        assert!(a.hover_ready(1, 2, now + Duration::from_secs(23)));
+        a.p.cursor.set((300, 300));
+        assert!(!a.hover_ready(1, 2, now + Duration::from_secs(23))); // arms after the move
+        assert!(a.hover_ready(1, 2, now + Duration::from_secs(24)));
     }
     #[test]
     fn each_dispatch_uses_one_desktop_query_even_when_drag_validation_repeats() {
@@ -1525,7 +1611,7 @@ mod scenarios {
         // Both drag_tick and poll_drag_release validate the desktop in this dispatch.
         dispatch(&mut a, PendingEvent { msg: WM_TIMER, wp: TIMER_DRAG, lp: 0 });
         assert_eq!(a.p.desktop_queries.get(), queries + 1);
-        assert!(a.dispatch_desktop.is_none());
+        assert!(a.dispatch_desktop.get().is_none());
     }
     #[test]
     fn hard_linked_log_cannot_modify_the_link_target() {
