@@ -4,7 +4,7 @@ This document describes the intended behaviour of the program, the reasons behin
 is going. It is the reference that code, tests and reviews are measured against. Sections marked
 **(planned)** are not implemented yet.
 
-Project name: *CosmicTile*.
+Project name: *Tilework*.
 
 ## 1. Vision
 
@@ -139,7 +139,7 @@ is on for the shown desktop, the program switches Snap off through `SystemParame
 (`SPI_SETWINARRANGING`) **for the running session only** (nothing is written to the registry), and
 restores the previous state on exit and on desktops where tiling is off. `--restore-snap` restores
 it manually (enabling Snap and removing the recovery marker). Before disabling Snap, the original
-state is read when ownership is taken and flushed to `%LOCALAPPDATA%\CosmicTile\snap-off.flag` as `1` or `0`. Normal shutdown,
+state is read when ownership is taken and flushed to `%LOCALAPPDATA%\Tilework\snap-off.flag` as `1` or `0`. Normal shutdown,
 a Rust panic, console control events and session end attempt restoration. A successful restoration
 removes the marker; a failed one retains it. On the next managed startup, an existing marker is
 recovered before changing Snap again. A forced process kill may leave Snap off until that recovery,
@@ -182,7 +182,7 @@ Key design decisions:
 The tray icon is re-added after Explorer restarts. A named process mutex prevents a second manager.
 The Windows manifest requests the caller's existing privileges; it does not request elevation.
 
-Diagnostics: a log at `%LOCALAPPDATA%\<name>\cosmictile.log` records adds, removals, drops,
+Diagnostics: a log at `%LOCALAPPDATA%\<name>\tilework.log` records adds, removals, drops,
 learned minimum sizes and desktop switches. The log is capped at 1 MB with one rotated backup.
 Timestamps include the UTC date. Window titles are omitted by default; `verbose_log=true` enables
 sanitized titles limited to 40 characters. `--dump` prints the layout the program would apply,

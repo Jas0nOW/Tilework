@@ -161,7 +161,7 @@ impl Platform {
                 return false;
             }
             let class = self.class_name(h);
-            if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "CosmicTileOverlay" | "CosmicTileMain") {
+            if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "TileworkOverlay" | "TileworkMain") {
                 return false;
             }
             let mut r = RECT::default();
@@ -638,7 +638,7 @@ mod snap_tests {
 
     #[test]
     fn recovery_only_changes_snap_for_a_valid_marker_and_retains_failed_recovery() {
-        let dir = std::env::temp_dir().join(format!("cosmictile-snap-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let dir = std::env::temp_dir().join(format!("tilework-snap-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("snap.flag");
         let _ = std::fs::remove_file(&path);

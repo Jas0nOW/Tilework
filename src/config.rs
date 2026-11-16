@@ -1,4 +1,4 @@
-//! User settings, stored as a plain `key=value` file in `%LOCALAPPDATA%\CosmicTile\config.ini`.
+//! User settings, stored as a plain `key=value` file in `%LOCALAPPDATA%\Tilework\config.ini`.
 //! Unknown keys and broken lines are ignored so an old or hand-edited file never stops the app.
 
 use std::path::{Path, PathBuf};
@@ -47,7 +47,7 @@ impl Config {
 
     pub fn to_text(&self) -> String {
         format!(
-            "# CosmicTile settings (changes made here apply after restarting CosmicTile)\n\
+            "# Tilework settings (changes made here apply after restarting Tilework)\n\
              # Hover a window for focus_delay_ms to give it the keyboard focus.\n\
              focus_follows_mouse={}\n\
              focus_delay_ms={}\n\
@@ -88,7 +88,12 @@ impl Config {
 fn config_path(base: Option<std::ffi::OsString>) -> Option<PathBuf> {
     let base = PathBuf::from(base?);
     // A malformed environment variable must not redirect writes into the working directory.
-    base.is_absolute().then(|| base.join("CosmicTile").join("config.ini"))
+    base.is_absolute().then(|| base.join("Tilework").join("config.ini"))
+}
+
+/// Settings location of the former project name, next to the current one.
+fn legacy_config_path(path: &Path) -> Option<PathBuf> {
+    Some(path.parent()?.parent()?.join("CosmicTile").join("config.ini"))
 }
 
 fn load_from_path(path: &Path) -> Config {
@@ -103,6 +108,14 @@ fn load_from_path(path: &Path) -> Config {
     match read_file(path) {
         Ok(text) => Config::parse(&text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // One-time migration from the former name (CosmicTile): keep the user's settings.
+            if let Some(text) = legacy_config_path(path).and_then(|old| std::fs::read_to_string(old).ok()) {
+                let config = Config::parse(&text);
+                if let Err(write_error) = ensure_exists_at(path, &config.to_text()) {
+                    crate::app::log(&format!("could not migrate legacy config: {write_error}"));
+                }
+                return config;
+            }
             let config = Config::default();
             if let Err(write_error) = ensure_exists_at(path, &config.to_text()) {
                 crate::app::log(&format!("could not create default config: {write_error}"));
@@ -316,13 +329,13 @@ mod tests {
         assert_eq!(config_path(Some("".into())), None);
         assert_eq!(config_path(Some("relative-app-data".into())), None);
         let base = std::env::temp_dir();
-        assert_eq!(config_path(Some(base.clone().into_os_string())), Some(base.join("CosmicTile").join("config.ini")));
+        assert_eq!(config_path(Some(base.clone().into_os_string())), Some(base.join("Tilework").join("config.ini")));
     }
 
     fn test_file(label: &str) -> PathBuf {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let dir = std::env::temp_dir().join(format!("cosmictile-config-{}-{nonce}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        let dir = std::env::temp_dir().join(format!("tilework-config-{}-{nonce}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(format!("config-test-{}-{label}.ini", std::process::id()))
     }
@@ -376,6 +389,24 @@ mod tests {
         assert_eq!(load_from_path(&path), Config::default());
         assert_eq!(Config::parse(&std::fs::read_to_string(&path).unwrap()), Config::default());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn settings_of_the_former_name_are_migrated_once() {
+        let root = test_file("legacy-root");
+        let old = root.join("CosmicTile").join("config.ini");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, "focus_delay_ms=900
+min_zone_width=333
+").unwrap();
+        let path = root.join("Tilework").join("config.ini");
+        let c = load_from_path(&path);
+        assert_eq!((c.focus_delay_ms, c.min_zone_width), (900, 333));
+        assert_eq!(Config::parse(&std::fs::read_to_string(&path).unwrap()), c);
+        std::fs::write(&old, "focus_delay_ms=100
+").unwrap();
+        assert_eq!(load_from_path(&path).focus_delay_ms, 900, "the migrated file wins afterwards");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

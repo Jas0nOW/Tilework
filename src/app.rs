@@ -153,7 +153,7 @@ pub fn log(msg: &str) {
     let Some(dir) = Config::path().and_then(|p| p.parent().map(std::path::Path::to_path_buf)) else { return };
     if crate::config::safe_path(&dir).is_err() { return; }
     let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("cosmictile.log");
+    let path = dir.join("tilework.log");
     let date = unsafe { windows::Win32::System::SystemInformation::GetSystemTime() };
     let msg = clean_text(msg, 500);
     let line = format!("[{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC] {msg}\n", date.wYear, date.wMonth, date.wDay, date.wHour, date.wMinute, date.wSecond);
@@ -786,9 +786,9 @@ impl<P: Win> App<P> {
         let mut nid = NOTIFYICONDATAW { cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32, hWnd: self.main, uID: 1, uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP, uCallbackMessage: WM_TRAY, ..Default::default() };
         let on = self.shown != 0 && self.desktop_on(self.shown);
         nid.hIcon = if on { self.icon_on } else { self.icon_off };
-        let tip = if self.shown == 0 { "CosmicTile: paused (desktop identity unavailable)" }
-            else if on { "CosmicTile: ON for this desktop (click to turn off)" }
-            else { "CosmicTile: OFF for this desktop (click to turn on)" };
+        let tip = if self.shown == 0 { "Tilework: paused (desktop identity unavailable)" }
+            else if on { "Tilework: ON for this desktop (click to turn off)" }
+            else { "Tilework: OFF for this desktop (click to turn on)" };
         for (i, c) in tip.encode_utf16().take(127).enumerate() {
             nid.szTip[i] = c;
         }
@@ -900,7 +900,7 @@ unsafe fn build_and_track_menu(cfg: &Config, main: HWND, on: bool) -> usize {
             }
             if let Err(e) = AppendMenuW(menu, MF_STRING, MENU_OPEN_CONFIG, w!("Open settings file")) { log(&format!("could not append tray menu item: {e}")); }
             if let Err(e) = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) { log(&format!("could not append tray menu item: {e}")); }
-            if let Err(e) = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Exit CosmicTile")) { log(&format!("could not append tray menu item: {e}")); }
+            if let Err(e) = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Exit Tilework")) { log(&format!("could not append tray menu item: {e}")); }
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
             let _ = SetForegroundWindow(main);
@@ -1062,12 +1062,12 @@ pub fn run(filter: Option<String>) {
     crate::tree::set_min_zone(cfg.min_zone_width, cfg.min_zone_height);
     unsafe {
         let hinst = GetModuleHandleW(None).unwrap();
-        let class_main = w!("CosmicTileMain");
-        let class_overlay = w!("CosmicTileOverlay");
+        let class_main = w!("TileworkMain");
+        let class_overlay = w!("TileworkOverlay");
         let accent_brush = CreateSolidBrush(COLORREF(ACCENT));
         RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(main_proc), hInstance: hinst.into(), lpszClassName: class_main, ..Default::default() });
         RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(overlay_proc), hInstance: hinst.into(), lpszClassName: class_overlay, hbrBackground: accent_brush, ..Default::default() });
-        let main = CreateWindowExW(WINDOW_EX_STYLE(0), class_main, w!("CosmicTile"), WS_OVERLAPPED, 0, 0, 0, 0, None, None, Some(hinst.into()), None).unwrap();
+        let main = CreateWindowExW(WINDOW_EX_STYLE(0), class_main, w!("Tilework"), WS_OVERLAPPED, 0, 0, 0, 0, None, None, Some(hinst.into()), None).unwrap();
         MAIN_HANDLE.with(|h| h.set(main));
         let overlay = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -1328,7 +1328,7 @@ mod tests {
     }
     #[test]
     fn log_rotation_keeps_one_backup_and_caps_the_active_file() {
-        let dir = std::env::temp_dir().join(format!("cosmictile-log-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let dir = std::env::temp_dir().join(format!("tilework-log-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("events.log");
         let backup = path.with_extension("log.1");
@@ -1615,7 +1615,7 @@ mod scenarios {
     }
     #[test]
     fn hard_linked_log_cannot_modify_the_link_target() {
-        let dir = std::env::temp_dir().join(format!("cosmictile-hardlink-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let dir = std::env::temp_dir().join(format!("tilework-hardlink-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("sentinel"); let log = dir.join("events.log");
         std::fs::write(&target, "unchanged").unwrap();

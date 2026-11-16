@@ -18,6 +18,6 @@ jobs:
       - run: cargo build --release
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: CosmicTile-Windows
-          path: target/release/cosmictile.exe
+          name: Tilework-Windows
+          path: target/release/tilework.exe
           if-no-files-found: error

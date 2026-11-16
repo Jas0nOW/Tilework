@@ -44,7 +44,7 @@ fn main() {
     unsafe {
         use windows::Win32::System::Threading::CreateMutexW;
         use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
-        let mutex = match CreateMutexW(None, false, windows::core::w!("Local\\CosmicTileSingleInstance")) {
+        let mutex = match CreateMutexW(None, false, windows::core::w!("Local\\TileworkSingleInstance")) {
             Ok(m) => m,
             Err(e) => { app::log(&format!("could not create single-instance mutex: {e}")); return; }
         };
@@ -52,7 +52,7 @@ fn main() {
         let restore = args.iter().any(|a| a == "--restore-snap");
         let force = args.iter().any(|a| a == "--force");
         if restore_refused(restore, running, force) {
-            eprintln!("CosmicTile is running; close it first or use --force to restore Snap.");
+            eprintln!("Tilework is running; close it first or use --force to restore Snap.");
             let _ = CloseHandle(mutex);
             std::process::exit(3);
         }
