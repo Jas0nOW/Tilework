@@ -2,13 +2,14 @@
 
 use crate::tree::Rect;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU8, Ordering};
+use windows::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT};
 use windows::core::{BOOL, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
-use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
-use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -21,6 +22,7 @@ pub struct SurfaceKey {
 
 pub struct Platform {
     vdm: Option<IVirtualDesktopManager>,
+    com_initialized: bool,
 }
 
 pub fn hwnd_of(h: isize) -> HWND {
@@ -34,10 +36,9 @@ pub fn id_of(h: HWND) -> isize {
 impl Platform {
     pub fn new() -> Self {
         unsafe {
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            let com_initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
             let vdm = CoCreateInstance::<_, IVirtualDesktopManager>(&VirtualDesktopManager, None, CLSCTX_ALL).ok();
-            Self { vdm }
+            Self { vdm, com_initialized }
         }
     }
 
@@ -126,10 +127,7 @@ impl Platform {
                 return false;
             }
             let mut r = RECT::default();
-            if GetWindowRect(hw, &mut r).is_err() || r.right - r.left < 80 || r.bottom - r.top < 40 {
-                return false;
-            }
-            true
+            !(GetWindowRect(hw, &mut r).is_err() || r.right - r.left < 80 || r.bottom - r.top < 40)
         }
     }
 
@@ -165,10 +163,14 @@ impl Platform {
 
     /// The desktop that is currently shown, taken from any visible (not cloaked) window.
     pub fn current_desktop(&self) -> u128 {
+        let Some(vdm) = &self.vdm else { return 0 };
         for h in self.all_top_level() {
             unsafe {
                 let hw = hwnd_of(h);
-                if IsWindowVisible(hw).as_bool() && !IsIconic(hw).as_bool() && self.cloaked(h) == 0 {
+                let mut cloak = 0u32;
+                if IsWindowVisible(hw).as_bool() && !IsIconic(hw).as_bool()
+                    && DwmGetWindowAttribute(hw, DWMWA_CLOAKED, &mut cloak as *mut u32 as *mut c_void, 4).is_ok() && cloak == 0
+                    && vdm.IsWindowOnCurrentVirtualDesktop(hw).map(|v| v.as_bool()).unwrap_or(false) {
                     let id = self.raw_desktop_id(h);
                     if id != 0 {
                         return id;
@@ -219,29 +221,42 @@ impl Platform {
         }
     }
 
-    /// Moves a window so that its *visible* edges match `target`.
-    pub fn place(&self, h: isize, target: Rect) {
+    pub fn is_maximized(&self, h: isize) -> bool {
+        unsafe { IsZoomed(hwnd_of(h)).as_bool() }
+    }
+
+    pub fn is_minimized(&self, h: isize) -> bool {
+        unsafe { IsIconic(hwnd_of(h)).as_bool() }
+    }
+
+    pub fn is_hung(&self, h: isize) -> bool {
+        unsafe { IsHungAppWindow(hwnd_of(h)).as_bool() }
+    }
+
+    /// Queues a move so that the window's *visible* edges match `target`.
+    pub fn place(&self, h: isize, target: Rect) -> bool {
         unsafe {
             let hw = hwnd_of(h);
+            if self.is_hung(h) { return false; }
             if IsZoomed(hw).as_bool() {
-                let _ = ShowWindow(hw, SW_RESTORE);
+                let _ = ShowWindowAsync(hw, SW_RESTORE);
             }
             let mut outer = RECT::default();
             if GetWindowRect(hw, &mut outer).is_err() {
-                return;
+                return false;
             }
             let vis = self.visible_rect(h).unwrap_or(Rect::new(outer.left, outer.top, outer.right - outer.left, outer.bottom - outer.top));
             let (il, it) = (vis.x - outer.left, vis.y - outer.top);
             let (ir, ib) = (outer.right - vis.right(), outer.bottom - vis.bottom());
-            let _ = SetWindowPos(
+            SetWindowPos(
                 hw,
                 None,
                 target.x - il,
                 target.y - it,
                 target.w + il + ir,
                 target.h + it + ib,
-                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
-            );
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS,
+            ).is_ok()
         }
     }
 }
@@ -249,19 +264,181 @@ impl Platform {
 const SPI_GETWINARRANGING: u32 = 0x0082;
 const SPI_SETWINARRANGING: u32 = 0x0083;
 
-/// Whether Windows' own window snapping (drag to an edge) is currently active.
-pub fn snap_enabled() -> bool {
-    let mut v: i32 = 1;
+// 0 = not prepared, 1 = originally off, 2 = originally on.
+static SNAP_ORIGINAL: AtomicU8 = AtomicU8::new(0);
+
+fn read_snap() -> Option<bool> {
+    let mut v: i32 = 0;
     unsafe {
-        let _ = SystemParametersInfoW(SYSTEM_PARAMETERS_INFO_ACTION(SPI_GETWINARRANGING), 0, Some(&mut v as *mut i32 as *mut c_void), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
+        SystemParametersInfoW(SYSTEM_PARAMETERS_INFO_ACTION(SPI_GETWINARRANGING), 0, Some(&mut v as *mut i32 as *mut c_void), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)).ok()?;
     }
-    v != 0
+    Some(v != 0)
 }
 
-/// Turns Windows' own snapping on or off for this session. Not written to the registry, so a
-/// crash can never leave the setting broken for good (it is back to normal after sign-out).
-pub fn set_snap(on: bool) {
-    unsafe {
-        let _ = SystemParametersInfoW(SYSTEM_PARAMETERS_INFO_ACTION(SPI_SETWINARRANGING), on as u32, None, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnapWrite { Applied, SetFailed, ReadFailed, Mismatch }
+
+fn write_snap(on: bool) -> SnapWrite {
+    if unsafe { SystemParametersInfoW(SYSTEM_PARAMETERS_INFO_ACTION(SPI_SETWINARRANGING), on as u32, Some(on as usize as *mut c_void), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)).is_err() } {
+        return SnapWrite::SetFailed;
+    }
+    match read_snap() {
+        Some(value) if value == on => SnapWrite::Applied,
+        Some(_) => SnapWrite::Mismatch,
+        None => SnapWrite::ReadFailed,
     }
 }
+
+fn write_snap_logged(on: bool) -> bool {
+    match write_snap(on) {
+        SnapWrite::Applied => true,
+        SnapWrite::SetFailed => { crate::app::log("could not set Windows Snap"); false }
+        SnapWrite::ReadFailed => { crate::app::log("could not verify Windows Snap after setting it"); false }
+        SnapWrite::Mismatch => { crate::app::log("Windows Snap did not take the requested value"); false }
+    }
+}
+
+fn marker_path() -> Option<std::path::PathBuf> {
+    Some(crate::config::Config::path()?.with_file_name("snap-off.flag"))
+}
+
+fn parse_marker(bytes: &[u8]) -> Option<bool> {
+    match bytes { b"1" => Some(true), b"0" => Some(false), _ => None }
+}
+
+/// Whether Windows' own window snapping (drag to an edge) is currently active.
+pub fn snap_status() -> Option<bool> { read_snap() }
+pub fn snap_enabled() -> bool { snap_status().unwrap_or(true) }
+
+/// Direct session-only setting; callers managing ownership should use `managed_snap`.
+pub fn set_snap(on: bool) -> bool { write_snap_logged(on) }
+
+/// Recover a previous interrupted session and install process-level recovery handlers.
+/// Call only after obtaining the single-instance mutex.
+pub fn prepare_snap_recovery() -> bool {
+    let ready = prepare_snap_recovery_inner();
+    if !ready { crate::app::log("could not prepare Windows Snap recovery"); }
+    ready
+}
+
+fn prepare_snap_recovery_inner() -> bool {
+    let Some(path) = marker_path() else { return false };
+    if !restore_marker(&path, None, write_snap_logged) { return false; }
+    let Some(original) = read_snap() else { return false };
+    SNAP_ORIGINAL.store(if original { 2 } else { 1 }, Ordering::SeqCst);
+    if unsafe { SetConsoleCtrlHandler(Some(snap_ctrl_handler), true) }.is_err() {
+        SNAP_ORIGINAL.store(0, Ordering::SeqCst);
+        return false;
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_owned_snap();
+        previous(info);
+    }));
+    true
+}
+
+unsafe extern "system" fn snap_ctrl_handler(event: u32) -> BOOL {
+    if matches!(event, CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT) {
+        restore_owned_snap();
+    }
+    BOOL(0)
+}
+
+/// Set Snap while preserving the original value in a recovery marker before disabling it.
+pub fn managed_snap(on: bool) -> bool {
+    let success = managed_snap_inner(on);
+    if !success { crate::app::log("could not update managed Windows Snap state"); }
+    success
+}
+
+fn managed_snap_inner(on: bool) -> bool {
+    let original = match SNAP_ORIGINAL.load(Ordering::SeqCst) { 1 => false, 2 => true, _ => return false };
+    if on {
+        // A session which started with Snap off must not enable it implicitly.
+        return restore_owned_snap();
+    }
+    let Some(path) = marker_path() else { return false };
+    let Some(dir) = path.parent() else { return false };
+    if std::fs::create_dir_all(dir).is_err() { return false; }
+    let marker = if original { b"1" } else { b"0" };
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            use std::io::Write;
+            if file.write_all(marker).is_err() || file.sync_all().is_err() { return false; }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            if std::fs::read(&path).ok().as_deref() != Some(marker.as_slice()) { return false; }
+        }
+        Err(_) => return false,
+    }
+    write_snap_logged(false)
+}
+
+/// Restore the captured state; retain the marker if Windows rejects the change.
+pub fn restore_owned_snap() -> bool {
+    let original = match SNAP_ORIGINAL.load(Ordering::SeqCst) { 1 => false, 2 => true, _ => return false };
+    let Some(path) = marker_path() else { return false };
+    restore_marker(&path, Some(original), |on| write_snap(on) == SnapWrite::Applied)
+}
+
+/// Recovery is testable without changing Windows settings. An absent marker never writes Snap.
+fn restore_marker(path: &std::path::Path, expected: Option<bool>, set: impl FnOnce(bool) -> bool) -> bool {
+    let original = match std::fs::read(path) {
+        Ok(bytes) => match parse_marker(&bytes) { Some(value) => value, None => return false },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    if expected.is_some_and(|value| value != original) || !set(original) { return false; }
+    match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Explicit user recovery enables Snap regardless of the captured session state.
+pub fn restore_snap_explicit() -> bool {
+    if !write_snap_logged(true) { return false; }
+    let Some(path) = marker_path() else { return false };
+    match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+impl Drop for Platform {
+    fn drop(&mut self) {
+        self.vdm.take();
+        if self.com_initialized { unsafe { CoUninitialize(); } }
+    }
+}
+
+#[cfg(test)]
+mod snap_tests {
+    use super::{parse_marker, restore_marker};
+
+    #[test]
+    fn recovery_only_changes_snap_for_a_valid_marker_and_retains_failed_recovery() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("snap-test-{}.flag", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(restore_marker(&path, None, |_| panic!("no marker must not change Snap")));
+        std::fs::write(&path, "1").unwrap();
+        assert!(!restore_marker(&path, None, |value| { assert!(value); false }));
+        assert!(path.exists());
+        assert!(!restore_marker(&path, Some(false), |_| panic!("ownership mismatch must not change Snap")));
+        assert!(restore_marker(&path, None, |value| { assert!(value); true }));
+        assert!(!path.exists());
+        std::fs::write(&path, "0").unwrap();
+        assert!(restore_marker(&path, None, |value| { assert!(!value); true }));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn marker_only_accepts_the_stored_original_state() {
+        assert_eq!(parse_marker(b"1"), Some(true));
+        assert_eq!(parse_marker(b"0"), Some(false));
+        assert_eq!(parse_marker(b""), None);
+        assert_eq!(parse_marker(b"other"), None);
+    }
+}
+

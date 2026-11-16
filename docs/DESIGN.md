@@ -28,20 +28,20 @@ optional addition **(planned)**.
 
 ## 2. Core concepts
 
-**Surface** – one virtual desktop on one monitor. Every surface has its own layout. Surfaces never
+**Surface** â€“ one virtual desktop on one monitor. Every surface has its own layout. Surfaces never
 influence each other; moving a window to another monitor or desktop moves it to that surface's
 layout.
 
-**Zone tree** – the layout of a surface. The tree is made of containers and windows:
+**Zone tree** â€“ the layout of a surface. The tree is made of containers and windows:
 
-- a *container* holds 2–4 zones side by side (horizontal) or stacked (vertical);
+- a *container* holds 2â€“4 zones side by side (horizontal) or stacked (vertical);
 - a *zone* is either a window or another container;
 - each zone has a weight; zones stay equal until the user resizes one.
 
 Invariants (checked by tests): no container has fewer than 2 or more than 4 zones, a zone is never
 empty, the zones always cover the surface completely without gaps or overlaps.
 
-**Work area** – the monitor without the taskbar. Windows are placed so that their *visible* edges
+**Work area** â€“ the monitor without the taskbar. Windows are placed so that their *visible* edges
 match the zone (the invisible resize borders of Windows 10/11 are compensated).
 
 ## 3. Automatic placement
@@ -52,7 +52,7 @@ A new window is placed without questions:
    has 4 columns.
 2. After that, columns are split in two (at most **2 windows per column** by default), starting at
    the focused window's column.
-3. Anything denser (3–4 zones in one column, deep splits) is the user's choice through drag & drop;
+3. Anything denser (3â€“4 zones in one column, deep splits) is the user's choice through drag & drop;
    the program never assumes it.
 4. If a window cannot be placed without squeezing anybody below their minimum size, the spot with
    the fewest violations is used. A window is never left out of the layout (except full-screen
@@ -69,16 +69,19 @@ a copy of the tree, so it is exactly what happens on release.
 
 Drop targets, by cursor position over the window below:
 
-| Cursor on … | Result |
+| Cursor on â€¦ | Result |
 |---|---|
-| centre of a window (28–72 %) | swap the two windows |
+| centre of a window (28â€“72 %) | swap the two windows |
 | edge band of a window | split **that window only** on that side; every other window keeps its place |
 | outer 36 px of the screen | new full-length zone along that screen edge |
 | empty monitor | the window fills it |
 | no valid target / would squeeze a window too small | nothing; the window snaps back |
 
 If the target container is already full (4 zones), the drop splits only the target's zone.
-Dropping onto another monitor inserts the window into that monitor's layout.
+Dropping onto another monitor inserts the window into that monitor's layout. A centre drop across
+monitors inserts below the target (trees cannot swap directly). Both source and destination layouts
+are previewed. The outer 36 px are measured from the work-area edge, excluding the taskbar.
+Release rechecks the cursor, window edges and target existence before committing the move.
 
 ## 5. Resizing
 
@@ -89,16 +92,21 @@ added or removed; there is an "equalise" operation in the tree **(UI planned)**.
 
 ## 6. Minimum sizes
 
-Some apps refuse to get small (Chrome ≈ 502 px wide, Discord ≈ 802×501, ChatGPT ≈ 480×600). The
+Some apps refuse to get small (Chrome â‰ˆ 502 px wide, Discord â‰ˆ 802Ã—501, ChatGPT â‰ˆ 480Ã—600). The
 program does not fight them:
 
-- Every zone has a global floor (default 260×160 px, configurable) so that part of the title bar
+- Every zone has a global floor (default 260Ã—160 px, configurable) so that part of the title bar
   always stays grabbable.
-- When a window ends up larger than its zone twice in a row, its real minimum is **learned** and
+- Placement requests are asynchronous and skip hung windows; maximized adoption uses an
+  asynchronous restore. After a 500 ms settling interval, two identical poll measurements are
+  required before a refused size is learned. When a window remains larger than its zone, its real
+  minimum is **learned** and
   the layout gives its zone exactly that size; the others share the rest. The layout engine
   distributes space by weight but never below a zone's minimum.
-- If the minimums of the windows on a surface cannot fit at all, the demanding windows are
-  re-seated (largest first) where they squeeze least; only then can windows overlap slightly.
+- Learned minima are forgotten when a window disappears from the top-level list. They do not decrease during its lifetime; maximized and minimized windows are not measured.
+- When the current arrangement violates minima, a bounded rebuild tries windows largest first,
+  with stable ordering for equal sizes. It is accepted only if it strictly reduces violations
+  and retains every window; otherwise the manual arrangement is kept.
 
 Physical limit: Windows does not let an app go below its own minimum; no tiling program can change
 that. Rearranging (for example moving Discord into a column where its width hurts less) is the way
@@ -109,13 +117,17 @@ out.
 - Each surface is tiled independently; the layout of a desktop you left is kept and verified when
   you come back.
 - Tiling is switched **per virtual desktop** (tray icon click, `Win + Y`, tray menu). Desktops
-  with tiling on and off can coexist; switching never changes the off desktop.
+  with tiling on and off can coexist. Paused trees preserve their manual weights for the process
+  lifetime; enabling reconciles windows that have since closed or moved.
+- Desktop identity requires a successful COM query confirming a visible, uncloaked window on the
+  current desktop with a nonzero desktop ID. If identity is unavailable, no windows are moved.
+- A desktop switch or disabling tiling cancels any active drag. Display/work-area notifications
+  rebuild surface monitor keys from live windows and trigger a full reconcile.
 - Windows that Windows itself hides (cloaked, ghost UWP frames on the shown desktop) are ignored.
 
 ## 8. Things the program leaves alone
 
-- **Full-screen windows** (anything covering the whole monitor: F11, video, games) are never pulled
-  back into a tile. When the window leaves full screen it returns to its tile.
+- **Maximized and full-screen windows** already tiled keep their reserved tile and are left alone until restored. Neighbours keep their positions. A newly adopted maximized window is restored into its tile; untracked full-screen windows are never adopted. A tile matching the whole monitor is still a tile.
 - Dialogs, tool windows, pop-ups, menus, tooltips, the taskbar and the desktop.
 - Minimised windows (they keep no tile).
 
@@ -125,22 +137,30 @@ Windows Snap fights with any tiling program (dragging to a screen edge triggers 
 is on for the shown desktop, the program switches Snap off through `SystemParametersInfo`
 (`SPI_SETWINARRANGING`) **for the running session only** (nothing is written to the registry), and
 restores the previous state on exit and on desktops where tiling is off. `--restore-snap` restores
-it manually. A crash can therefore never leave Snap off after the next sign-in.
+it manually (enabling Snap and removing the recovery marker). Before disabling Snap, the original
+state is flushed to `%LOCALAPPDATA%\CosmicTile\snap-off.flag` as `1` or `0`. Normal shutdown,
+a Rust panic, console control events and session end attempt restoration. A successful restoration
+removes the marker; a failed one retains it. On the next managed startup, an existing marker is
+recovered before changing Snap again. A forced process kill may leave Snap off until that recovery,
+manual restoration or sign-in. Without a usable marker path, Snap is left unchanged.
 
 ## 10. Focus follows mouse
 
 The tiled window under the cursor receives the keyboard focus after the cursor has rested on it for
 a delay (default 300 ms, configurable, can be turned off). It is deliberately conservative: it only
 acts when the focused window is one of ours or the desktop, never while a mouse button is held,
-during drags, while menus, the Start menu, dialogs or any other unmanaged window have the focus.
+during drags, while menus (including foreground-thread popups), the Start menu, dialogs or any
+other unmanaged window have the focus, or while the foreground window is full screen or maximized.
+All five common mouse buttons suppress hover focus. Focus requests use `SetForegroundWindow`
+without joining input queues; Windows may decline the request silently.
 
 ## 11. Architecture
 
 ```
-main.rs      argument handling (--dump, --filter, --restore-snap), starts app::run
+main.rs      early DPI, single instance, arguments (--dump, --filter, --snap-status, --restore-snap)
 config.rs    key=value settings file (%LOCALAPPDATA%\<name>\config.ini), tolerant parser
 tree.rs      pure logic, no Windows calls: zone tree, placement policy, drop zones,
-             minimum-aware layout, previews. Fully unit-tested.
+             minimum-aware layout, previews. Covered by unit and invariant tests; Win32 integration needs desktop checks.
 platform.rs  thin Windows layer: window/monitor/virtual-desktop queries, placement, Snap control
 app.rs       event loop: WinEvent hooks -> debounced reconcile -> apply; drag overlay; tray;
              hotkey; focus follows mouse
@@ -157,29 +177,35 @@ Key design decisions:
   changes them. Settings it changes (Snap, window border colour) are session-only or restored.
 - **No dependencies** except the official `windows` crate.
 
+The tray icon is re-added after Explorer restarts. A named process mutex prevents a second manager.
+The Windows manifest requests the caller's existing privileges; it does not request elevation.
+
 Diagnostics: a log at `%LOCALAPPDATA%\<name>\cosmictile.log` records adds, removals, drops,
-learned minimum sizes and desktop switches. `--dump` prints the layout the program would apply,
+learned minimum sizes and desktop switches. The log is capped at 1 MB with one rotated backup.
+Titles appear only on add/remove events, sanitized and limited to 40 characters. `--dump` prints the layout the program would apply,
 without touching any window; `--filter TEXT` limits management to matching windows for safe tests.
 
 ## 12. Settings
+
+Settings are created only when missing. Saves replace the file atomically; opening the file never overwrites manual edits. Read errors use defaults without replacing the unreadable file. If `LOCALAPPDATA` is unavailable, config writes and logging are disabled.
 
 Tray menu and `config.ini`:
 
 | Key | Default | Meaning |
 |---|---|---|
 | `focus_follows_mouse` | `true` | focus the window under the cursor |
-| `focus_delay_ms` | `300` | how long the cursor must rest (50–5000) |
+| `focus_delay_ms` | `300` | how long the cursor must rest (50â€“5000) |
 | `min_zone_width` / `min_zone_height` | `260` / `160` | smallest zone |
 
 ## 13. Roadmap
 
 Near term (before a public 0.2):
 
-- audit and bug-hunt findings (see `docs/` for the report), regression tests for each bug
+- live verification of the hardening changes (see `HARDENING.md`), especially desktop and Snap paths
 - autostart as administrator without a UAC prompt (scheduled task) and a clean uninstall
 - the thin colour frame around the focused window as a real 4 px overlay
 - persisted learned minimum sizes; per-app overrides and an ignore list
-- rename, MIT licence metadata, CI (build + tests on pull requests)
+- rename before public release
 
 Later:
 

@@ -1,0 +1,17 @@
+name: Windows CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['*']
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo test
+      - run: cargo clippy --all-targets
+      - run: cargo build --release

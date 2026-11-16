@@ -2,26 +2,26 @@
 //! monitor), applies the layout and handles drag & drop with a live preview.
 
 use crate::config::Config;
-use crate::platform::{hwnd_of, id_of, set_snap, snap_enabled, Platform, SurfaceKey};
+use crate::platform::{hwnd_of, id_of, managed_snap, prepare_snap_recovery, restore_owned_snap, Platform, SurfaceKey};
 use std::time::{Duration, Instant};
 use crate::tree::{zone_at, DropZone, Edge, Hwnd, Rect, Tree};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::io::Write;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
 use windows::Win32::Graphics::Gdi::{BeginPaint, CreateBitmap, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
-use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, RegisterHotKey, MOD_NOREPEAT, MOD_WIN, VK_LBUTTON, VK_RBUTTON};
+use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, RegisterHotKey, MOD_NOREPEAT, MOD_WIN, VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2};
 use windows::Win32::UI::Shell::{ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const WM_EVENT: u32 = WM_APP + 1;
 const WM_TRAY: u32 = WM_APP + 2;
+const WM_PENDING: u32 = WM_APP + 3;
 const TIMER_RECONCILE: usize = 1;
 const TIMER_DRAG: usize = 2;
 const TIMER_POLL: usize = 3;
@@ -43,6 +43,24 @@ fn close(a: Rect, b: Rect) -> bool {
     (a.x - b.x).abs() <= 1 && (a.y - b.y).abs() <= 1 && (a.w - b.w).abs() <= 1 && (a.h - b.h).abs() <= 1
 }
 
+struct Placement {
+    target: Rect,
+    measured: Option<Rect>,
+    requested: Instant,
+}
+
+impl Placement {
+    fn new(target: Rect) -> Self { Self { target, measured: None, requested: Instant::now() } }
+
+    /// Ignore early async results; require two later polls with identical visible geometry.
+    fn observe(&mut self, visible: Option<Rect>, elapsed: Duration) -> bool {
+        if elapsed < Duration::from_millis(500) { self.measured = None; return false; }
+        let stable = visible.is_some() && self.measured == visible;
+        self.measured = visible;
+        stable
+    }
+}
+
 struct Surface {
     tree: Tree,
     area: Rect,
@@ -51,9 +69,9 @@ struct Surface {
 struct Drag {
     hwnd: Hwnd,
     key: SurfaceKey,
-    w0: i32,
-    h0: i32,
+    start: Rect,
     resize: bool,
+    released_since: Option<Instant>,
     /// (surface, window under the cursor or None for an outer edge / empty monitor, zone)
     target: Option<(SurfaceKey, Option<Hwnd>, DropZone)>,
 }
@@ -62,22 +80,23 @@ pub struct App {
     p: Platform,
     /// Virtual desktops on which tiling is switched off (every desktop is on by default).
     disabled: HashSet<u128>,
-    /// State of Windows' own snapping before we started; restored on exit and on desktops without tiling.
-    snap_original: bool,
     cfg: Config,
     /// Window under the cursor, the focused window at that moment, and since when.
     hover: Option<(Hwnd, Hwnd, Instant)>,
     /// The virtual desktop that is currently shown.
     shown: u128,
+    desktop_error_logged: bool,
     /// Minimum sizes some windows insist on, learned from windows that refuse to shrink.
     mins: HashMap<Hwnd, (i32, i32)>,
     /// Last target we placed a window at, and what we measured afterwards.
-    placed: HashMap<Hwnd, (Rect, Option<Rect>)>,
+    placed: HashMap<Hwnd, Placement>,
     /// Windows that currently fit nowhere (they stay floating).
     floating: HashSet<Hwnd>,
     surfaces: HashMap<SurfaceKey, Surface>,
     focused: Option<Hwnd>,
     bordered: Option<Hwnd>,
+    border_original: HashMap<Hwnd, u32>,
+    taskbar_created: u32,
     drag: Option<Drag>,
     overlay: HWND,
     main: HWND,
@@ -88,17 +107,52 @@ pub struct App {
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
+    static MAIN_HANDLE: Cell<HWND> = const { Cell::new(HWND(std::ptr::null_mut())) };
+    static PENDING: Cell<bool> = const { Cell::new(false) };
+    static MENU_OPEN: Cell<bool> = const { Cell::new(false) };
     /// What the drag overlay paints: the screen area and (rectangle, is the dragged window) pairs.
     static OVERLAY: RefCell<(Rect, Vec<(Rect, bool)>)> = const { RefCell::new((Rect::new(0, 0, 0, 0), Vec::new())) };
 }
 
+fn clean_text(text: &str, limit: usize) -> String {
+    text.chars().take(limit).map(|c| if c.is_control() { ' ' } else { c }).collect()
+}
+
+#[cfg(test)]
+pub fn log(_msg: &str) {}
+
+#[cfg(not(test))]
 pub fn log(msg: &str) {
-    let dir = std::env::var("LOCALAPPDATA").map(|d| format!("{d}\\CosmicTile")).unwrap_or_else(|_| ".".into());
+    static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = WRITER.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dir) = Config::path().and_then(|p| p.parent().map(std::path::Path::to_path_buf)) else { return };
     let _ = std::fs::create_dir_all(&dir);
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(format!("{dir}\\cosmictile.log")) {
-        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        let _ = writeln!(f, "[{}:{:02}:{:02}] {msg}", (t / 3600) % 24, (t / 60) % 60, t % 60);
+    let path = dir.join("cosmictile.log");
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let msg = clean_text(msg, 500);
+    let line = format!("[{}:{:02}:{:02}] {msg}\n", (t / 3600) % 24, (t / 60) % 60, t % 60);
+    let _ = append_log(&path, &line);
+}
+
+fn append_log(path: &std::path::Path, line: &str) -> std::io::Result<()> {
+    if std::fs::metadata(path).map(|m| m.len().saturating_add(line.len() as u64) > 1_048_576).unwrap_or(false) {
+        let backup = path.with_extension("log.1");
+        match std::fs::remove_file(&backup) {
+            Ok(()) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) => return Err(e),
+        }
+        std::fs::rename(path, backup)?;
     }
+    std::fs::OpenOptions::new().create(true).append(true).open(path)?.write_all(line.as_bytes())
+}
+
+fn set_timer(main: HWND, id: usize, ms: u32) {
+    unsafe { if SetTimer(Some(main), id, ms, None) == 0 { log(&format!("could not create timer {id}")); } }
+}
+
+fn notify(action: windows::Win32::UI::Shell::NOTIFY_ICON_MESSAGE, data: &NOTIFYICONDATAW) {
+    unsafe { if !Shell_NotifyIconW(action, data).as_bool() { log("tray icon operation failed"); } }
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -111,7 +165,7 @@ fn make_icon(on: bool) -> HICON {
     let mut px = vec![0u32; N * N];
     for y in 0..N {
         for x in 0..N {
-            let frame = x < 3 || x >= N - 3 || y < 3 || y >= N - 3;
+            let frame = !(3..N - 3).contains(&x) || !(3..N - 3).contains(&y);
             let vline = (15..17).contains(&x) && y < N / 2 + 1;
             let hline = (N / 2 - 1..N / 2 + 1).contains(&y) && x >= 15;
             if frame || vline || hline {
@@ -152,13 +206,21 @@ impl App {
     /// Brings the trees in line with the windows that really exist, then lays out what changed.
     fn reconcile(&mut self, force_all: bool) {
         let cur = self.p.current_desktop();
+        if cur == 0 {
+            self.cancel_drag();
+            if !self.desktop_error_logged { log("current virtual desktop unavailable; tiling suspended"); self.desktop_error_logged = true; }
+            return;
+        }
         if cur != self.shown {
+            self.cancel_drag();
             log(&format!("desktop switch {:x} -> {:x} (tiling {})", self.shown, cur, if self.desktop_on(cur) { "on" } else { "off" }));
             self.shown = cur;
             self.sync_snap();
             self.update_tray();
         }
         let tops = self.p.all_top_level();
+        self.mins.retain(|h, _| tops.contains(h));
+        self.border_original.retain(|h, _| tops.contains(h));
         let current: HashMap<Hwnd, (SurfaceKey, Rect)> = tops
             .iter()
             .rev()
@@ -175,8 +237,9 @@ impl App {
             s.tree.mins = self.mins.clone();
         }
 
-        // Windows that vanished, were minimised, moved to another desktop/monitor or whose desktop was switched off.
+        // Paused desktops retain their manual trees until enabled again.
         for (key, s) in self.surfaces.iter_mut() {
+            if self.disabled.contains(&key.desktop) { continue; }
             s.area = current.values().find(|(k, _)| k == key).map(|(_, a)| *a).unwrap_or(s.area);
             for h in s.tree.leaves() {
                 if current.get(&h).map(|(k, _)| k) != Some(key) {
@@ -186,7 +249,8 @@ impl App {
                 }
             }
         }
-        self.placed.retain(|h, _| current.contains_key(h));
+        let paused: HashSet<Hwnd> = self.surfaces.iter().filter(|(k, _)| self.disabled.contains(&k.desktop)).flat_map(|(_, s)| s.tree.leaves()).collect();
+        self.placed.retain(|h, _| current.contains_key(h) || paused.contains(h));
         self.floating.retain(|h| current.contains_key(h));
 
         // New windows, in z-order from back to front.
@@ -197,7 +261,7 @@ impl App {
                 continue;
             }
             let focused = self.focused;
-            let info = format!("{h:x} {} ({})", self.p.title(h), self.p.exe_name(h));
+            let info = format!("{h:x} {} ({})", clean_text(&self.p.title(h), 40), self.p.exe_name(h));
             let mins = self.mins.clone();
             let s = self.surfaces.entry(key).or_insert_with(|| Surface { tree: Tree::new(), area });
             s.area = area;
@@ -207,7 +271,7 @@ impl App {
                 self.floating.remove(&h);
                 log(&format!("added {info}"));
             } else if self.floating.insert(h) {
-                log(&format!("no room, stays floating: {info}"));
+                log(&format!("no room, stays floating: {h:x}"));
             }
         }
         self.surfaces.retain(|_, s| !s.tree.is_empty());
@@ -220,23 +284,27 @@ impl App {
     }
 
     fn apply(&mut self, key: SurfaceKey, force: bool) {
+        if self.shown == 0 || key.desktop != self.shown || !self.desktop_on(key.desktop) { return; }
         let Some(s) = self.surfaces.get(&key) else { return };
         let layout = s.tree.layout(s.area);
         let mut learned = false;
         for (h, r) in layout {
-            if self.p.is_fullscreen(h) {
-                continue; // full screen stays full screen: never pull it back into its tile
+            let vis = self.p.visible_rect(h);
+            let was_placed = self.placed.get(&h).map(|p| p.target);
+            if suspend_placement(self.p.is_maximized(h), self.p.is_fullscreen(h), was_placed, vis) || self.p.is_minimized(h) || self.p.is_hung(h) {
+                continue;
             }
             if force {
                 self.placed.remove(&h);
             }
-            let vis = self.p.visible_rect(h);
             if vis.map(|v| close(v, r)).unwrap_or(false) {
-                self.placed.insert(h, (r, vis));
+                self.placed.insert(h, Placement::new(r));
                 continue;
             }
-            if let Some((pr, pv)) = self.placed.get(&h) {
-                if *pr == r && *pv == vis {
+            if let Some(placement) = self.placed.get_mut(&h) && placement.target == r {
+                let elapsed = placement.requested.elapsed();
+                if !placement.observe(vis, elapsed) { continue; }
+                {
                     // Same target, same result as last time: the window refuses this size.
                     // Remember what it needs; the layout then gives it a zone of that size.
                     if let Some(v) = vis {
@@ -250,41 +318,24 @@ impl App {
                         }
                         if new != old {
                             self.mins.insert(h, new);
-                            log(&format!("{h:x} {} needs at least {}x{} (zone was {}x{})", self.p.title(h), new.0, new.1, r.w, r.h));
+                            log(&format!("{h:x} needs at least {}x{} (zone was {}x{})", new.0, new.1, r.w, r.h));
                             learned = true;
                         }
                     }
                     continue;
                 }
             }
-            self.p.place(h, r);
-            self.placed.insert(h, (r, self.p.visible_rect(h)));
+            if self.p.place(h, r) {
+                // The request is pending; only later stable polls can teach a minimum.
+                self.placed.insert(h, Placement::new(r));
+            }
         }
         if learned {
             for s in self.surfaces.values_mut() {
                 s.tree.mins = self.mins.clone();
             }
-            // If the learned minimums do not fit the current arrangement, re-seat the demanding
-            // windows (biggest first) where they squeeze nobody.
-            let mins = &self.mins;
-            if let Some(s) = self.surfaces.get_mut(&key) {
-                let area = s.area;
-                if s.tree.violations(area) > 0 {
-                    let mut movers: Vec<Hwnd> = s.tree.leaves().into_iter().filter(|h| mins.contains_key(h)).collect();
-                    movers.sort_by_key(|h| std::cmp::Reverse(mins[h].0 as i64 * 2000 + mins[h].1 as i64 * 1000));
-                    for h in movers {
-                        let before = s.tree.violations(area);
-                        let mut c = s.tree.clone();
-                        c.remove(h);
-                        if c.add(h, area, None) && c.violations(area) < before {
-                            s.tree = c;
-                            log(&format!("re-seated {h:x} to respect minimum sizes"));
-                        }
-                        if s.tree.violations(area) == 0 {
-                            break;
-                        }
-                    }
-                }
+            if let Some(s) = self.surfaces.get_mut(&key) && s.tree.reseat(s.area) {
+                log("re-seated surface to respect minimum sizes");
             }
             self.apply(key, false);
         }
@@ -292,26 +343,34 @@ impl App {
 
     /// Windows' own snapping must not fight with us: it is off while tiling is on for the shown desktop.
     fn sync_snap(&self) {
-        set_snap(if self.desktop_on(self.shown) { false } else { self.snap_original });
+        managed_snap(self.shown == 0 || !self.desktop_on(self.shown));
     }
 
     fn set_border(&mut self, h: Hwnd, color: u32) {
         unsafe {
+            let color = if color == COLOR_DEFAULT {
+                self.border_original.remove(&h).unwrap_or(COLOR_DEFAULT)
+            } else {
+                self.border_original.entry(h).or_insert_with(|| {
+                    let mut original = COLOR_DEFAULT;
+                    let _ = DwmGetWindowAttribute(hwnd_of(h), DWMWA_BORDER_COLOR, &mut original as *mut u32 as *mut c_void, 4);
+                    original
+                });
+                color
+            };
             let c = COLORREF(color);
             let _ = DwmSetWindowAttribute(hwnd_of(h), DWMWA_BORDER_COLOR, &c as *const COLORREF as *const c_void, 4);
         }
     }
 
     fn on_focus(&mut self, h: Hwnd) {
-        if self.surface_containing(h).is_none() {
+        if !self.desktop_on(self.shown) || self.surface_containing(h).is_none() {
+            self.focused = None;
+            if let Some(prev) = self.bordered.take() { self.set_border(prev, COLOR_DEFAULT); }
             return;
         }
         self.focused = Some(h);
-        if let Some(prev) = self.bordered.take() {
-            if prev != h {
-                self.set_border(prev, COLOR_DEFAULT);
-            }
-        }
+        if let Some(prev) = self.bordered.take() && prev != h { self.set_border(prev, COLOR_DEFAULT); }
         self.set_border(h, ACCENT);
         self.bordered = Some(h);
     }
@@ -319,6 +378,7 @@ impl App {
     /// Switches tiling on or off for the desktop that is shown right now.
     fn toggle(&mut self) {
         let d = self.p.current_desktop();
+        if d == 0 { return; }
         if !self.disabled.remove(&d) {
             self.disabled.insert(d);
         }
@@ -333,8 +393,6 @@ impl App {
         if let Some(b) = self.bordered.take() {
             self.set_border(b, COLOR_DEFAULT);
         }
-        self.surfaces.retain(|k, _| k.desktop != d);
-        self.placed.clear();
         self.sync_snap();
         if on {
             self.reconcile(true);
@@ -342,16 +400,62 @@ impl App {
         self.update_tray();
     }
 
+    fn cancel_drag(&mut self) {
+        self.drag = None;
+        unsafe { let _ = KillTimer(Some(self.main), TIMER_DRAG); }
+        self.hide_overlay();
+    }
+
+    fn drag_desktop_valid(&self, desktop: u128) -> bool {
+        desktop != 0 && desktop == self.shown && self.desktop_on(desktop) && self.p.current_desktop() == desktop
+    }
+
+    fn poll_drag_release(&mut self) {
+        if let Some(d) = &self.drag {
+            if !self.drag_desktop_valid(d.key.desktop) { self.cancel_drag(); }
+            else {
+                let down = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 };
+                let d = self.drag.as_mut().expect("drag was checked");
+                if down { d.released_since = None; }
+                else if d.released_since.get_or_insert_with(Instant::now).elapsed() >= Duration::from_millis(500) {
+                    let h = d.hwnd;
+                    self.drag_end(h);
+                }
+            }
+        }
+    }
+
+    fn poll_tick(&mut self) {
+        self.poll_drag_release();
+        if self.drag.is_none() { self.reconcile(false); }
+    }
+
+    fn refresh_surfaces(&mut self) {
+        if self.p.current_desktop() == 0 { self.reconcile(true); return; }
+        self.cancel_drag();
+        let tops = self.p.all_top_level();
+        let old = std::mem::take(&mut self.surfaces);
+        for (_, mut surface) in old {
+            let Some(h) = surface.tree.leaves().into_iter().find(|h| tops.contains(h)) else { continue };
+            let (key, area) = self.p.surface_of(h);
+            if key.desktop == 0 { continue; }
+            surface.area = area;
+            if let Some(existing) = self.surfaces.get_mut(&key) {
+                for h in surface.tree.leaves() { existing.tree.add(h, area, None); }
+            } else { self.surfaces.insert(key, surface); }
+        }
+        self.reconcile(true);
+    }
+
     // ---------- drag & drop ----------
 
     fn drag_start(&mut self, h: Hwnd) {
         let Some(key) = self.surface_containing(h) else { return };
+        if !self.drag_desktop_valid(key.desktop) { return; }
         let Some(v) = self.p.visible_rect(h) else { return };
         log(&format!("drag start {h:x}"));
-        self.drag = Some(Drag { hwnd: h, key, w0: v.w, h0: v.h, resize: false, target: None });
-        unsafe {
-            SetTimer(Some(self.main), TIMER_DRAG, 30, None);
-        }
+        self.drag = Some(Drag { hwnd: h, key, start: v, resize: false, released_since: None, target: None });
+        set_timer(self.main, TIMER_DRAG, 30);
     }
 
     fn cursor_surface(&self, desktop: u128) -> Option<(SurfaceKey, Rect, i32, i32)> {
@@ -379,20 +483,19 @@ impl App {
 
     fn drag_tick(&mut self) {
         let Some(d) = &self.drag else { return };
-        let (h, w0, h0, home) = (d.hwnd, d.w0, d.h0, d.key);
+        let (h, start, home) = (d.hwnd, d.start, d.key);
+        if !self.drag_desktop_valid(home.desktop) { self.cancel_drag(); return; }
         if d.resize {
             return;
         }
-        if let Some(v) = self.p.visible_rect(h) {
-            if (v.w - w0).abs() > 4 || (v.h - h0).abs() > 4 {
+        if let Some(v) = self.p.visible_rect(h) && is_resize(start, v) {
                 if let Some(d) = &mut self.drag {
                     d.resize = true;
                 }
                 self.hide_overlay();
                 return;
-            }
         }
-        let Some((key, area, cx, cy)) = self.cursor_surface(home.desktop) else { return };
+        let Some((key, area, cx, cy)) = self.cursor_surface(self.shown) else { return };
         let mut target = None;
         let mut preview: Option<Vec<(Hwnd, Rect)>> = None;
         match self.surfaces.get(&key) {
@@ -420,12 +523,24 @@ impl App {
             d.target = target;
         }
         match preview {
-            Some(l) => self.show_overlay(area, &l, h),
+            Some(mut l) => {
+                let mut bounds = area;
+                if key != home && let Some(source) = self.surfaces.get(&home) {
+                    let mut tree = source.tree.clone();
+                    tree.remove(h);
+                    l.extend(tree.layout(source.area));
+                    bounds = union(area, source.area);
+                }
+                self.show_overlay(bounds, &l, h);
+            }
             None => self.hide_overlay(),
         }
     }
 
     fn drag_end(&mut self, h: Hwnd) {
+        if self.drag.as_ref().map(|d| d.hwnd) != Some(h) { return; }
+        // Release can arrive before the first 30 ms tick or after the last cursor move.
+        self.drag_tick();
         let Some(d) = self.drag.take() else { return };
         unsafe {
             let _ = KillTimer(Some(self.main), TIMER_DRAG);
@@ -435,16 +550,16 @@ impl App {
             return;
         }
         let home = d.key;
+        if !self.drag_desktop_valid(home.desktop) { return; }
         if d.resize {
-            if let (Some(v), Some(s)) = (self.p.visible_rect(h), self.surfaces.get_mut(&home)) {
-                if let Some(old) = s.tree.rect_of(s.area, h) {
+            if let (Some(v), Some(s)) = (self.p.visible_rect(h), self.surfaces.get_mut(&home))
+                && let Some(old) = s.tree.rect_of(s.area, h) {
                     let area = s.area;
                     let tol = 3;
                     if (v.x - old.x).abs() > tol { s.tree.set_edge(area, h, Edge::Left, v.x); }
                     if (v.right() - old.right()).abs() > tol { s.tree.set_edge(area, h, Edge::Right, v.right()); }
                     if (v.y - old.y).abs() > tol { s.tree.set_edge(area, h, Edge::Top, v.y); }
                     if (v.bottom() - old.bottom()).abs() > tol { s.tree.set_edge(area, h, Edge::Bottom, v.bottom()); }
-                }
             }
             log(&format!("resize end {h:x}"));
             self.apply(home, true);
@@ -455,6 +570,16 @@ impl App {
             self.apply(home, true);
             return;
         };
+        let cur = self.p.current_desktop();
+        let valid = cur == key.desktop && self.desktop_on(cur)
+            && self.surfaces.get(&home).map(|s| s.tree.contains(h)).unwrap_or(false)
+            && self.managed(h, cur) && self.p.desktop_id(h) == cur
+            && target_in_tree(self.surfaces.get(&key).map(|s| &s.tree), target)
+            && target.map(|t| self.managed(t, cur) && self.p.surface_of(t).0 == key).unwrap_or(true);
+        if !valid {
+            self.apply(home, true);
+            return;
+        }
         log(&format!("drop {h:x} -> surface {:x} target {:?} {zone:?}", key.monitor, target.map(|t| format!("{t:x}"))));
         match (target, zone) {
             (Some(t), z) if key == home => {
@@ -501,12 +626,12 @@ impl App {
     /// on it for the configured time. Does nothing while a menu, the Start menu, a dialog or any
     /// window we do not manage has the focus, while a mouse button is held, or while dragging.
     fn hover_tick(&mut self) {
-        if !self.cfg.focus_follows_mouse || self.drag.is_some() {
+        if !self.cfg.focus_follows_mouse || !self.desktop_on(self.shown) || self.drag.is_some() || MENU_OPEN.with(Cell::get) {
             self.hover = None;
             return;
         }
         unsafe {
-            if GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 || GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0 {
+            if [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2].iter().any(|k| GetAsyncKeyState(k.0 as i32) < 0) {
                 self.hover = None;
                 return;
             }
@@ -516,6 +641,10 @@ impl App {
             }
             let under = id_of(GetAncestor(WindowFromPoint(pt), GA_ROOT));
             let fg = id_of(GetForegroundWindow());
+            if self.p.is_fullscreen(fg) || self.p.is_maximized(fg) || foreground_has_menu(hwnd_of(fg)) {
+                self.hover = None;
+                return;
+            }
             if under == 0 || under == fg || !self.is_tracked_here(under) {
                 self.hover = None;
                 return;
@@ -528,8 +657,7 @@ impl App {
             match self.hover {
                 Some((h, f, since)) if h == under && f == fg => {
                     if since.elapsed() >= Duration::from_millis(self.cfg.focus_delay_ms) {
-                        let ok = self.focus_window(under);
-                        log(&format!("hover focus {under:x} ({})", if ok { "ok" } else { "refused by Windows" }));
+                        self.focus_window(under);
                         self.hover = Some((under, fg, Instant::now()));
                     }
                 }
@@ -539,18 +667,7 @@ impl App {
     }
 
     fn focus_window(&self, h: Hwnd) -> bool {
-        unsafe {
-            let fg = GetForegroundWindow();
-            let fg_thread = GetWindowThreadProcessId(fg, None);
-            let me = GetCurrentThreadId();
-            // Windows only lets the thread that owns the focus hand it on; joining its input queue allows it.
-            let attached = fg_thread != 0 && fg_thread != me && AttachThreadInput(me, fg_thread, true).as_bool();
-            let ok = SetForegroundWindow(hwnd_of(h)).as_bool();
-            if attached {
-                let _ = AttachThreadInput(me, fg_thread, false);
-            }
-            ok
-        }
+        unsafe { SetForegroundWindow(hwnd_of(h)).as_bool() }
     }
 
     // ---------- overlay & tray ----------
@@ -594,52 +711,32 @@ impl App {
     }
 
     fn update_tray(&self) {
-        unsafe {
-            let _ = Shell_NotifyIconW(NIM_MODIFY, &self.tray_data());
-        }
+        notify(NIM_MODIFY, &self.tray_data());
     }
 
-    fn show_menu(&mut self) {
+    fn menu_command(&mut self, cmd: usize) {
+        let app = self;
         unsafe {
-            let menu = CreatePopupMenu().unwrap();
-            let focus_menu = CreatePopupMenu().unwrap();
-            let check = |on: bool| if on { MF_STRING | MF_CHECKED } else { MF_STRING };
-            let _ = AppendMenuW(focus_menu, check(!self.cfg.focus_follows_mouse), MENU_FFM_OFF, w!("Off"));
-            for (i, ms) in FFM_PRESETS.iter().enumerate() {
-                let label = wide(&format!("After {ms} ms{}", if *ms == 300 { " (default)" } else { "" }));
-                let on = self.cfg.focus_follows_mouse && self.cfg.focus_delay_ms == *ms;
-                let _ = AppendMenuW(focus_menu, check(on), MENU_FFM_BASE + i, PCWSTR(label.as_ptr()));
-            }
-            let label = if self.desktop_on(self.shown) { w!("Turn tiling off for this desktop") } else { w!("Turn tiling on for this desktop") };
-            let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE, label);
-            let _ = AppendMenuW(menu, MF_POPUP, focus_menu.0 as usize, w!("Focus follows mouse"));
-            let _ = AppendMenuW(menu, MF_STRING, MENU_OPEN_CONFIG, w!("Open settings file"));
-            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-            let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Exit CosmicTile"));
-            let mut pt = POINT::default();
-            let _ = GetCursorPos(&mut pt);
-            let _ = SetForegroundWindow(self.main);
-            let cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, Some(0), self.main, None).0 as usize;
-            let _ = DestroyMenu(menu);
             match cmd {
-                MENU_TOGGLE => self.toggle(),
+                MENU_TOGGLE => app.toggle(),
                 MENU_OPEN_CONFIG => {
-                    self.cfg.save();
-                    let path = wide(&Config::path().to_string_lossy());
-                    ShellExecuteW(None, w!("open"), PCWSTR(path.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+                    app.cfg.ensure_exists();
+                    if let Some(path) = Config::path() {
+                        let path = wide(&path.to_string_lossy());
+                        ShellExecuteW(None, w!("open"), PCWSTR(path.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+                    }
                 }
                 MENU_FFM_OFF => {
-                    self.cfg.focus_follows_mouse = false;
-                    self.cfg.save();
+                    app.cfg.focus_follows_mouse = false;
+                    app.cfg.save();
                 }
                 c if (MENU_FFM_BASE..MENU_FFM_BASE + FFM_PRESETS.len()).contains(&c) => {
-                    self.cfg.focus_follows_mouse = true;
-                    self.cfg.focus_delay_ms = FFM_PRESETS[c - MENU_FFM_BASE];
-                    self.cfg.save();
-                    log(&format!("focus follows mouse after {} ms", self.cfg.focus_delay_ms));
+                    app.cfg.focus_follows_mouse = true;
+                    app.cfg.focus_delay_ms = FFM_PRESETS[c - MENU_FFM_BASE];
+                    app.cfg.save();
+                    log(&format!("focus follows mouse after {} ms", app.cfg.focus_delay_ms));
                 }
                 MENU_EXIT => {
-                    self.shutdown();
                     PostQuitMessage(0);
                 }
                 _ => {}
@@ -648,27 +745,73 @@ impl App {
     }
 
     fn shutdown(&mut self) {
-        set_snap(self.snap_original);
+        restore_owned_snap();
         if let Some(b) = self.bordered.take() {
             self.set_border(b, COLOR_DEFAULT);
         }
-        unsafe {
-            let nid = self.tray_data();
-            let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
-        }
+        notify(NIM_DELETE, &self.tray_data());
         log("exit");
     }
+}
+
+fn foreground_has_menu(foreground: HWND) -> bool {
+    unsafe extern "system" fn visit(hwnd: HWND, lp: LPARAM) -> windows::core::BOOL {
+        let mut class = [0u16; 32];
+        let len = unsafe { GetClassNameW(hwnd, &mut class) } as usize;
+        if String::from_utf16_lossy(&class[..len]) == "#32768" && unsafe { IsWindowVisible(hwnd).as_bool() } {
+            unsafe { *(lp.0 as *mut bool) = true; }
+            return windows::core::BOOL(0);
+        }
+        windows::core::BOOL(1)
+    }
+    let mut found = false;
+    unsafe { let thread = GetWindowThreadProcessId(foreground, None); if thread != 0 { let _ = EnumThreadWindows(thread, Some(visit), LPARAM(&mut found as *mut bool as isize)); } }
+    found
+}
+
+fn show_menu() {
+    if MENU_OPEN.with(|m| m.replace(true)) { return; }
+    let snapshot = APP.with(|a| a.try_borrow().ok().and_then(|g| g.as_ref().map(|app| (app.cfg.clone(), app.main, app.desktop_on(app.shown)))));
+    if let Some((cfg, main, on)) = snapshot {
+        let cmd = unsafe { build_and_track_menu(&cfg, main, on) };
+        APP.with(|a| { if let Ok(mut g) = a.try_borrow_mut() && let Some(app) = g.as_mut() { app.menu_command(cmd); } });
+    }
+    MENU_OPEN.with(|m| m.set(false));
+}
+
+unsafe fn build_and_track_menu(cfg: &Config, main: HWND, on: bool) -> usize {
+        unsafe {
+            let Ok(menu) = CreatePopupMenu() else { log("could not create tray menu"); return 0; };
+            let Ok(focus_menu) = CreatePopupMenu() else { let _ = DestroyMenu(menu); log("could not create focus menu"); return 0; };
+            let check = |on: bool| if on { MF_STRING | MF_CHECKED } else { MF_STRING };
+            if let Err(e) = AppendMenuW(focus_menu, check(!cfg.focus_follows_mouse), MENU_FFM_OFF, w!("Off")) { log(&format!("could not append tray menu item: {e}")); }
+            for (i, ms) in FFM_PRESETS.iter().enumerate() {
+                let label = wide(&format!("After {ms} ms{}", if *ms == 300 { " (default)" } else { "" }));
+                let on = cfg.focus_follows_mouse && cfg.focus_delay_ms == *ms;
+                if let Err(e) = AppendMenuW(focus_menu, check(on), MENU_FFM_BASE + i, PCWSTR(label.as_ptr())) { log(&format!("could not append tray menu item: {e}")); }
+            }
+            let label = if on { w!("Turn tiling off for this desktop") } else { w!("Turn tiling on for this desktop") };
+            if let Err(e) = AppendMenuW(menu, MF_STRING, MENU_TOGGLE, label) { log(&format!("could not append tray menu item: {e}")); }
+            if let Err(e) = AppendMenuW(menu, MF_POPUP, focus_menu.0 as usize, w!("Focus follows mouse")) { log(&format!("could not append tray menu item: {e}")); }
+            if let Err(e) = AppendMenuW(menu, MF_STRING, MENU_OPEN_CONFIG, w!("Open settings file")) { log(&format!("could not append tray menu item: {e}")); }
+            if let Err(e) = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) { log(&format!("could not append tray menu item: {e}")); }
+            if let Err(e) = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Exit CosmicTile")) { log(&format!("could not append tray menu item: {e}")); }
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            let _ = SetForegroundWindow(main);
+            let cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, Some(0), main, None).0 as usize;
+            let _ = DestroyMenu(menu);
+            cmd
+        }
 }
 
 unsafe extern "system" fn win_event_proc(_h: HWINEVENTHOOK, event: u32, hwnd: HWND, id_object: i32, id_child: i32, _thread: u32, _time: u32) {
     if id_object != 0 || id_child != 0 || hwnd.0.is_null() {
         return;
     }
-    let main = APP.with(|a| a.try_borrow().ok().and_then(|g| g.as_ref().map(|app| app.main)));
-    if let Some(main) = main {
-        unsafe {
-            let _ = PostMessageW(Some(main), WM_EVENT, WPARAM(event as usize), LPARAM(hwnd.0 as isize));
-        }
+    let main = MAIN_HANDLE.with(Cell::get);
+    if !main.is_invalid() {
+        unsafe { if PostMessageW(Some(main), WM_EVENT, WPARAM(event as usize), LPARAM(hwnd.0 as isize)).is_err() { PENDING.with(|p| p.set(true)); } }
     }
 }
 
@@ -721,19 +864,28 @@ fn paint_overlay(hwnd: HWND) {
 }
 
 unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg == WM_QUERYENDSESSION { return LRESULT(1); }
+    if msg == WM_ENDSESSION && wp.0 != 0 { restore_owned_snap(); unsafe { PostQuitMessage(0); } return LRESULT(0); }
+    if msg == WM_CLOSE { unsafe { PostQuitMessage(0); } return LRESULT(0); }
+    if msg == WM_TRAY && lp.0 as u32 == WM_RBUTTONUP { show_menu(); return LRESULT(0); }
     let handled = APP.with(|a| {
-        let Ok(mut guard) = a.try_borrow_mut() else { return false };
+        let Ok(mut guard) = a.try_borrow_mut() else {
+            if matches!(msg, WM_EVENT | WM_TIMER | WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_PENDING) { PENDING.with(|p| p.set(true)); }
+            return false;
+        };
         let Some(app) = guard.as_mut() else { return false };
+        if app.taskbar_created != 0 && msg == app.taskbar_created {
+            notify(NIM_ADD, &app.tray_data());
+            return true;
+        }
         match msg {
             WM_EVENT => {
-                let h = lp.0 as isize;
+                let h = lp.0;
                 match wp.0 as u32 {
                     0x0003 => app.on_focus(h),
                     0x000A => app.drag_start(h),
                     0x000B => app.drag_end(h),
-                    _ => unsafe {
-                        SetTimer(Some(app.main), TIMER_RECONCILE, 80, None);
-                    },
+                    _ => set_timer(app.main, TIMER_RECONCILE, 80),
                 }
             }
             WM_TIMER => match wp.0 {
@@ -745,25 +897,22 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                         app.reconcile(false);
                     }
                 }
-                TIMER_DRAG => app.drag_tick(),
+                TIMER_DRAG => { app.drag_tick(); app.poll_drag_release(); },
                 TIMER_HOVER => app.hover_tick(),
-                TIMER_POLL => {
-                    if app.drag.is_none() {
-                        app.reconcile(false);
-                    }
-                }
+                TIMER_POLL => app.poll_tick(),
                 _ => {}
             },
+            WM_PENDING => app.poll_tick(),
+            WM_DISPLAYCHANGE | WM_SETTINGCHANGE => app.refresh_surfaces(),
             WM_HOTKEY => app.toggle(),
-            WM_TRAY => match lp.0 as u32 {
-                WM_LBUTTONUP => app.toggle(),
-                WM_RBUTTONUP => app.show_menu(),
-                _ => {}
-            },
+            WM_TRAY if lp.0 as u32 == WM_LBUTTONUP => app.toggle(),
             _ => return false,
         }
         true
     });
+    if handled && PENDING.with(|p| p.replace(false)) {
+        unsafe { let _ = PostMessageW(Some(hwnd), WM_PENDING, WPARAM(0), LPARAM(0)); }
+    }
     if handled {
         LRESULT(0)
     } else {
@@ -772,6 +921,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 }
 
 pub fn run(filter: Option<String>) {
+    if !prepare_snap_recovery() { log("Snap recovery unavailable; Snap setting will be left unchanged"); }
     let cfg = Config::load();
     crate::tree::set_min_zone(cfg.min_zone_width, cfg.min_zone_height);
     unsafe {
@@ -782,6 +932,7 @@ pub fn run(filter: Option<String>) {
         RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(main_proc), hInstance: hinst.into(), lpszClassName: class_main, ..Default::default() });
         RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(overlay_proc), hInstance: hinst.into(), lpszClassName: class_overlay, hbrBackground: accent_brush, ..Default::default() });
         let main = CreateWindowExW(WINDOW_EX_STYLE(0), class_main, w!("CosmicTile"), WS_OVERLAPPED, 0, 0, 0, 0, None, None, Some(hinst.into()), None).unwrap();
+        MAIN_HANDLE.with(|h| h.set(main));
         let overlay = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class_overlay,
@@ -803,16 +954,18 @@ pub fn run(filter: Option<String>) {
         let app = App {
             p: platform,
             disabled: HashSet::new(),
-            snap_original: snap_enabled(),
             cfg,
             hover: None,
             shown: 0,
+            desktop_error_logged: false,
             mins: HashMap::new(),
             placed: HashMap::new(),
             floating: HashSet::new(),
             surfaces: HashMap::new(),
             focused: None,
             bordered: None,
+            border_original: HashMap::new(),
+            taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
             drag: None,
             overlay,
             main,
@@ -821,18 +974,21 @@ pub fn run(filter: Option<String>) {
             icon_off: make_icon(false),
         };
         let nid = app.tray_data();
-        let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+        notify(NIM_ADD, &nid);
         APP.with(|a| *a.borrow_mut() = Some(app));
 
         // foreground, move/size start+end, minimise start+end, destroy, show, cloak, uncloak
+        let mut hooks = Vec::new();
         for ev in [0x0003u32, 0x000A, 0x000B, 0x0016, 0x0017, 0x8001, 0x8002, 0x8017, 0x8018] {
-            SetWinEventHook(ev, ev, None, Some(win_event_proc), 0, 0, 0);
+            let hook = SetWinEventHook(ev, ev, None, Some(win_event_proc), 0, 0, 0);
+            if hook.is_invalid() { log(&format!("could not register window hook {ev:x}")); }
+            else { hooks.push(hook); }
         }
         if RegisterHotKey(Some(main), HOTKEY_TOGGLE, MOD_WIN | MOD_NOREPEAT, 'Y' as u32).is_err() {
             log("could not register Win+Y");
         }
-        SetTimer(Some(main), TIMER_POLL, 1500, None);
-        SetTimer(Some(main), TIMER_HOVER, 50, None);
+        set_timer(main, TIMER_POLL, 1500);
+        set_timer(main, TIMER_HOVER, 50);
         log("started");
         APP.with(|a| {
             if let Some(app) = a.borrow_mut().as_mut() {
@@ -841,10 +997,111 @@ pub fn run(filter: Option<String>) {
         });
 
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        loop {
+            let result = GetMessageW(&mut msg, None, 0, 0).0;
+            if result <= 0 {
+                if result < 0 { log("GetMessageW failed"); }
+                break;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        let _ = id_of(main);
+        for hook in hooks { let _ = UnhookWinEvent(hook); }
+        APP.with(|a| { if let Some(mut app) = a.borrow_mut().take() {
+            app.shutdown();
+            let _ = DestroyIcon(app.icon_on);
+            let _ = DestroyIcon(app.icon_off);
+        } });
+        let _ = DestroyWindow(overlay);
+        let _ = DestroyWindow(main);
+        MAIN_HANDLE.with(|h| h.set(HWND(std::ptr::null_mut())));
+        let _ = DeleteObject(accent_brush.into());
+    }
+}
+
+/// A monitor-filling tile is not an app entering full screen. Test before clearing placement.
+fn suspend_placement(maximized: bool, fullscreen: bool, placed: Option<Rect>, visible: Option<Rect>) -> bool {
+    (maximized && placed.is_some()) || (fullscreen && !placed.zip(visible).map(|(p, v)| close(p, v)).unwrap_or(false))
+}
+
+fn target_in_tree(tree: Option<&Tree>, target: Option<Hwnd>) -> bool {
+    target.map(|h| tree.is_some_and(|tree| tree.contains(h))).unwrap_or(true)
+}
+
+fn is_resize(start: Rect, now: Rect) -> bool {
+    let moved = |a: i32, b: i32| (i64::from(a) - i64::from(b)).abs() > 3;
+    (moved(start.x, now.x) && !moved(start.right(), now.right()))
+        || (moved(start.right(), now.right()) && !moved(start.x, now.x))
+        || (moved(start.y, now.y) && !moved(start.bottom(), now.bottom()))
+        || (moved(start.bottom(), now.bottom()) && !moved(start.y, now.y))
+}
+
+fn union(a: Rect, b: Rect) -> Rect {
+    let (x, y) = (a.x.min(b.x), a.y.min(b.y));
+    Rect::new(x, y, a.right().max(b.right()) - x, a.bottom().max(b.bottom()) - y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn log_rotation_keeps_one_backup_and_caps_the_active_file() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("log-test-{}.log", std::process::id()));
+        let backup = path.with_extension("log.1");
+        std::fs::write(&path, vec![b'x'; 1_048_576]).unwrap();
+        append_log(&path, "new event\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new event\n");
+        assert_eq!(std::fs::metadata(&backup).unwrap().len(), 1_048_576);
+        std::fs::write(&path, vec![b'y'; 1_048_576]).unwrap();
+        append_log(&path, "next event\n").unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap()[0], b'y');
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(backup).unwrap();
+    }
+    #[test]
+    fn a_disappearing_drop_target_cancels_the_drop() {
+        let mut tree = Tree::new();
+        tree.add(1, Rect::new(0, 0, 1920, 1080), None);
+        assert!(target_in_tree(Some(&tree), Some(1)));
+        tree.remove(1);
+        assert!(!target_in_tree(Some(&tree), Some(1)));
+        assert!(!target_in_tree(None, Some(1)));
+        assert!(target_in_tree(None, None)); // an empty monitor is a valid target
+    }
+    #[test]
+    fn delayed_async_placement_cannot_teach_the_old_size_on_early_polls() {
+        let target = Rect::new(0, 0, 600, 500);
+        let old = Rect::new(0, 0, 1200, 900);
+        let mut p = Placement::new(target);
+        assert!(!p.observe(Some(old), Duration::from_millis(80)));
+        assert!(!p.observe(Some(old), Duration::from_millis(160)));
+        assert!(!p.observe(Some(target), Duration::from_millis(600)));
+        assert!(p.observe(Some(target), Duration::from_millis(1500)));
+        let refused = Rect::new(0, 0, 800, 500);
+        assert!(!p.observe(Some(refused), Duration::from_millis(3000)));
+        assert!(p.observe(Some(refused), Duration::from_millis(4500)));
+    }
+    #[test]
+    fn log_text_has_no_controls_and_titles_are_bounded() {
+        assert_eq!(clean_text("one\ntwo\r\tthree", 7), "one two");
+        assert_eq!(clean_text(&"x".repeat(100), 40).len(), 40);
+    }
+    #[test]
+    fn resize_compares_edges_to_the_drag_start() {
+        let start = Rect::new(20, 30, 900, 600);
+        assert!(!is_resize(start, Rect::new(50, 60, 900, 600)));
+        assert!(is_resize(start, Rect::new(20, 30, 908, 600)));
+        assert!(is_resize(start, Rect::new(12, 30, 908, 600)));
+        assert!(is_resize(start, Rect::new(20, 22, 900, 608)));
+        assert!(!is_resize(start, Rect::new(20, 30, 902, 600)));
+    }
+    #[test]
+    fn placed_maximized_and_fullscreen_windows_keep_their_reservation() {
+        let tile = Rect::new(0, 0, 1920, 1080);
+        assert!(!suspend_placement(false, true, Some(tile), Some(tile)));
+        assert!(suspend_placement(false, true, Some(Rect::new(0, 0, 960, 1080)), Some(tile)));
+        assert!(suspend_placement(true, false, Some(tile), Some(tile)));
+        assert!(!suspend_placement(true, false, None, Some(tile)));
+        assert!(!suspend_placement(false, false, Some(tile), Some(tile)));
     }
 }
