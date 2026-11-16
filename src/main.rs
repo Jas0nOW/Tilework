@@ -1,5 +1,4 @@
 #![windows_subsystem = "windows"]
-#![allow(dead_code)]
 mod app;
 mod config;
 mod platform;
@@ -17,12 +16,15 @@ fn main() {
             app::log(&format!("could not enable per-monitor DPI awareness: {e}"));
         }
     }
-    // GUI subsystem has no console; attach to the parent's so that --dump can print.
-    unsafe {
-        let _ = windows::Win32::System::Console::AttachConsole(windows::Win32::System::Console::ATTACH_PARENT_PROCESS);
-    }
     let args: Vec<String> = std::env::args().collect();
-    let filter = match parse_filter(&args) {
+    let parsed = parse_filter(&args);
+    if parsed.is_err() || args.iter().any(|a| matches!(a.as_str(), "--dump" | "--snap-status" | "--restore-snap")) {
+        unsafe { let _ = windows::Win32::System::Console::AttachConsole(windows::Win32::System::Console::ATTACH_PARENT_PROCESS); }
+    } else {
+        // Detach even if the process was started with an inherited console.
+        unsafe { let _ = windows::Win32::System::Console::FreeConsole(); }
+    }
+    let filter = match parsed {
         Ok(f) => f,
         Err(e) => { eprintln!("{e}"); std::process::exit(2); }
     };
@@ -87,12 +89,25 @@ fn dump() {
 
 fn parse_filter(args: &[String]) -> Result<Option<String>, &'static str> {
     let mut filter = None;
-    for (i, _) in args.iter().enumerate().filter(|(_, arg)| *arg == "--filter") {
-        if filter.is_some() { return Err("--filter may only be supplied once"); }
-        match args.get(i + 1) {
-            Some(value) if !value.trim().is_empty() && !value.starts_with("--") => filter = Some(value.clone()),
-            _ => return Err("--filter requires a non-empty value"),
+    let mut mode = false;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--filter" => {
+                if filter.is_some() { return Err("--filter may only be supplied once"); }
+                match args.get(i + 1) {
+                    Some(value) if !value.trim().is_empty() && !value.starts_with("--") => filter = Some(value.clone()),
+                    _ => return Err("--filter requires a non-empty value"),
+                }
+                i += 1;
+            }
+            "--dump" | "--snap-status" | "--restore-snap" => {
+                if mode { return Err("only one diagnostic mode may be supplied"); }
+                mode = true;
+            }
+            _ => return Err("unknown argument"),
         }
+        i += 1;
     }
     Ok(filter)
 }
@@ -106,5 +121,7 @@ mod tests {
             assert!(parse_filter(&args.into_iter().map(String::from).collect::<Vec<_>>()).is_err());
         }
         assert_eq!(parse_filter(&["app".into(), "--filter".into(), "test".into()]), Ok(Some("test".into())));
+        assert!(parse_filter(&["app".into(), "--unknown".into()]).is_err());
+        assert!(parse_filter(&["app".into(), "--dump".into(), "--snap-status".into()]).is_err());
     }
 }

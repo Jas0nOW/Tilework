@@ -11,11 +11,12 @@ pub struct Config {
     /// Smallest zone a window may be squeezed into (keeps part of the title bar grabbable).
     pub min_zone_width: i32,
     pub min_zone_height: i32,
+    pub verbose_log: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { focus_follows_mouse: true, focus_delay_ms: 300, min_zone_width: 260, min_zone_height: 160 }
+        Self { focus_follows_mouse: true, focus_delay_ms: 300, min_zone_width: 260, min_zone_height: 160, verbose_log: false }
     }
 }
 
@@ -37,6 +38,7 @@ impl Config {
                 "focus_delay_ms" => if let Ok(n) = v.parse::<u64>() { c.focus_delay_ms = n.clamp(50, 5000); },
                 "min_zone_width" => if let Ok(n) = v.parse::<i32>() { c.min_zone_width = n.clamp(80, 1000); },
                 "min_zone_height" => if let Ok(n) = v.parse::<i32>() { c.min_zone_height = n.clamp(60, 1000); },
+                "verbose_log" => if let Ok(b) = v.parse() { c.verbose_log = b; },
                 _ => {}
             }
         }
@@ -51,8 +53,10 @@ impl Config {
              focus_delay_ms={}\n\
              # Smallest zone a window can be squeezed into (pixels).\n\
              min_zone_width={}\n\
-             min_zone_height={}\n",
-            self.focus_follows_mouse, self.focus_delay_ms, self.min_zone_width, self.min_zone_height
+             min_zone_height={}\n\
+             # Include window titles in the log.\n\
+             verbose_log={}\n",
+            self.focus_follows_mouse, self.focus_delay_ms, self.min_zone_width, self.min_zone_height, self.verbose_log
         )
     }
 
@@ -64,14 +68,9 @@ impl Config {
         load_from_path(&path)
     }
 
-    pub fn save(&self) {
-        let Some(path) = Self::path() else {
-            crate::app::log("LOCALAPPDATA is unavailable; settings were not saved");
-            return;
-        };
-        if let Err(e) = save_to_path(&path, &self.to_text()) {
-            crate::app::log(&format!("could not save config: {e}"));
-        }
+    pub fn update_keys(keys: &[(&str, &str)]) -> std::io::Result<()> {
+        let path = Self::path().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "LOCALAPPDATA is unavailable"))?;
+        update_keys_at(&path, keys)
     }
 
     /// Creates the defaults only when the config is absent; never replaces an existing file.
@@ -93,7 +92,15 @@ fn config_path(base: Option<std::ffi::OsString>) -> Option<PathBuf> {
 }
 
 fn load_from_path(path: &Path) -> Config {
-    match std::fs::read_to_string(path) {
+    let _guard = match guard_parent(path) {
+        Ok(guard) => guard,
+        Err(e) => { crate::app::log(&format!("unsafe config directory: {e}")); return Config::default(); }
+    };
+    if let Err(e) = safe_path(path) {
+        crate::app::log(&format!("unsafe config path: {e}"));
+        return Config::default();
+    }
+    match read_file(path) {
         Ok(text) => Config::parse(&text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let config = Config::default();
@@ -110,8 +117,14 @@ fn load_from_path(path: &Path) -> Config {
 }
 
 fn ensure_exists_at(path: &Path, text: &str) -> std::io::Result<()> {
+    let _guard = guard_parent(path)?;
+    safe_path(path)?;
     if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
-    let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+    safe_path(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    no_follow(&mut options);
+    let mut file = match options.open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
         Err(e) => return Err(e),
@@ -123,17 +136,23 @@ fn ensure_exists_at(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 fn save_to_path(path: &Path, text: &str) -> std::io::Result<()> {
+    let _guard = guard_parent(path)?;
     use std::io::Write;
     static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    safe_path(path)?;
     std::fs::create_dir_all(parent)?;
+    safe_path(path)?;
     let name = path.file_name().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "config path has no filename"))?;
     let (temp_path, mut file) = loop {
         let n = NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut temp_name = name.to_os_string();
         temp_name.push(format!(".{}.{}.tmp", std::process::id(), n));
         let candidate = parent.join(temp_name);
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        no_follow(&mut options);
+        match options.open(&candidate) {
             Ok(file) => break (candidate, file),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
@@ -144,10 +163,133 @@ fn save_to_path(path: &Path, text: &str) -> std::io::Result<()> {
         file.flush()?;
         file.sync_all()?;
         drop(file);
+        safe_path(path)?;
         replace_file(&temp_path, path)
     })();
     if result.is_err() { let _ = std::fs::remove_file(&temp_path); }
     result
+}
+
+/// Reject existing reparse points in the path before accessing application data.
+pub fn safe_path(path: &Path) -> std::io::Result<()> {
+    for ancestor in path.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) if is_reparse(&metadata) => return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "reparse point in application data path")),
+            Ok(_) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Keeps every directory in the path open without delete sharing.
+/// This prevents a checked directory from being replaced while files are accessed.
+pub struct PathGuard {
+    _directories: Vec<std::fs::File>,
+}
+
+pub fn guard_parent(path: &Path) -> std::io::Result<PathGuard> {
+    let parent = path.parent().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent"))?;
+    if !parent.is_absolute() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "path must be absolute")); }
+    let mut directories = Vec::new();
+    for directory in parent.ancestors().collect::<Vec<_>>().into_iter().rev() {
+        let mut options = std::fs::OpenOptions::new();
+        directory_options(&mut options);
+        let file = match options.open(directory) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::create_dir(directory) {
+                    Ok(()) => {},
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {},
+                    Err(e) => return Err(e),
+                }
+                options.open(directory)?
+            }
+            Err(e) => return Err(e),
+        };
+        if is_reparse(&file.metadata()?) {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "reparse point in application data path"));
+        }
+        directories.push(file);
+    }
+    Ok(PathGuard { _directories: directories })
+}
+
+#[cfg(windows)]
+fn directory_options(options: &mut std::fs::OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+    options.read(true).access_mode(1).share_mode(3).custom_flags(0x0220_0000);
+}
+
+#[cfg(not(windows))]
+fn directory_options(options: &mut std::fs::OpenOptions) { options.read(true); }
+
+fn read_file(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    no_follow(&mut options);
+    let mut file = options.open(path)?;
+    if is_reparse(&file.metadata()?) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "reparse point in application data path"));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+#[cfg(windows)]
+fn is_reparse(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    reparse_attribute(metadata.file_attributes())
+}
+
+#[cfg(any(windows, test))]
+fn reparse_attribute(attributes: u32) -> bool { attributes & 0x400 != 0 }
+
+#[cfg(not(windows))]
+fn is_reparse(metadata: &std::fs::Metadata) -> bool { metadata.file_type().is_symlink() }
+
+#[cfg(windows)]
+fn no_follow(options: &mut std::fs::OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+    options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+}
+
+#[cfg(not(windows))]
+fn no_follow(_options: &mut std::fs::OpenOptions) {}
+
+fn update_keys_at(path: &Path, keys: &[(&str, &str)]) -> std::io::Result<()> {
+    let _guard = guard_parent(path)?;
+    safe_path(path)?;
+    let text = match read_file(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default().to_text(),
+        Err(e) => return Err(e),
+    };
+    let mut found = vec![false; keys.len()];
+    let mut result = String::new();
+    for line in text.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\r', '\n']);
+        let key = content.split_once('=').map(|(key, _)| key.trim());
+        if let Some(index) = keys.iter().position(|(name, _)| Some(*name) == key) {
+            result.push_str(keys[index].0);
+            result.push('=');
+            result.push_str(keys[index].1);
+            result.push('\n');
+            found[index] = true;
+        } else {
+            result.push_str(line);
+        }
+    }
+    for (index, (key, value)) in keys.iter().enumerate() {
+        if !found[index] {
+            if !result.is_empty() && !result.ends_with('\n') { result.push('\n'); }
+            result.push_str(&format!("{key}={value}\n"));
+        }
+    }
+    save_to_path(path, &result)
 }
 
 #[cfg(windows)]
@@ -173,12 +315,14 @@ mod tests {
         assert_eq!(config_path(None), None);
         assert_eq!(config_path(Some("".into())), None);
         assert_eq!(config_path(Some("relative-app-data".into())), None);
-        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        let base = std::env::temp_dir();
         assert_eq!(config_path(Some(base.clone().into_os_string())), Some(base.join("CosmicTile").join("config.ini")));
     }
 
     fn test_file(label: &str) -> PathBuf {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("cosmictile-config-{}-{nonce}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(format!("config-test-{}-{label}.ini", std::process::id()))
     }
@@ -187,12 +331,13 @@ mod tests {
     fn defaults_follow_the_mouse_after_300_ms() {
         let c = Config::default();
         assert!(c.focus_follows_mouse);
+        assert!(!c.verbose_log);
         assert_eq!(c.focus_delay_ms, 300);
     }
 
     #[test]
     fn a_saved_config_reads_back_the_same() {
-        let c = Config { focus_follows_mouse: false, focus_delay_ms: 800, min_zone_width: 300, min_zone_height: 200 };
+        let c = Config { focus_follows_mouse: false, focus_delay_ms: 800, min_zone_width: 300, min_zone_height: 200, verbose_log: true };
         assert_eq!(Config::parse(&c.to_text()), c);
     }
 
@@ -207,7 +352,7 @@ mod tests {
     #[test]
     fn save_atomically_replaces_an_existing_config() {
         let path = test_file("atomic-overwrite");
-        let config = Config { focus_follows_mouse: false, focus_delay_ms: 900, min_zone_width: 320, min_zone_height: 220 };
+        let config = Config { focus_follows_mouse: false, focus_delay_ms: 900, min_zone_width: 320, min_zone_height: 220, verbose_log: false };
         std::fs::write(&path, "old contents").unwrap();
         save_to_path(&path, &config.to_text()).unwrap();
         assert_eq!(Config::parse(&std::fs::read_to_string(&path).unwrap()), config);
@@ -235,7 +380,7 @@ mod tests {
 
     #[test]
     fn read_error_returns_defaults_without_modifying_target() {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("config-test-{}-read-error", std::process::id()));
+        let dir = test_file("read-error");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("existing-directory.ini");
         std::fs::write(&path, "sentinel").unwrap();
@@ -243,5 +388,38 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "sentinel");
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn tray_updates_keep_manual_edits_and_unknown_lines() {
+        let path = test_file("tray");
+        std::fs::write(&path, "# custom\nmin_zone_width=413\ncustom=keep\nfocus_follows_mouse=false\n").unwrap();
+        update_keys_at(&path, &[("focus_follows_mouse", "true"), ("focus_delay_ms", "800")]).unwrap();
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert!(updated.contains("# custom\nmin_zone_width=413\ncustom=keep\n"));
+        let config = Config::parse(&updated);
+        assert_eq!(config.min_zone_width, 413);
+        assert!(config.focus_follows_mouse);
+        assert_eq!(config.focus_delay_ms, 800);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reparse_attribute_detection_rejects_the_flag() {
+        assert!(reparse_attribute(0x400));
+        assert!(!reparse_attribute(0x20));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn directory_guard_prevents_replacement_until_released() {
+        let path = test_file("guard");
+        let directory = path.parent().unwrap();
+        let moved = directory.with_extension("moved");
+        let guard = guard_parent(&path).unwrap();
+        assert!(std::fs::rename(directory, &moved).is_err());
+        drop(guard);
+        std::fs::rename(directory, &moved).unwrap();
+        std::fs::remove_dir(moved).unwrap();
     }
 }

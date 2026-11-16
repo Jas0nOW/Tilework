@@ -95,7 +95,7 @@ pub enum Edge {
 
 pub type Hwnd = isize;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Node {
     Leaf(Hwnd),
     Container {
@@ -272,23 +272,49 @@ impl Tree {
         }
     }
 
-    /// Rebuilds the layout only if doing so reduces the number of minimum-size violations.
+    /// Move only violating windows, retaining the existing tree whenever that improves it.
     pub fn reseat(&mut self, area: Rect) -> bool {
-        let before = self.violations(area);
-        if before == 0 { return false; }
-        let mut leaves = self.leaves();
-        leaves.sort_by_key(|h| {
-            let (w, h) = leaf_min(&self.mins, *h);
-            std::cmp::Reverse(i64::from(w) * i64::from(h))
-        });
-        let mut candidate = Tree { root: None, mins: self.mins.clone() };
-        for &h in &leaves { candidate.add(h, area, None); }
-        if candidate.leaves().len() == leaves.len() && candidate.violations(area) < before {
+        let mut changed = false;
+        loop {
+            let before = self.violations(area);
+            if before == 0 { break; }
+            let leaves = self.leaves();
+            let violating: Vec<_> = self.layout(area).into_iter().filter_map(|(h, r)| {
+                let (w, height) = leaf_min(&self.mins, h);
+                (r.w < w || r.h < height).then_some(h)
+            }).collect();
+            let mut best: Option<(usize, usize, Tree)> = None;
+            let mut consider = |candidate: Tree| {
+                let violations = candidate.violations(area);
+                let preserved = match (&self.root, &candidate.root) {
+                    (Some(original), Some(new)) => preserved_manual_subtrees(original, new),
+                    _ => 0,
+                };
+                if violations < before && best.as_ref().is_none_or(|(n, p, _)| violations < *n || violations == *n && preserved > *p) {
+                    best = Some((violations, preserved, candidate));
+                }
+            };
+            for h in violating {
+                let mut base = self.clone();
+                base.remove(h);
+                for target in leaves.iter().copied().filter(|&target| target != h) {
+                    for side in [DropZone::Right, DropZone::Bottom, DropZone::Left, DropZone::Top] {
+                        let mut candidate = base.clone();
+                        candidate.insert(h, target, side);
+                        consider(candidate);
+                    }
+                }
+                for side in [DropZone::Right, DropZone::Bottom, DropZone::Left, DropZone::Top] {
+                    let mut candidate = base.clone();
+                    candidate.insert_edge(h, side);
+                    consider(candidate);
+                }
+            }
+            let Some((_, _, candidate)) = best else { break };
             *self = candidate;
-            true
-        } else {
-            false
+            changed = true;
         }
+        changed
     }
 
     /// Adds a window as a new full-length zone along one outer edge of the screen.
@@ -357,19 +383,6 @@ impl Tree {
         Some(c.layout(area))
     }
 
-    /// Rectangle the window would get at the outer edge (None if that violates minimum sizes).
-    pub fn preview_edge(&self, area: Rect, added: Hwnd, side: DropZone) -> Option<Rect> {
-        let mut c = self.clone();
-        if c.contains(added) {
-            c.remove(added);
-        }
-        c.insert_edge(added, side);
-        if c.violations(area) > self.violations(area) {
-            return None;
-        }
-        c.rect_of(area, added)
-    }
-
     /// Removes a window; the freed space goes to its neighbours.
     pub fn remove(&mut self, h: Hwnd) -> bool {
         let Some(root) = self.root.take() else { return false };
@@ -417,16 +430,6 @@ impl Tree {
         }
     }
 
-    /// Rectangle a foreign window would get if it were inserted next to `target`.
-    pub fn preview_insert(&self, area: Rect, added: Hwnd, target: Hwnd, zone: DropZone) -> Option<Rect> {
-        let mut c = self.clone();
-        c.insert(added, target, zone);
-        if c.violations(area) > self.violations(area) {
-            return None;
-        }
-        c.rect_of(area, added)
-    }
-
     fn insert_around(&mut self, target: Hwnd, added: Hwnd, zone: DropZone) {
         if let Some(root) = self.root.take() {
             self.root = Some(insert_node(root, target, added, zone, false));
@@ -447,6 +450,7 @@ impl Tree {
     }
 
     /// The exact rectangle the dragged window would get if it were dropped here.
+    #[cfg(test)]
     pub fn preview(&self, area: Rect, dragged: Hwnd, target: Hwnd, zone: DropZone) -> Option<Rect> {
         let mut c = self.clone();
         if !c.move_to(dragged, target, zone) {
@@ -469,6 +473,7 @@ impl Tree {
     }
 
     /// Makes all zones of every container equal again.
+    #[cfg(test)]
     pub fn equalize(&mut self) {
         if let Some(root) = &mut self.root {
             equalize_node(root);
@@ -496,15 +501,18 @@ pub fn zone_at(r: Rect, x: i32, y: i32) -> DropZone {
     }
 }
 
-/// Orientation and zone count of the container that directly holds `h`.
-fn parent_row(n: &Node, h: Hwnd) -> Option<(Orientation, usize)> {
-    if let Node::Container { orient, children, .. } = n {
-        if children.iter().any(|c| matches!(c, Node::Leaf(id) if *id == h)) {
-            return Some((*orient, children.len()));
-        }
-        return children.iter().find_map(|c| parent_row(c, h));
+/// Count unchanged manually sized subtrees to prefer preserving user decisions on ties.
+fn preserved_manual_subtrees(original: &Node, candidate: &Node) -> usize {
+    fn includes(root: &Node, wanted: &Node) -> bool {
+        root == wanted || matches!(root, Node::Container { children, .. } if children.iter().any(|child| includes(child, wanted)))
     }
-    None
+    match original {
+        Node::Leaf(_) => 0,
+        Node::Container { children, auto, .. } => {
+            usize::from(!auto && includes(candidate, original))
+                + children.iter().map(|child| preserved_manual_subtrees(child, candidate)).sum::<usize>()
+        }
+    }
 }
 
 fn has(n: &Node, h: Hwnd) -> bool {
@@ -623,6 +631,7 @@ fn swap_ids(n: &mut Node, a: Hwnd, b: Hwnd) {
     }
 }
 
+#[cfg(test)]
 fn equalize_node(n: &mut Node) {
     if let Node::Container { children, weights, auto, .. } = n {
         *weights = equal(children.len());
@@ -987,9 +996,25 @@ mod tests {
         assert!(t.violations(SCREEN) > 0);
         assert!(t.reseat(SCREEN));
         assert_eq!(t.violations(SCREEN), 0);
-        assert_eq!(t.leaves(), vec![1, 2, 3]);
-        for id in 1..=3 { assert_eq!((rect(&t, id).w, rect(&t, id).h), (1920, 360)); }
+        let mut leaves = t.leaves();
+        leaves.sort();
+        assert_eq!(leaves, vec![1, 2, 3]);
+        for id in 1..=3 { assert!(rect(&t, id).w >= 1100); }
         assert!(!t.reseat(SCREEN));
+    }
+
+    #[test]
+    fn reseat_keeps_unaffected_manual_subtree_weights() {
+        let mut t = tree_of(&[1, 2, 3]);
+        t.insert(4, 1, DropZone::Bottom);
+        assert!(t.set_edge(SCREEN, 1, Edge::Bottom, 400));
+        let before_ratio = rect(&t, 1).h as f64 / rect(&t, 4).h as f64;
+        t.mins.insert(3, (1500, 300));
+        assert!(t.violations(SCREEN) > 0);
+        assert!(t.reseat(SCREEN));
+        assert_eq!(t.violations(SCREEN), 0);
+        let after_ratio = rect(&t, 1).h as f64 / rect(&t, 4).h as f64;
+        assert!((before_ratio - after_ratio).abs() < 0.01);
     }
 
     #[test]

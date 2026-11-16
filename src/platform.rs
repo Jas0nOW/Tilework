@@ -2,6 +2,8 @@
 
 use crate::tree::Rect;
 use std::ffi::c_void;
+use std::cell::Cell;
+use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicU8, Ordering};
 use windows::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT};
 use windows::core::{BOOL, PWSTR};
@@ -20,7 +22,31 @@ pub struct SurfaceKey {
     pub monitor: isize,
 }
 
+/// The window operations used by the tiler. Implementations can simulate window behavior.
+pub trait Win {
+    fn visible_rect(&self, h: isize) -> Option<Rect>;
+    fn is_maximized(&self, h: isize) -> bool;
+    fn is_minimized(&self, h: isize) -> bool;
+    fn is_fullscreen(&self, h: isize) -> bool;
+    fn is_hung(&self, h: isize) -> bool;
+    fn place(&self, h: isize, target: Rect) -> bool;
+    fn desktop_id(&self, h: isize) -> u128;
+    fn all_top_level(&self) -> Vec<isize>;
+    fn monitor_of(&self, h: isize) -> (isize, Rect);
+    fn is_manageable(&self, h: isize, current: u128) -> bool;
+    fn title(&self, h: isize) -> String;
+    fn exe_name(&self, h: isize) -> String;
+    fn class_name(&self, h: isize) -> String;
+    fn current_desktop(&self) -> u128;
+    fn invalidate_desktop(&self);
+    fn surface_of(&self, h: isize) -> (SurfaceKey, Rect) {
+        let (monitor, area) = self.monitor_of(h);
+        (SurfaceKey { desktop: self.desktop_id(h), monitor }, area)
+    }
+}
+
 pub struct Platform {
+    desktop_cache: Cell<Option<(Instant, u128)>>,
     vdm: Option<IVirtualDesktopManager>,
     com_initialized: bool,
 }
@@ -38,7 +64,7 @@ impl Platform {
         unsafe {
             let com_initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
             let vdm = CoCreateInstance::<_, IVirtualDesktopManager>(&VirtualDesktopManager, None, CLSCTX_ALL).ok();
-            Self { vdm, com_initialized }
+            Self { vdm, com_initialized, desktop_cache: Cell::new(None) }
         }
     }
 
@@ -133,9 +159,11 @@ impl Platform {
 
     pub fn all_top_level(&self) -> Vec<isize> {
         unsafe extern "system" fn cb(h: HWND, lp: LPARAM) -> BOOL {
-            let v = unsafe { &mut *(lp.0 as *mut Vec<isize>) };
-            v.push(h.0 as isize);
-            BOOL(1)
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let v = unsafe { &mut *(lp.0 as *mut Vec<isize>) };
+                v.push(h.0 as isize);
+                BOOL(1)
+            })).unwrap_or_else(|_| { crate::app::callback_failed(); BOOL(0) })
         }
         let mut out: Vec<isize> = Vec::new();
         unsafe {
@@ -156,16 +184,21 @@ impl Platform {
     /// desktop that is currently shown.
     pub fn desktop_id(&self, h: isize) -> u128 {
         match self.raw_desktop_id(h) {
-            0 => self.current_desktop(),
+            0 => self.desktop_cache.get().map(|(_, id)| id).unwrap_or_else(|| self.current_desktop()),
             id => id,
         }
     }
 
-    /// Use confirmed visible application windows, rejecting conflicting IDs rather than trusting
-    /// the first one (a pinned window may report its original desktop).
+    /// Invalidate cached desktop evidence after a foreground or desktop-switch event.
+    pub fn invalidate_desktop(&self) { self.desktop_cache.set(None); }
+
     pub fn current_desktop(&self) -> u128 {
+        if let Some((time, id)) = self.desktop_cache.get() && time.elapsed() < Duration::from_millis(250) {
+            return id;
+        }
         let Some(vdm) = &self.vdm else { return 0 };
-        let mut ids = Vec::new();
+        let mut evidence = Vec::new();
+        let foreground = id_of(unsafe { GetForegroundWindow() });
         for h in self.all_top_level() {
             unsafe {
                 let hw = hwnd_of(h);
@@ -175,12 +208,14 @@ impl Platform {
                     && vdm.IsWindowOnCurrentVirtualDesktop(hw).map(|v| v.as_bool()).unwrap_or(false) {
                     let id = self.raw_desktop_id(h);
                     if id != 0 {
-                        ids.push(id);
+                        evidence.push((h, id));
                     }
                 }
             }
         }
-        desktop_consensus(ids)
+        let result = identify_desktop(foreground, &evidence, || explorer_current_desktop().unwrap_or(0));
+        self.desktop_cache.set(Some((Instant::now(), result)));
+        result
     }
 
     /// Monitor handle and the usable work area (without the taskbar) for a window.
@@ -211,6 +246,10 @@ impl Platform {
     /// True for a window that covers its whole monitor including the taskbar area (F11 in a
     /// browser, a video or a game in full screen). Such windows must be left alone.
     pub fn is_fullscreen(&self, h: isize) -> bool {
+        // Full-screen coverage requires a borderless style. A normal maximized
+        // window can cover a taskbar-free monitor and still needs adoption.
+        let style = unsafe { GetWindowLongW(hwnd_of(h), GWL_STYLE) } as u32;
+        if style & WS_CAPTION.0 == WS_CAPTION.0 { return false; }
         let Some(v) = self.visible_rect(h) else { return false };
         unsafe {
             let m = MonitorFromWindow(hwnd_of(h), MONITOR_DEFAULTTONEAREST);
@@ -269,6 +308,24 @@ impl Platform {
     }
 }
 
+impl Win for Platform {
+    fn visible_rect(&self, h: isize) -> Option<Rect> { Platform::visible_rect(self, h) }
+    fn is_maximized(&self, h: isize) -> bool { Platform::is_maximized(self, h) }
+    fn is_minimized(&self, h: isize) -> bool { Platform::is_minimized(self, h) }
+    fn is_fullscreen(&self, h: isize) -> bool { Platform::is_fullscreen(self, h) }
+    fn is_hung(&self, h: isize) -> bool { Platform::is_hung(self, h) }
+    fn place(&self, h: isize, target: Rect) -> bool { Platform::place(self, h, target) }
+    fn desktop_id(&self, h: isize) -> u128 { Platform::desktop_id(self, h) }
+    fn all_top_level(&self) -> Vec<isize> { Platform::all_top_level(self) }
+    fn monitor_of(&self, h: isize) -> (isize, Rect) { Platform::monitor_of(self, h) }
+    fn is_manageable(&self, h: isize, current: u128) -> bool { Platform::is_manageable(self, h, current) }
+    fn title(&self, h: isize) -> String { Platform::title(self, h) }
+    fn exe_name(&self, h: isize) -> String { Platform::exe_name(self, h) }
+    fn class_name(&self, h: isize) -> String { Platform::class_name(self, h) }
+    fn current_desktop(&self) -> u128 { Platform::current_desktop(self) }
+    fn invalidate_desktop(&self) { Platform::invalidate_desktop(self); }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum PlacementStep { Wait, Restore, Position }
 
@@ -278,13 +335,44 @@ fn placement_step(hung: bool, minimized: bool, maximized: bool) -> PlacementStep
     else { PlacementStep::Position }
 }
 
-fn desktop_consensus(ids: impl IntoIterator<Item = u128>) -> u128 {
-    let mut current = 0;
-    for id in ids.into_iter().filter(|&id| id != 0) {
-        if current != 0 && current != id { return 0; }
-        current = id;
+/// Explorer exposes the active desktop here even when it contains no windows. This
+/// is an undocumented shell detail, so unavailable or malformed data is ignored.
+fn explorer_current_desktop() -> Option<u128> {
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_BINARY};
+    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    let mut session = 0;
+    let session_ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session).is_ok() };
+    let base = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer";
+    let mut paths = Vec::new();
+    if session_ok { paths.push(format!(r"{base}\SessionInfo\{session}\VirtualDesktops")); }
+    paths.push(format!(r"{base}\VirtualDesktops"));
+    for path in paths {
+        let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut guid = windows::core::GUID::zeroed();
+        let mut len = std::mem::size_of_val(&guid) as u32;
+        let status = unsafe { RegGetValueW(HKEY_CURRENT_USER, windows::core::PCWSTR(wide.as_ptr()), windows::core::w!("CurrentVirtualDesktop"), RRF_RT_REG_BINARY, None, Some(&mut guid as *mut _ as *mut c_void), Some(&mut len)) };
+        if status.is_ok() && len as usize == std::mem::size_of_val(&guid) && guid.to_u128() != 0 {
+            return Some(guid.to_u128());
+        }
     }
-    current
+    None
+}
+
+fn identify_desktop(foreground: isize, evidence: &[(isize, u128)], empty: impl FnOnce() -> u128) -> u128 {
+    if let Some((_, id)) = evidence.iter().find(|(h, id)| *h == foreground && *id != 0) { return *id; }
+    if evidence.is_empty() { return empty(); }
+    desktop_consensus(evidence.iter().map(|(_, id)| *id))
+}
+
+fn desktop_consensus(ids: impl IntoIterator<Item = u128>) -> u128 {
+    let mut counts = std::collections::HashMap::new();
+    let mut total = 0usize;
+    for id in ids.into_iter().filter(|&id| id != 0) {
+        *counts.entry(id).or_insert(0usize) += 1;
+        total += 1;
+    }
+    counts.into_iter().find_map(|(id, count)| (count > total / 2).then_some(id)).unwrap_or(0)
 }
 
 const SPI_GETWINARRANGING: u32 = 0x0082;
@@ -334,10 +422,6 @@ fn parse_marker(bytes: &[u8]) -> Option<bool> {
 
 /// Whether Windows' own window snapping (drag to an edge) is currently active.
 pub fn snap_status() -> Option<bool> { read_snap() }
-pub fn snap_enabled() -> bool { snap_status().unwrap_or(true) }
-
-/// Direct session-only setting; callers managing ownership should use `managed_snap`.
-pub fn set_snap(on: bool) -> bool { write_snap_logged(on) }
 
 /// Recover a previous interrupted session and install process-level recovery handlers.
 /// Call only after obtaining the single-instance mutex.
@@ -365,9 +449,11 @@ fn prepare_snap_recovery_inner() -> bool {
 }
 
 unsafe extern "system" fn snap_ctrl_handler(event: u32) -> BOOL {
-    if matches!(event, CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT) {
-        restore_owned_snap();
-    }
+    std::panic::catch_unwind(|| {
+        if matches!(event, CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT) {
+            restore_owned_snap();
+        }
+    }).unwrap_or_else(|_| crate::app::callback_failed());
     BOOL(0)
 }
 
@@ -379,26 +465,60 @@ pub fn managed_snap(on: bool) -> bool {
 }
 
 fn managed_snap_inner(on: bool) -> bool {
-    let original = match SNAP_ORIGINAL.load(Ordering::SeqCst) { 1 => false, 2 => true, _ => return false };
+    if SNAP_ORIGINAL.load(Ordering::SeqCst) == 0 { return false; }
     if on {
         // A session which started with Snap off must not enable it implicitly.
         return restore_owned_snap();
     }
     let Some(path) = marker_path() else { return false };
-    let Some(dir) = path.parent() else { return false };
-    if std::fs::create_dir_all(dir).is_err() { return false; }
+    let Ok(_guard) = crate::config::guard_parent(&path) else { return false };
+    let marker_exists = match read_marker_file(&path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => return false,
+    };
+    let Some(original) = ownership_original(marker_exists, SNAP_ORIGINAL.load(Ordering::SeqCst), read_snap) else { return false };
+    SNAP_ORIGINAL.store(if original { 2 } else { 1 }, Ordering::SeqCst);
     let marker = if original { b"1" } else { b"0" };
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(windows)]
+    { use std::os::windows::fs::OpenOptionsExt; options.custom_flags(0x0020_0000); }
+    match options.open(&path) {
         Ok(mut file) => {
             use std::io::Write;
             if file.write_all(marker).is_err() || file.sync_all().is_err() { return false; }
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            if std::fs::read(&path).ok().as_deref() != Some(marker.as_slice()) { return false; }
+            if read_marker_file(&path).ok().as_deref() != Some(marker.as_slice()) { return false; }
         }
         Err(_) => return false,
     }
     write_snap_logged(false)
+}
+
+// A current value is captured only when acquiring a new ownership marker.
+fn ownership_original(marker_exists: bool, stored: u8, read: impl FnOnce() -> Option<bool>) -> Option<bool> {
+    if marker_exists { match stored { 1 => Some(false), 2 => Some(true), _ => None } }
+    else { read() }
+}
+
+fn read_marker_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    { use std::os::windows::fs::OpenOptionsExt; options.custom_flags(0x0020_0000); }
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    #[cfg(windows)]
+    let reparse = { use std::os::windows::fs::MetadataExt; metadata.file_attributes() & 0x400 != 0 };
+    #[cfg(not(windows))]
+    let reparse = metadata.file_type().is_symlink();
+    if reparse { return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "reparse marker")); }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// Restore the captured state; retain the marker if Windows rejects the change.
@@ -410,12 +530,13 @@ pub fn restore_owned_snap() -> bool {
 
 /// Recovery is testable without changing Windows settings. An absent marker never writes Snap.
 fn restore_marker(path: &std::path::Path, expected: Option<bool>, set: impl FnOnce(bool) -> bool) -> bool {
-    let original = match std::fs::read(path) {
+    let Ok(_guard) = crate::config::guard_parent(path) else { return false };
+    let original = match read_marker_file(path) {
         Ok(bytes) => match parse_marker(&bytes) { Some(value) => value, None => return false },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
         Err(_) => return false,
     };
-    if expected.is_some_and(|value| value != original) || !set(original) { return false; }
+    if expected.is_some_and(|value| value != original) || !set(original) || crate::config::safe_path(path).is_err() { return false; }
     match std::fs::remove_file(path) {
         Ok(()) => true,
         Err(e) => e.kind() == std::io::ErrorKind::NotFound,
@@ -424,8 +545,14 @@ fn restore_marker(path: &std::path::Path, expected: Option<bool>, set: impl FnOn
 
 /// Explicit user recovery enables Snap regardless of the captured session state.
 pub fn restore_snap_explicit() -> bool {
-    if !write_snap_logged(true) { return false; }
     let Some(path) = marker_path() else { return false };
+    let Ok(_guard) = crate::config::guard_parent(&path) else { return false };
+    match read_marker_file(&path) {
+        Ok(_) => {},
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+        Err(_) => return false,
+    }
+    if !write_snap_logged(true) || crate::config::safe_path(&path).is_err() { return false; }
     match std::fs::remove_file(path) {
         Ok(()) => true,
         Err(e) => e.kind() == std::io::ErrorKind::NotFound,
@@ -441,28 +568,23 @@ impl Drop for Platform {
 
 #[cfg(test)]
 mod snap_tests {
-    use super::{desktop_consensus, parse_marker, placement_step, restore_marker, PlacementStep};
+    use super::{ownership_original, parse_marker, restore_marker};
 
     #[test]
-    fn maximized_adoption_restores_before_a_later_normal_placement() {
-        assert_eq!(placement_step(true, false, true), PlacementStep::Wait);
-        assert_eq!(placement_step(false, true, false), PlacementStep::Wait);
-        assert_eq!(placement_step(false, false, true), PlacementStep::Restore);
-        assert_eq!(placement_step(false, false, false), PlacementStep::Position);
-    }
-
-    #[test]
-    fn desktop_identity_requires_consistent_nonzero_evidence() {
-        assert_eq!(desktop_consensus([]), 0);
-        assert_eq!(desktop_consensus([0, 0]), 0);
-        assert_eq!(desktop_consensus([0, 42, 42]), 42);
-        assert_eq!(desktop_consensus([42, 99]), 0);
-        assert_eq!(desktop_consensus([99, 42, 42]), 0);
+    fn ownership_recaptures_a_user_change_after_releasing_snap() {
+        let first = ownership_original(false, 2, || Some(true)).unwrap();
+        assert!(first);
+        let while_owned = ownership_original(true, 2, || panic!("owned state must not be recaptured"));
+        assert_eq!(while_owned, Some(true));
+        let after_release = ownership_original(false, 2, || Some(false));
+        assert_eq!(after_release, Some(false));
     }
 
     #[test]
     fn recovery_only_changes_snap_for_a_valid_marker_and_retains_failed_recovery() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("snap-test-{}.flag", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cosmictile-snap-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("snap.flag");
         let _ = std::fs::remove_file(&path);
         assert!(restore_marker(&path, None, |_| panic!("no marker must not change Snap")));
         std::fs::write(&path, "1").unwrap();
@@ -478,6 +600,7 @@ mod snap_tests {
         assert!(!restore_marker(&path, None, |_| panic!("corrupt marker must not change Snap")));
         assert!(path.exists());
         std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]
@@ -487,5 +610,18 @@ mod snap_tests {
         assert_eq!(parse_marker(b""), None);
         assert_eq!(parse_marker(b"other"), None);
     }
+    #[test]
+    fn pinned_window_evidence_does_not_pause_other_desktops_and_foreground_wins() {
+        use super::identify_desktop;
+        let mut windows = vec![(1, 99), (2, 42), (3, 42)]; // Window 1 is pinned from desktop 99.
+        assert_eq!(identify_desktop(0, &windows, || panic!("visible evidence exists")), 42);
+        windows[1].1 = 7; windows[2].1 = 7; // Switch desktop; the pinned window stays.
+        assert_eq!(identify_desktop(2, &windows, || 0), 7);
+        windows[2].1 = 99; // A conflict cannot override an explicit foreground window.
+        assert_eq!(identify_desktop(2, &windows, || 0), 7);
+        windows.clear(); // The empty desktop is resolved through shell evidence.
+        assert_eq!(identify_desktop(0, &windows, || 7), 7);
+    }
+
 }
 

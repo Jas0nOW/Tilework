@@ -12,7 +12,7 @@ Written in Rust, no runtime dependencies besides the `windows` crate.
 - One independent layout per virtual desktop and monitor; tiling can be switched on/off per desktop
   (tray icon click or `Win + Y`); manual layouts survive off/on for the process lifetime.
 - Windows with a minimum size (Chrome, Discord, ...) get a zone of exactly the size they need.
-- Tiled windows that become maximized or full screen keep their reserved tile until restored.
+- Tiled windows that become maximized or full screen keep their reserved tile until restored, including across minimize/restore. Minimized tracked windows retain their tiles, preserving layouts across Win+D.
 - Windows' own edge snapping is switched off while tiling is active (restored on exit,
   `cosmictile.exe --restore-snap` enables it manually and clears the recovery marker).
   A marker recovers the previous state on next startup after an interrupted run.
@@ -21,7 +21,7 @@ Written in Rust, no runtime dependencies besides the `windows` crate.
 ## Settings
 
 Tray icon right-click menu, or `%LOCALAPPDATA%\CosmicTile\config.ini`.
-Log file: `%LOCALAPPDATA%\CosmicTile\cosmictile.log` (1 MB, one backup). Settings are saved atomically; opening them preserves existing edits. Without `LOCALAPPDATA`, config writes and logging are disabled.
+Log file: `%LOCALAPPDATA%\CosmicTile\cosmictile.log` (1 MB, one backup). Tray changes preserve manual settings and save atomically. When elevated, the settings command shows the file path. Titles are omitted from the dated UTC log unless `verbose_log=true`. Without `LOCALAPPDATA`, config writes and logging are disabled. Existing reparse points are refused; complete protection against concurrent hostile filesystem changes remains pending (see the hardening notes).
 
 ## Build
 
@@ -38,9 +38,9 @@ Run it as administrator if you also want to tile elevated windows (e.g. admin te
 
 ## Status
 
-Tree and helper logic have 74 unit and invariant tests; Windows desktop interactions require live checks.
+The platform scenarios, tree and helpers have 90 unit and invariant tests; Windows desktop interactions require live checks.
 Windows CI tests, checks Clippy and builds release artifacts on pull requests, main updates and tags.
 
 Early development. Not yet implemented: autostart, keyboard shortcuts for moving/focusing, workspaces.
 
-Hardening status, the pinned-window limitation and required desktop checks: [Design: Hardening](docs/DESIGN.md#15-hardening).
+Hardening status and required desktop checks: [Design: Hardening](docs/DESIGN.md#15-hardening).

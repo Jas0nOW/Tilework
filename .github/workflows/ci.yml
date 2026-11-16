@@ -8,10 +8,16 @@ jobs:
   verify:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
+          toolchain: stable
           components: clippy
       - run: cargo test
-      - run: cargo clippy --all-targets
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --release
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: CosmicTile-Windows
+          path: target/release/cosmictile.exe
+          if-no-files-found: error
