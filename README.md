@@ -1,5 +1,7 @@
 # Tilework
 
+[![CI](https://github.com/Jas0nOW/Tilework/actions/workflows/ci.yml/badge.svg)](https://github.com/Jas0nOW/Tilework/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **Automatic tiling for Windows 10/11, inspired by the COSMIC desktop (Pop!_OS 24.04).**
 Open a window and it finds its place. Drag it to rearrange, with a live preview of the exact result.
 No layout language, no configuration needed, no gaps.
