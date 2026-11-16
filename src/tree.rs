@@ -135,6 +135,22 @@ impl Tree {
         true
     }
 
+    /// Inserts a window that is not part of this tree yet next to `target`.
+    pub fn insert(&mut self, added: Hwnd, target: Hwnd, zone: DropZone) {
+        if self.root.is_none() {
+            self.root = Some(Node::Leaf(added));
+        } else if self.contains(target) && !self.contains(added) {
+            self.insert_around(target, added, zone);
+        }
+    }
+
+    /// Rectangle a foreign window would get if it were inserted next to `target`.
+    pub fn preview_insert(&self, area: Rect, added: Hwnd, target: Hwnd, zone: DropZone) -> Option<Rect> {
+        let mut c = self.clone();
+        c.insert(added, target, zone);
+        c.rect_of(area, added)
+    }
+
     fn insert_around(&mut self, target: Hwnd, added: Hwnd, zone: DropZone) {
         if let Some(root) = self.root.take() {
             self.root = Some(insert_node(root, target, added, zone));
