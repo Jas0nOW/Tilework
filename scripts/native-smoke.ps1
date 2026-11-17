@@ -1,4 +1,4 @@
-param([Parameter(Mandatory)][string]$Executable, [switch]$TestSnapRecovery)
+param([Parameter(Mandatory)][string]$Executable, [switch]$TestSnapRecovery, [switch]$TestDrag)
 # Use an interactive standard-user session with Tilework closed.
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
@@ -27,6 +27,94 @@ public static class TileworkAuditNative {
     [DllImport("user32.dll", EntryPoint="SystemParametersInfoW")]
     public static extern bool SetSystemParameter(uint action, uint value, IntPtr input, uint flags);
     [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out Rect rect, int size);
+
+    [StructLayout(LayoutKind.Sequential)] public struct Point { public int X, Y; }
+    [DllImport("user32.dll")] static extern bool GetCursorPos(out Point p);
+    [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] static extern void mouse_event(uint flags, uint x, uint y, uint data, UIntPtr info);
+    [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(Point p);
+    [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+    [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr window);
+    [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr window, IntPtr dc);
+    [DllImport("gdi32.dll")] static extern uint GetPixel(IntPtr dc, int x, int y);
+    static bool PreviewBlue(IntPtr dc, int x, int y) {
+        uint color = GetPixel(dc, x, y);
+        int red = (int)(color & 255), green = (int)(color >> 8 & 255), blue = (int)(color >> 16 & 255);
+        return blue - red >= 90 && blue - green >= 40;
+    }
+    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr dc);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleBitmap(IntPtr dc, int width, int height);
+    [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr dc, IntPtr obj);
+    [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
+    [DllImport("gdi32.dll")] static extern bool BitBlt(IntPtr dest, int x, int y, int w, int h, IntPtr src, int sx, int sy, uint op);
+    static Rect SamplePreview(IntPtr overlay, int x, int y) {
+        Rect area = Bounds(overlay);
+        int width = area.Right - area.Left, height = area.Bottom - area.Top;
+        IntPtr screen = GetDC(IntPtr.Zero);
+        IntPtr dc = CreateCompatibleDC(screen);
+        IntPtr bitmap = CreateCompatibleBitmap(screen, width, height);
+        IntPtr old = SelectObject(dc, bitmap);
+        try {
+            if (!BitBlt(dc, 0, 0, width, height, screen, area.Left, area.Top, 0x40CC0020)) throw new Exception("Preview capture failed");
+            x -= area.Left;
+            y -= area.Top;
+            Rect result = new Rect { Left = x, Top = y, Right = x, Bottom = y };
+            if (PreviewBlue(dc, x, y)) {
+                while (result.Left > 0 && PreviewBlue(dc, result.Left-1, y)) result.Left--;
+                while (result.Right < width && PreviewBlue(dc, result.Right, y)) result.Right++;
+                while (result.Top > 0 && PreviewBlue(dc, x, result.Top-1)) result.Top--;
+                while (result.Bottom < height && PreviewBlue(dc, x, result.Bottom)) result.Bottom++;
+            }
+            result.Left += area.Left;
+            result.Right += area.Left;
+            result.Top += area.Top;
+            result.Bottom += area.Top;
+            return result;
+        } finally {
+            SelectObject(dc, old);
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+            ReleaseDC(IntPtr.Zero, screen);
+        }
+    }
+    public static System.Threading.Tasks.Task<Rect> Drag(IntPtr source, int x1, int y1, int x2, int y2, int sampleX, int sampleY) {
+        return System.Threading.Tasks.Task.Run(() => {
+            IntPtr oldDpi = SetThreadDpiAwarenessContext(new IntPtr(-4));
+            GetCursorPos(out Point old);
+            bool pressed = false;
+            try {
+                if (!SetCursorPos(x1, y1)) throw new Exception("SetCursorPos was refused.");
+                System.Threading.Thread.Sleep(120);
+                IntPtr hit = GetAncestor(WindowFromPoint(new Point { X = x1, Y = y1 }), 2);
+                if (hit != source) throw new Exception("The fixture caption was obscured.");
+                mouse_event(2, 0, 0, 0, UIntPtr.Zero);
+                pressed = true;
+                System.Threading.Thread.Sleep(110);
+                for (int i = 1; i <= 20; i++) {
+                    SetCursorPos(x1 + (x2 - x1) * i / 20, y1 + (y2 - y1) * i / 20);
+                    System.Threading.Thread.Sleep(25);
+                }
+                IntPtr overlay = FindWindowW("TileworkOverlay", null);
+                for (int i = 0; i < 50; i++) {
+                    if (overlay != IntPtr.Zero && IsWindowVisible(overlay)) {
+                        System.Threading.Thread.Sleep(180);
+                        Rect preview = SamplePreview(overlay, sampleX, sampleY);
+                        mouse_event(4, 0, 0, 0, UIntPtr.Zero);
+                        pressed = false;
+                        System.Threading.Thread.Sleep(150);
+                        return preview;
+                    }
+                    System.Threading.Thread.Sleep(20);
+                }
+                throw new Exception("Tilework did not show the native drag preview.");
+            } finally {
+                if (pressed) mouse_event(4, 0, 0, 0, UIntPtr.Zero);
+                SetCursorPos(old.X, old.Y);
+                if (oldDpi != IntPtr.Zero) SetThreadDpiAwarenessContext(oldDpi);
+            }
+        });
+    }
     public static Rect Bounds(IntPtr hwnd) {
         if (DwmGetWindowAttribute(hwnd, 9, out Rect rect, Marshal.SizeOf<Rect>()) != 0)
             throw new Exception("Could not query DWM extended frame bounds");
@@ -87,6 +175,23 @@ function New-AuditForm([string]$Name) {
     $form.Show()
     return $form
 }
+function Invoke-AuditDrag($Form, [int]$DropX, [int]$DropY, [int]$SampleX, [int]$SampleY) {
+    $Form.Activate()
+    $source = Get-AuditBounds $Form
+    # The mouse driver runs on another thread while WinForms pumps the native move loop.
+    $task = [TileworkAuditNative]::Drag($Form.Handle, ($source.Left + 160), ($source.Top + 16), $DropX, $DropY, $SampleX, $SampleY)
+    if (!(Wait-AuditCondition { $task.IsCompleted })) { throw 'Mouse driver did not finish.' }
+    $task.GetAwaiter().GetResult()
+}
+function Assert-Preview($Preview, $Tile, [string]$Label) {
+    # The colored fill starts at the 3 px inset plus the 3 px white border.
+    if ($Preview.Left -ge $Preview.Right -or $Preview.Top -ge $Preview.Bottom -or
+        !(Test-Close ($Preview.Left - 6) $Tile.Left) -or !(Test-Close ($Preview.Top - 6) $Tile.Top) -or
+        !(Test-Close ($Preview.Right + 6) $Tile.Right) -or !(Test-Close ($Preview.Bottom + 6) $Tile.Bottom)) {
+        throw "Native $Label preview $Preview differed from committed tile $Tile."
+    }
+    Write-Output "PASS native $Label preview $Preview matched committed tile $Tile."
+}
 if ((Get-Process -Id $PID).SessionId -eq 0) { throw 'No interactive Windows session' }
 if ([TileworkAuditNative]::FindWindowW('TileworkMain', 'Tilework') -ne [IntPtr]::Zero) { throw 'Tilework is already running' }
 $token = 'TileworkAudit-' + [guid]::NewGuid().ToString('N').Substring(0, 10)
@@ -130,6 +235,47 @@ try {
     $forms[1].WindowState = [System.Windows.Forms.FormWindowState]::Normal
     if (!(Wait-AuditCondition { Test-Halves (Get-AuditBounds $forms[0]) (Get-AuditBounds $forms[1]) })) { throw 'Restore reflow geometry failed' }
     Write-Output 'PASS native minimize/restore reflow.'
+    if ($TestDrag) {
+        $forms[0].Activate()
+        $from = Get-AuditBounds $forms[0]
+        $to = Get-AuditBounds $forms[1]
+        $centerX = ($to.Left + $to.Right) / 2
+        $centerY = ($to.Top + $to.Bottom) / 2
+        $preview = Invoke-AuditDrag $forms[0] $centerX $centerY $centerX $centerY
+        if (!(Wait-AuditCondition {
+            (Test-Close (Get-AuditBounds $forms[0]).Left $to.Left) -and
+            (Test-Close (Get-AuditBounds $forms[1]).Left $from.Left)
+        })) { throw 'Native centre swap did not commit expected geometry.' }
+        Assert-Preview $preview (Get-AuditBounds $forms[0]) 'centre swap'
+
+        $forms[2] = New-AuditForm 'four'
+        if (!(Wait-AuditCondition { Test-V3Third @($forms | ForEach-Object { Get-AuditBounds $_ }) })) {
+            throw 'Could not restore the third test tile.'
+        }
+        $source = $forms[2]
+        $target = $forms | Where-Object { $b = Get-AuditBounds $_; $b.Top -eq $work.Top -and $b.Bottom -eq $work.Bottom } |
+            Select-Object -First 1
+        $to = Get-AuditBounds $target
+        $nestedX = $to.Left + ($to.Right - $to.Left) / 8
+        $centerY = ($to.Top + $to.Bottom) / 2
+        $preview = Invoke-AuditDrag $source $nestedX $centerY $nestedX $centerY
+        if (!(Wait-AuditCondition {
+            $b = Get-AuditBounds $source
+            (Test-Close $b.Left $to.Left) -and (Test-Close $b.Right (($to.Left + $to.Right)/2)) -and
+            (Test-Close $b.Top $to.Top) -and (Test-Close $b.Bottom $to.Bottom)
+        })) { throw "Native nested split did not commit expected geometry: $(Get-AuditBounds $source), target $to" }
+        Assert-Preview $preview (Get-AuditBounds $source) 'nested split'
+
+        $centerX = ($work.Left + $work.Right) / 2
+        $dropY = $work.Bottom - 12
+        $sampleY = $work.Bottom - ($work.Bottom - $work.Top) / 4
+        $preview = Invoke-AuditDrag $source $centerX $dropY $centerX $sampleY
+        if (!(Wait-AuditCondition {
+            $b = Get-AuditBounds $source
+            (Test-Close $b.Left $work.Left) -and (Test-Close $b.Right $work.Right) -and (Test-Close $b.Bottom $work.Bottom)
+        })) { throw "Native screen-edge drop did not fill the full width: $(Get-AuditBounds $source)" }
+        Assert-Preview $preview (Get-AuditBounds $source) 'bottom-edge zone'
+    }
     $front = $forms[0]
     $front.Activate()
     $frame = [TileworkAuditNative]::FindWindowW('TileworkFocusBorder', $null)

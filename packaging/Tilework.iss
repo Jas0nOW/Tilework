@@ -106,6 +106,7 @@ begin
     Exit;
   end;
   if LegacyFiles or LegacyTask then begin
+    Log('Legacy Tilework migration required.');
     SuppressibleMsgBox('Old Tilework files or a scheduled task that needs manual review were found. Follow the Tilework README migration steps before continuing. Setup leaves existing tasks untouched.',
       mbError, MB_OK, IDOK);
     Exit;

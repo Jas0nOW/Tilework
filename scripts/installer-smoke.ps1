@@ -21,7 +21,7 @@ $ErrorActionPreference = 'Stop'
 $appId = '{AC539AC6-9BC0-4D2B-9B89-3D739FF1342C}_is1'
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $installKey = 'HKCU:\Software\Tilework'
-$setupLog = Join-Path $env:TEMP 'tilework-installer-qa.log'
+$setupLog = $null
 
 function Assert-Condition([bool]$Condition, [string]$Message) {
     if (-not $Condition) {
@@ -95,7 +95,17 @@ function Invoke-Lifecycle {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
     Assert-Condition (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) 'Lifecycle child must use a standard user.'
-    Assert-Condition ($identity.Name -like "*$TestUser") 'Lifecycle child is running under the wrong test account.'
+    Assert-Condition ($identity.Name -like "*\$TestUser") 'Lifecycle child is running under the wrong test account.'
+    # RunAs loads the test registry hive but may inherit the runner account's environment.
+    $profile = [Environment]::GetFolderPath('UserProfile')
+    Assert-Condition ((Split-Path -Leaf $profile) -eq $TestUser) 'The isolated Windows profile was not loaded.'
+    $env:USERPROFILE = $profile
+    $env:LOCALAPPDATA = [Environment]::GetFolderPath('LocalApplicationData', 'Create')
+    $env:APPDATA = [Environment]::GetFolderPath('ApplicationData', 'Create')
+    Assert-Condition ($env:LOCALAPPDATA.StartsWith("$profile\", [StringComparison]::OrdinalIgnoreCase)) 'Local app data is outside the test profile.'
+    $env:TEMP = (New-Item -ItemType Directory -Force -Path (Join-Path $env:LOCALAPPDATA 'Temp')).FullName
+    $env:TMP = $env:TEMP
+    $script:setupLog = Join-Path $env:TEMP 'tilework-installer-qa.log'
 
     Assert-OfficialFiles $CurrentSetup $CurrentSha256 'Current Setup'
     Assert-OfficialFiles $NewerSetup $NewerSha256 'Newer Setup'
@@ -113,6 +123,7 @@ function Invoke-Lifecycle {
     try {
         $failedGuard = Start-Process -FilePath $CurrentSetup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/LOG=$setupLog") -Wait -PassThru
         Assert-Condition ($failedGuard.ExitCode -ne 0) 'Setup did not block a legacy install path.'
+        Assert-Condition (Select-String -LiteralPath $setupLog -SimpleMatch 'Legacy Tilework migration required.' -Quiet) 'Setup stopped for a reason other than the legacy fixture.'
         Assert-Condition (Test-Path -LiteralPath $legacyExe) 'The legacy path guard modified its marker file.'
         Assert-Condition (-not (Test-Path -LiteralPath $programDir)) 'The legacy path guard installed files before blocking.'
         Remove-Item -LiteralPath $setupLog -ErrorAction SilentlyContinue
@@ -208,10 +219,16 @@ function Invoke-Lifecycle {
 
 Assert-Condition ($Child) 'This script must be launched by the disposable-runner account wrapper with -Child.'
 Assert-Condition ($TestUser -match '^TileworkQA_[A-F0-9]{8}$') 'Test user name is invalid.'
-Assert-Condition ($CurrentVersion -eq '0.3.0' -and $NewerVersion -eq '0.3.1') 'Installer fixture versions must be 0.3.0 and 0.3.1.'
+Assert-Condition ([version]$CurrentVersion -lt [version]$NewerVersion) 'The upgrade fixture must use a newer version.'
 try {
     Start-Transcript -LiteralPath $TranscriptPath -Force | Out-Null
     Invoke-Lifecycle
+} catch {
+    if ($setupLog -and (Test-Path -LiteralPath $setupLog)) {
+        Get-Content -LiteralPath $setupLog -Tail 30 | Write-Host
+    }
+    Write-Host $_
+    throw
 } finally {
     Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
 }
