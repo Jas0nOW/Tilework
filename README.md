@@ -4,7 +4,7 @@
 
 Tilework automatically arranges Windows apps into tiles. Drag by the title bar to swap two windows, split one tile, or make a zone along a screen edge. The preview shows the resulting layout before you release.
 
-> **0.3.0 release candidate.** See the [release verification matrix](docs/RELEASE.md) for tested behavior and open Windows checks.
+> **0.3.0 beta.** See the [release verification matrix](docs/RELEASE.md) for tested behavior and open Windows checks.
 
 ## Try the interactive V3 demo
 

@@ -1,6 +1,6 @@
 # Tilework 0.3.0 release verification
 
-Evidence was collected on 2026-11-17 using Windows 11 and a disposable Windows Server 2025 GitHub-hosted runner. The public release gate remains closed pending the interactive checks and metadata decision below.
+Evidence was collected on 2026-11-17 using Windows 11 and a disposable Windows Server 2025 GitHub-hosted runner. Release decision: **BETA**. Version 0.3.0 is published for volunteer testers. The interactive desktop checks marked NOT TESTED below are still open.
 
 | Area | Result | Evidence |
 |---|---|---|
@@ -18,11 +18,11 @@ Evidence was collected on 2026-11-17 using Windows 11 and a disposable Windows S
 | Update discovery | PASS | Automated fixtures exercise older and equal versions, prereleases, the exact official installer URL, invalid responses and network failures. A native call reached GitHub without finding a public stable release. The legacy command prints manual update instructions. |
 | Public positive update discovery | NOT TESTED | Requires a newer public stable release. Version 0.3 installs updates manually from the official Releases page after checksum verification. |
 | Interactive installer and in-progress interruption | NOT TESTED | Windows client setup wizard, interruption after setup starts writing, and recovery by rerunning a verified installer require a disposable interactive session. Rejecting a truncated download covers a distinct failure before installation. |
-| Draft attachments and public checksums | NOT TESTED | The workflow checks tag, Cargo version, PE version and commit identity. An actual draft and public download require release authorization. |
+| Draft attachments and public checksums | PASS | Workflow run for tag v0.3.0 built the draft from commit fbc164b. The downloaded Setup and Portable SHA-256 values matched SHA256SUMS.txt, and BUILDINFO.txt named the tagged commit. |
 | Dependency advisories | PASS | OSV returned zero matching advisories for the 23 audited locked crate versions. |
-| Repository history for public visibility | FAIL | Common credential patterns and sensitive filenames returned zero hits in reachable history. Existing commit metadata contains a personal address. Keep this repository private pending a publication-history decision. |
+| Repository history for public visibility | PASS | Common credential patterns and sensitive filenames returned zero hits. History was rewritten so every commit and tag carries the GitHub no-reply address, and the remote holds only the sanitized refs. |
 | Interactive V3 demo | PASS | Edge exercised desktop and touch viewports, one to eight windows, centre swap, edge split, screen edge, divider resize and independent simulation desktop state. The README embeds the standalone demo and two screenshots. |
-| Public Pages and private vulnerability reporting | NOT TESTED | The demo is ready to deploy from the default branch's /docs folder after publication authorization. Verify unauthenticated access and the reporting form as part of that launch. |
+| Public Pages and private vulnerability reporting | PASS | The demo answers HTTP 200 without authentication at the Pages URL linked in the README. Private vulnerability reporting is enabled. |
 
 ## Findings and release gates
 
