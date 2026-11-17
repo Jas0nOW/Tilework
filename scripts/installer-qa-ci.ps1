@@ -56,28 +56,67 @@ if (-not (Get-LocalGroupMember -SID 'S-1-5-32-545' | Where-Object SID -eq $guest
 if ($LASTEXITCODE -ne 0) { throw 'Failed to make installer QA logs writable for the guest.' }
 $credential = [pscredential]::new(".\$name", $password)
 
-$transcript = Join-Path $logs 'lifecycle.log'
-$arguments = @('-NoProfile', '-NonInteractive', '-File', ('"' + (Join-Path $qa 'installer-smoke.ps1') + '"'),
+if (Get-ScheduledTask -TaskName Tilework -TaskPath '\' -ErrorAction SilentlyContinue) {
+    throw 'The disposable runner already has a root Tilework task.'
+}
+
+function Set-FixtureTask([string]$RunLevel) {
+    $account = "$env:COMPUTERNAME\$name"
+    $definition = New-ScheduledTask -Action (New-ScheduledTaskAction -Execute (Join-Path $env:WINDIR 'System32/whoami.exe')) `
+        -Principal (New-ScheduledTaskPrincipal -UserId $account -LogonType Interactive -RunLevel $RunLevel) `
+        -Trigger (New-ScheduledTaskTrigger -AtLogOn -User $account) `
+        -Settings (New-ScheduledTaskSettingsSet -Disable) -Description "Disposable Tilework QA fixture $name"
+    Register-ScheduledTask -TaskName Tilework -TaskPath '\' -InputObject $definition -Force | Out-Null
+    $scheduler = New-Object -ComObject 'Schedule.Service'
+    $scheduler.Connect()
+    $registered = $scheduler.GetFolder('\').GetTask('Tilework')
+    $acl = $registered.GetSecurityDescriptor(4)
+    $registered.SetSecurityDescriptor("$acl(A;;GR;;;$($guest.SID.Value))", 16)
+}
+
+function Assert-FixtureTask {
+    $task = Get-ScheduledTask -TaskName Tilework -TaskPath '\'
+    if ($task.Description -ne "Disposable Tilework QA fixture $name" -or $task.Settings.Enabled) {
+        throw 'Setup changed the disabled fixture task.'
+    }
+}
+
+function Invoke-StandardSmoke([switch]$ProbeTask) {
+    $label = if ($ProbeTask) { 'migration-task' } else { 'lifecycle' }
+    $transcript = Join-Path $logs "$label.log"
+    $arguments = @('-NoProfile', '-NonInteractive', '-File', ('"' + (Join-Path $qa 'installer-smoke.ps1') + '"'),
     '-Child', '-TestUser', $name, '-TranscriptPath', ('"' + $transcript + '"'),
     '-CurrentSetup', ('"' + (Join-Path $qa (Split-Path -Leaf $candidate)) + '"'),
     '-CurrentVersion', $version, '-CurrentSha256', $publishedHash,
     '-NewerSetup', ('"' + (Join-Path $qa (Split-Path -Leaf $upgrade)) + '"'),
     '-NewerVersion', $next, '-NewerSha256', $fixtureHash)
-$start = @{
-    FilePath = Join-Path $PSHOME 'pwsh.exe'
-    ArgumentList = $arguments
-    WorkingDirectory = $qa
-    Credential = $credential
-    LoadUserProfile = $true
-    PassThru = $true
-}
-$process = Start-Process @start
-try {
-    if (-not $process.WaitForExit(180000)) {
-        $process.Kill()
-        throw 'The standard-user installer test timed out.'
+    if ($ProbeTask) { $arguments += '-ProbeTask' }
+    $start = @{
+        FilePath = Join-Path $PSHOME 'pwsh.exe'
+        ArgumentList = $arguments
+        WorkingDirectory = $qa
+        Credential = $credential
+        LoadUserProfile = $true
+        PassThru = $true
     }
-    if ($process.ExitCode -ne 0) { throw "Standard-user test failed ($($process.ExitCode))." }
-} finally {
-    if (Test-Path -LiteralPath $transcript) { Get-Content -LiteralPath $transcript }
+    $process = Start-Process @start
+    try {
+        if (-not $process.WaitForExit(180000)) {
+            $process.Kill()
+            throw "Standard-user $label test timed out."
+        }
+        if ($process.ExitCode -ne 0) { throw "Standard-user $label test failed ($($process.ExitCode))." }
+    } finally {
+        if (Test-Path -LiteralPath $transcript) { Get-Content -LiteralPath $transcript }
+    }
 }
+
+Invoke-StandardSmoke
+Set-FixtureTask 'Highest'
+Invoke-StandardSmoke -ProbeTask
+Assert-FixtureTask
+Write-Output 'PASS setup leaves the flagged task untouched.'
+Set-FixtureTask 'Limited'
+Invoke-StandardSmoke
+Assert-FixtureTask
+Write-Output 'PASS lifecycle leaves the unrelated same-name task untouched.'

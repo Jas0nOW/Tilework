@@ -14,6 +14,7 @@ param(
     [Parameter(Mandatory)]
     [string]$TranscriptPath,
     [switch]$Child,
+    [switch]$ProbeTask,
     [string]$TestUser
 )
 
@@ -48,6 +49,14 @@ function Start-Installer([string]$Path, [string]$Label) {
     Remove-Item -LiteralPath $setupLog -ErrorAction SilentlyContinue
 }
 
+function Assert-LegacyGuard([string]$Reason) {
+    $arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/LOG=$setupLog")
+    $process = Start-Process -FilePath $CurrentSetup -ArgumentList $arguments -Wait -PassThru
+    Assert-Condition ($process.ExitCode -ne 0) "Setup did not block $Reason."
+    Assert-Condition (Select-String -LiteralPath $setupLog -SimpleMatch 'Legacy Tilework migration required.' -Quiet) "Setup stopped for a reason other than $Reason."
+    Remove-Item -LiteralPath $setupLog
+}
+
 function Assert-InstalledVersion([string]$Version, [string]$Label) {
     $program = Join-Path $env:LOCALAPPDATA 'Programs/Tilework/tilework.exe'
     Assert-Condition ((Get-ProductVersion) -eq $Version) "$Label registry version is not $Version."
@@ -75,7 +84,7 @@ function Assert-RunEntry([bool]$Enabled, [string]$Label) {
 }
 
 function Assert-Shortcuts([bool]$Present, [string]$Label) {
-    $programs = [Environment]::GetFolderPath('Programs')
+    $programs = Join-Path $env:APPDATA 'Microsoft/Windows/Start Menu/Programs'
     $paths = @(
         (Join-Path $programs 'Tilework.lnk'),
         (Join-Path $programs 'Uninstall Tilework.lnk')
@@ -100,9 +109,9 @@ function Invoke-Lifecycle {
     $profile = [Environment]::GetFolderPath('UserProfile')
     Assert-Condition ((Split-Path -Leaf $profile) -eq $TestUser) 'The isolated Windows profile was not loaded.'
     $env:USERPROFILE = $profile
-    $env:LOCALAPPDATA = [Environment]::GetFolderPath('LocalApplicationData', 'Create')
-    $env:APPDATA = [Environment]::GetFolderPath('ApplicationData', 'Create')
-    Assert-Condition ($env:LOCALAPPDATA.StartsWith("$profile\", [StringComparison]::OrdinalIgnoreCase)) 'Local app data is outside the test profile.'
+    # This freshly created, local-only QA account uses default profile folders.
+    $env:LOCALAPPDATA = Join-Path $profile 'AppData/Local'
+    $env:APPDATA = Join-Path $profile 'AppData/Roaming'
     $env:TEMP = (New-Item -ItemType Directory -Force -Path (Join-Path $env:LOCALAPPDATA 'Temp')).FullName
     $env:TMP = $env:TEMP
     $script:setupLog = Join-Path $env:TEMP 'tilework-installer-qa.log'
@@ -117,16 +126,21 @@ function Invoke-Lifecycle {
     Assert-RunEntry $false 'Fresh profile'
 
     $legacyExe = Join-Path $legacyDir 'tilework.exe'
+    if ($ProbeTask) {
+        Assert-Condition (-not (Test-Path -LiteralPath $legacyExe)) 'The task guard must be tested without a legacy executable.'
+        Assert-LegacyGuard 'the disabled elevated-shaped task fixture'
+        Assert-Condition (-not (Test-Path -LiteralPath $programDir)) 'The task guard wrote installation files.'
+        Write-Pass 'legacy task shape alone blocks setup before installation'
+        return
+    }
+
     New-Item -ItemType Directory -Force -Path $legacyDir | Out-Null
     $legacyMarker = [Text.Encoding]::ASCII.GetBytes('non-executable Tilework migration guard fixture')
     [IO.File]::WriteAllBytes($legacyExe, $legacyMarker)
     try {
-        $failedGuard = Start-Process -FilePath $CurrentSetup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/LOG=$setupLog") -Wait -PassThru
-        Assert-Condition ($failedGuard.ExitCode -ne 0) 'Setup did not block a legacy install path.'
-        Assert-Condition (Select-String -LiteralPath $setupLog -SimpleMatch 'Legacy Tilework migration required.' -Quiet) 'Setup stopped for a reason other than the legacy fixture.'
+        Assert-LegacyGuard 'the legacy executable fixture'
         Assert-Condition (Test-Path -LiteralPath $legacyExe) 'The legacy path guard modified its marker file.'
         Assert-Condition (-not (Test-Path -LiteralPath $programDir)) 'The legacy path guard installed files before blocking.'
-        Remove-Item -LiteralPath $setupLog -ErrorAction SilentlyContinue
         Write-Pass 'legacy-path guard blocks setup and preserves its inert marker'
     } finally {
         if (Test-Path -LiteralPath $legacyExe) {
