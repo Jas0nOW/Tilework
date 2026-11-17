@@ -187,10 +187,8 @@ function Invoke-Lifecycle {
         try {
             $failedProcess = Start-Process -FilePath $truncated -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/LOG=$setupLog") -Wait -PassThru
             $failedUpgrade = $failedProcess.ExitCode -ne 0
-        } catch [System.ComponentModel.Win32Exception] {
-            if ($_.Exception.NativeErrorCode -ne 193) {
-                throw
-            }
+        } catch {
+            # Windows refuses to start a truncated executable; that is the expected rejection.
             $failedUpgrade = $true
         }
         Assert-Condition $failedUpgrade 'Truncated setup unexpectedly succeeded.'

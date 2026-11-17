@@ -1,66 +1,73 @@
-# Release verification
+# Tilework 0.3.0 release verification
 
-**0.3.0 candidate · 2026-11-17 · NO-GO for publication.** The per-user installation lifecycle and public release path still need verification. The candidate is suitable for controlled local QA. Use a disposable Windows account or VM for installer tests.
+Evidence was collected on 2026-11-17 using Windows 11 and a disposable Windows Server 2025 GitHub-hosted runner. The public release gate remains closed pending the interactive checks and metadata decision below.
 
 | Area | Result | Evidence |
 |---|---|---|
-| Rust tests | PASS | `cargo test --locked` on Windows, 106 passed. Includes V3 layout, drag and drop, delayed native positioning via the fake platform, transient focus, DPI changes, minimized dividers, settings and log rotation. |
-| Lint and release executable | PASS | `cargo clippy --locked --all-targets -- -D warnings` and `cargo build --locked --release` with Rust 1.100.0, x64 MSVC. Native `--version` returned 0.3.0. |
-| Native Windows window lifecycle and focus frame | PASS | [Native smoke script](../scripts/native-smoke.ps1) on standard-user Windows 11, primary work area 1920×1032. Three real WinForms windows, DWM bounds checked, reflow on close and minimize/restore, overlay matched foreground bounds, exit code 0. Snap stayed enabled with isolated, intentionally unavailable app data. |
-| Native graceful exit and crash while owning Snap | NOT TESTED | Recovery-marker handling was exercised in automated tests. The native test isolated the setting and confirmed it stayed unchanged. |
-| Native drag, preview, resize, fullscreen, virtual desktops, monitor changes and Explorer restart | NOT TESTED | Related layout and event scenarios pass in simulation. Native capture, pinned windows, mixed DPI, hot-plug and Explorer recovery need separate runs. |
-| Long desktop session and handle/resource usage | NOT TESTED | Bounded placement retries and log rotation have regression coverage. Long-run CPU, GDI object and window-handle reuse behavior remain unmeasured. |
-| Legacy elevated autostart | FAIL | The prior implementation scheduled its executable with highest privileges, including a path writable by the standard user. An existing task must be removed before migrating. |
-| Candidate autostart boundary | PASS | Static review found only a current-user Run value and standard-user execution. Native portable CLI refused to register; no sign-in entry appeared. Legacy task creation was removed. |
-| Installed sign-in, restart and task migration | NOT TESTED | Clean-profile installer, sign-out/in, migration from the old task and uninstaller registry removal have no native lifecycle evidence yet. |
-| Prior executable self-updater | FAIL | Checking MZ and PE signatures only identified a file format. The old replace-and-restart sequence had a gap between renames and discarded its backup without checking application readiness. |
-| Candidate update discovery | PASS | Transport to the fixed GitHub API returned no public stable release. Fixtures check old and equal versions, the exact installer URL, prereleases, invalid JSON, HTTP errors and unexpected assets. Legacy `--update` returned a manual-install message without replacing files. |
-| Automatic application update and rollback | FAIL | The candidate uses manual installation and downgrade. A signed and authenticated automatic update and recovery protocol has not been delivered. |
-| Setup build, clean install, upgrade, interrupted install, manual rollback and uninstall | NOT TESTED | Inno Setup source and workflow are present. The compiler bootstrap was blocked by local command policy; offline extraction could not parse that compiler package. A clean Windows guest was unavailable. |
-| GitHub Actions, draft assets, and published checksums | NOT TESTED | Workflow YAML parsed locally. No dispatch or remote artifact test was performed. Toolchain version, dependency lock and compiler digest are pinned; no independent byte-for-byte rebuild of the distribution was performed. |
-| Dependency advisories | PASS | OSV batch check of 23 locked crate versions returned zero matching entries on the audit date. |
-| Repository contents and history | FAIL | No hits in the checked common credential patterns or sensitive filename scan. Commit metadata contains a personal, non-noreply email. Decide its publication or an approved history sanitization before making the repository public. |
-| Interactive V3 demo | PASS | Isolated Edge tested desktop and touch viewports, 1–8 window placements, centre swap, edge split, outer zone, divider resize and independent desktop state. No external asset requests or page errors. |
-| Public GitHub Pages and private vulnerability submission | NOT TESTED | The repository remains private. Pages activation and private reporting settings require a maintainer action. |
+| Rust tests, Clippy and release build | PASS | 106 locked tests passed on Windows. Clippy passed with warnings denied and the x64 MSVC release executable reported 0.3.0. Rust 1.100.0. |
+| Release binary and setup reproducibility | PASS | Two independent local target directories built the same portable executable. Inno Setup 6.7.4 packed both copies into identical installers on the same workstation. See SHA-256 values below. Cross-toolchain reproducibility remains unverified. |
+| Native window lifecycle and focus frame | PASS | On a standard-user Windows 11 desktop, three WinForms fixture windows reflowed on close and minimize/restore. The focus overlay matched the foreground frame in physical DWM coordinates. |
+| Native move and drop preview | PASS | Real pointer input exercised centre swap, nested split and the bottom screen edge. The captured preview for the dragged tile matched its final DWM bounds, accounting for the preview's 6-pixel inset. Primary work area 1920×1032. |
+| Native Snap state recovery | PASS | Tilework took ownership of Snap on Windows 11. The harness terminated its process, checked the recovery marker, restarted Tilework and observed Snap restored after a graceful exit. |
+| Native multi-monitor, mixed DPI, interactive resize and Explorer recovery | NOT TESTED | Single-monitor Windows session only. Monitor hot-plug, the full-screen and virtual desktop interactions, and every neighbouring preview rectangle need separate runs. Related conditions have automated layout and event coverage. |
+| Long-session resource consumption | NOT TESTED | Bounded placement retries and log rotation have automated coverage. Long-run CPU, GDI objects and handle reuse remain unmeasured. |
+| Legacy file path migration guard | PASS | The actual local installer exited 1 with the migration message against an existing legacy executable. A SHA-256 comparison confirmed the old file stayed intact. No candidate files were installed. |
+| Legacy task migration on an existing interactive desktop | NOT TESTED | Follow the verified-ownership procedure in the [README](../README.md#migrate-from-the-earlier-development-build). Setup checks tasks visible under the installing account and leaves all tasks intact. An administrator must check tasks registered under another identity. |
+| Autostart execution after sign-in or reboot | NOT TESTED | A runner process started under a fresh user token does not start an interactive Windows shell. Actual sign-in, reboot and the next sign-in after uninstall require a disposable desktop. |
+| Update discovery | PASS | Automated fixtures exercise older and equal versions, prereleases, the exact official installer URL, invalid responses and network failures. A native call reached GitHub without finding a public stable release. The legacy command prints manual update instructions. |
+| Public positive update discovery | NOT TESTED | Requires a newer public stable release. Version 0.3 installs updates manually from the official Releases page after checksum verification. |
+| Interactive installer and in-progress interruption | NOT TESTED | Windows client setup wizard, interruption after setup starts writing, and recovery by rerunning a verified installer require a disposable interactive session. Rejecting a truncated download covers a distinct failure before installation. |
+| Draft attachments and public checksums | NOT TESTED | The workflow checks tag, Cargo version, PE version and commit identity. An actual draft and public download require release authorization. |
+| Dependency advisories | PASS | OSV returned zero matching advisories for the 23 audited locked crate versions. |
+| Repository history for public visibility | FAIL | Common credential patterns and sensitive filenames returned zero hits in reachable history. Existing commit metadata contains a personal address. Keep this repository private pending a publication-history decision. |
+| Interactive V3 demo | PASS | Edge exercised desktop and touch viewports, one to eight windows, centre swap, edge split, screen edge, divider resize and independent simulation desktop state. The README embeds the standalone demo and two screenshots. |
+| Public Pages and private vulnerability reporting | NOT TESTED | The demo is ready to deploy from the default branch's /docs folder after publication authorization. Verify unauthenticated access and the reporting form as part of that launch. |
 
-## Findings and severity
+## Findings and release gates
 
 | Priority | Finding and disposition |
 |---|---|
-| P0 | An earlier build could elevate a replaceable executable at logon. Removed elevated scheduling and rejected elevated manager execution in the candidate. Follow the README migration for existing tasks. |
-| P0 | The earlier updater accepted executable-looking bytes as trusted content and could replace a file used by elevated autostart. Removed download-to-execution and executable replacement from the app. |
-| P1 | The old setup could leave a partial install and report successful removal despite failures. Replaced it with the per-user Windows installer and explicit file ownership. Installer lifecycle remains a release gate. |
-| P1 | Desktop detection could suspend tiling with a lone app, focus could outline fullscreen or stale windows, and a valid drop onto another monitor could be discarded before Windows applied its queued move. Added focused fixes with application-level regressions. |
-| P1 | Setup lifecycle, real multi-monitor drag/resize and crash/session recovery require the tests below. Resolve personal Git metadata before going public. |
-| P2 | A sole pinned window can be ambiguous without Explorer desktop information. Recycled numeric window handles could briefly inherit cached state. Handle reuse has no reproduced failure in this audit. |
+| P0 | Previous builds used a scheduled task that could launch an executable in a user-writable directory with elevated rights. The candidate uses a per-user Run entry and refuses elevated management. Review and remove a confirmed legacy Tilework task before migration. |
+| P0 | The previous updater treated executable headers as adequate verification and replaced the running application. The candidate discovers updates using a fixed HTTPS endpoint and gives the user the official release link. The application no longer downloads or replaces executables. |
+| P1 | Per-user installation, removal, migration and actual sign-in need independent evidence. Confirm the remaining interactive checks before stable publication. |
+| P1 | Real multi-monitor and mixed-DPI placement and Explorer recovery remain open. Confirm public Git metadata and the positive public update path before widening distribution. |
+| P2 | Pinned windows can be ambiguous without Explorer desktop information. Handle reuse has no reproduced failure. |
 
-## Reproduce the checks
+### Reproducible local package hashes
 
-Run the locked Cargo commands from the README, then use an interactive, standard-user PowerShell 7 session with Tilework closed:
+| File | SHA-256 |
+|---|---|
+| Portable executable | 746114f31c931b5de79dc53a2266ee4fe88ca4e1aac2e5824317a6aa144d49a2 |
+| Installer | 54f10cb447e695037dd676334d845599eb6abad0e6b59afa63583c6f6be6df16 |
 
-```powershell
-.\scripts\native-smoke.ps1 -Executable .\target\release\tilework.exe
-```
+These hashes refer to the two-build local experiment. Use each GitHub artifact's own SHA256SUMS.txt for distribution.
 
-The script opens three fixture windows and filters management to their unique titles. It checks physical DWM bounds and uses temporary app data that disables ownership of Windows Snap.
+## Reproduce checks
 
-Use verified Inno Setup 6.7.4 in a separate QA environment:
+Use a standard-user Windows session with Tilework closed. Keep the installer log, test OS version, profile type and package SHA-256 with the result.
 
-```powershell
-ISCC.exe /DMyAppVersion=0.3.0 .\packaging\Tilework.iss
-```
 
-Installer output is `packaging/output/Tilework-Setup-0.3.0-x64.exe`. Keep install logs with `/LOG` and note OS version, profile type and artifact hashes.
+~~~powershell
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked --release
+.\scripts\native-smoke.ps1 -Executable .\target\release\tilework.exe -TestDrag -TestSnapRecovery
+~~~
 
-1. On clean Windows 11 and Windows 10 22H2, install from a standard account. Check that Windows shows an Apps entry, that the Start menu starts version 0.3.0, and that autostart is initially off. On a test profile that has the previous build, follow the README migration and verify the legacy task is absent before proceeding.
-2. Enable autostart from the installed app. Sign out and in, then check for one standard-user instance. Disable it, sign out and in again, and check that no Tilework instance starts. Repeat the upgrade and uninstall checks with autostart enabled.
-3. From two verified installer builds of different candidate versions, try an upgrade with Tilework open, then close it and retry. Check the installed version, that settings survive and that relaunch works. Repeat after cancelling setup, after testing a truncated installer copy, and after interrupting an install in the disposable guest. Record whether the prior version still runs and whether rerunning verified Setup repairs it. Downgrade with the previously verified installer and check version, settings and startup again.
-4. Uninstall via Settings and check that the executable, both Start menu entries, any selected desktop shortcut, Apps entry and Run value are gone. Check that settings remain until explicitly removed. Sign out and in and check that Tilework stays closed.
-5. In an interactive desktop, test title-bar drag (centre, edge, outer edge and cancellation), resize with a minimized sibling, full screen, Win+D, moving across two different DPI settings, monitor disconnect/reconnect, pinned/empty virtual desktops and Explorer restart. Compare preview to actual bounds. In the disposable session, force-stop Tilework while it owns Snap, then verify recovery on next launch and clean exit. Observe CPU, handles and GDI objects across a repetitive window-open/close session.
+The native script limits management to its three fixture windows. The Snap recovery option temporarily changes the current user's Windows Snap setting and restores it on cleanup. Keep the pointer free during the drag test.
 
-## Prepare a draft after the gates pass
+From a private GitHub branch, manually dispatch **Windows CI** with **installer_qa** enabled and **release_tag** empty. The job runs a real 0.3.0 setup and a version-bumped 0.3.1 test fixture in a new standard-user profile. The VM is discarded after the run. GitHub stores the generated installer, portable build, checksums and source commit with the successful run.
 
-1. Review the source and private metadata before changing repository visibility. Enable private vulnerability reporting before relying on the reporting form.
-2. Merge the verified candidate, create and push the matching tag only after approval, and dispatch **Windows CI** on that tag with the same `release_tag`. Inspect `Tilework-Setup-x64.exe`, `Tilework-Portable-x64.exe` and `SHA256SUMS.txt` on the draft prerelease. Exercise the full lifecycle with those exact files. Run the positive update-discovery path against a released stable test fixture or verify it when a newer public stable version exists.
-3. Configure GitHub Pages to deploy from the default branch and `/docs` after visibility and publication approval. Open `/Tilework/demo/` without authentication and verify that the README link, controls and screenshots work.
-4. Decide publisher signing and whether manual update installation is acceptable for the first release. An unsigned download may trigger Windows reputation checks. Stable publication needs a separate maintainer decision.
+Use a disposable interactive Windows desktop to finish the remaining gates:
+
+1. On Windows 11 and Windows 10 22H2, install as a standard user. Start Tilework from Start and check that Windows shows the correct version in Installed apps. For an older installation, verify the exact task identity, action and account as described in the README, then complete the migration and confirm only that task was removed.
+2. Enable autostart in the tray. Sign out and back in, then reboot. Check for one standard-user Tilework process on each login. Disable autostart and repeat sign-in. After uninstall, verify that the app stays closed after another sign-in.
+3. Try an upgrade while Tilework is running. Exit Tilework and retry. In a snapshot of the VM, cancel after installation starts writing and verify whether the previous version still starts. Rerun a checksum-verified setup to confirm recovery. Reinstall the previous verified version and check settings and launch. Uninstall through Windows Settings and check the optional desktop shortcut as well.
+4. Repeat drag and resize across two monitors with different scales. Compare preview and window bounds, including neighbours. Disconnect and reconnect a monitor. Test fullscreen, Win+D, switching to an empty desktop, and restarting Explorer. Confirm windows, focus and Snap after Tilework exits and restarts.
+
+## Prepare the release after approval
+
+1. Resolve the private commit metadata before exposing Git history. Verify private vulnerability reporting before relying on the reporting form.
+2. On the approved release commit, create the matching tag and dispatch **Windows CI** against that tag with the same **release_tag** and with **installer_qa** enabled. Download the draft attachments and check each hash and BUILDINFO.txt. Keep the tested package as the release artifact.
+3. Publish the demo from the default branch's /docs folder only after approval. Open the README link without authentication and exercise the demo on desktop and touch.
+4. When a newer stable release exists, check the positive live update result on 0.3.0 and open the release link in the browser. Document the unsigned package and Windows publisher warning for testers. Decision to publish a stable release stays with the maintainer.
