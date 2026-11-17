@@ -18,14 +18,32 @@ The demo is a single-monitor simulation. Add five windows to see the layout prog
 
 ## Install on Windows
 
-1. Download `Tilework-Setup-x64.exe` and `SHA256SUMS.txt` for the same version from [Releases](https://github.com/Jas0nOW/Tilework/releases). The candidate targets x64 Windows 10 22H2 and Windows 11.
-2. In PowerShell, run `Get-FileHash -Algorithm SHA256 .\Tilework-Setup-x64.exe` and compare the hash with the published value. The candidate is unsigned, so Windows may show an unknown publisher. A matching hash verifies the downloaded bytes against the published checksum.
-3. Run Setup as your usual user and launch **Tilework** from the Start menu. Setup defaults to `%LOCALAPPDATA%\Programs\Tilework`.
-4. To launch at sign-in, enable **Start with Windows** from the tray menu. Autostart is off by default and Windows may delay or disable it in Startup Apps.
+**Just three steps, no technical knowledge needed:**
 
-For a portable run, download `Tilework-Portable-x64.exe` and launch it directly. Both variants store settings and diagnostics in `%LOCALAPPDATA%\Tilework`.
+1. Open the **[latest release](https://github.com/Jas0nOW/Tilework/releases/latest)** and click **`Tilework-Setup-x64.exe`** to download it.
+2. Open the downloaded file. If Windows says *"Windows protected your PC"*, click **More info** and then **Run anyway**. This warning appears because the app is new and not yet signed with a paid certificate.
+3. Click **Next** until it finishes, then start **Tilework** from the Start menu. A small icon appears next to the clock, and your windows arrange themselves.
 
-### Migrate from the earlier development build
+That's it. Works on Windows 10 (22H2) and Windows 11, 64-bit. No administrator rights needed.
+
+**Handy to know**
+- **Start together with Windows:** right-click the Tilework icon next to the clock and tick **Start with Windows**.
+- **Pause:** press `Win + Y` or click the icon.
+- **Uninstall:** open **Settings → Apps**, pick **Tilework** and click **Uninstall**.
+- **No installation wanted?** Download `Tilework-Portable-x64.exe` instead and just open it.
+
+<details>
+<summary><b>Advanced: verify the download, update, roll back, migrate from the old version</b></summary>
+
+#### Verify the download (optional)
+
+Download `SHA256SUMS.txt` from the same release. In PowerShell run `Get-FileHash -Algorithm SHA256 .\Tilework-Setup-x64.exe` and compare the result with the matching line in that file. Identical values mean the file arrived unchanged.
+
+#### Where data lives
+
+Both variants store settings and logs in `%LOCALAPPDATA%\Tilework`. Setup installs to `%LOCALAPPDATA%\Programs\Tilework`. Autostart is off by default.
+
+#### Migrate from the earlier development build
 
 1. Exit the old Tilework from the tray.
 2. In **Task Scheduler**, check the root **Task Scheduler Library** for a task named exactly `Tilework`. The old task had **Run with highest privileges** enabled, one **At log on** trigger, and one **Start a program** action pointing to the old Tilework executable. Match the full action path to the copy you previously started, and check that the task runs under the account that enabled it. Then disable and delete that task. Use administrator approval if Windows requires it. Check the task even if the executable has already been removed or was run from a portable location. Leave unrelated or uncertain tasks in place and have their owner review them.
@@ -34,17 +52,19 @@ For a portable run, download `Tilework-Portable-x64.exe` and launch it directly.
 
 Setup stops when it finds legacy executable files or a visible scheduled task matching the old name and structure. Setup leaves tasks untouched. If the previous task was registered from an elevated account, check Task Scheduler from that account before installing.
 
-### Update or roll back
+#### Update or roll back
 
 Use **Check for updates…** in the tray or `--check-update` from a terminal. The check reports newer public stable releases with the expected installer. Beta testers can check the Releases page for prereleases.
 
 Exit Tilework, verify the checksum for the desired version, then run its installer. Keep a previous verified installer and a backup of `config.ini` if you need to roll back. Exit Tilework and reinstall that version. The app delegates downloads and installation to the user and the standalone installer.
 
-### Uninstall
+#### Uninstall
 
 1. Select **Exit** from the Tilework tray menu.
 2. In **Settings → Apps**, select **Tilework → Uninstall**. The uninstaller removes the program, shortcuts, and Tilework's sign-in entry.
 3. To remove retained user data, first restore Windows Snap if a previous crash left it disabled. Then remove `%LOCALAPPDATA%\Tilework` if you no longer need its settings or logs. If you used the former **CosmicTile** build, you can also remove its old settings folder. Portable users can remove the downloaded executable after exiting.
+
+</details>
 
 ## Use Tilework
 
