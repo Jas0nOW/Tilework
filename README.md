@@ -28,9 +28,11 @@ For a portable run, download `Tilework-Portable-x64.exe` and launch it directly.
 ### Migrate from the earlier development build
 
 1. Exit the old Tilework from the tray.
-2. In **Task Scheduler**, check the **Task Scheduler Library** for the old `Tilework` task. Verify its action is the old Tilework executable, then delete that task. Use administrator approval if Windows requires it. The old task could run a user-writable executable with elevated permissions. Check the task even if you have already deleted the executable or originally enabled it from a portable location.
+2. In **Task Scheduler**, check the root **Task Scheduler Library** for a task named exactly `Tilework`. The old task had **Run with highest privileges** enabled, one **At log on** trigger, and one **Start a program** action pointing to the old Tilework executable. Match the full action path to the copy you previously started, and check that the task runs under the account that enabled it. Then disable and delete that task. Use administrator approval if Windows requires it. Check the task even if the executable has already been removed or was run from a portable location. Leave unrelated or uncertain tasks in place and have their owner review them.
 3. Remove the old Start menu shortcut if it remains. Remove `tilework.exe` and `tilework.exe.old` from `%LOCALAPPDATA%\Tilework` if present. Keep `config.ini` to carry your settings forward.
 4. Run the new installer and re-enable **Start with Windows** if desired.
+
+Setup stops when it finds legacy executable files or a visible scheduled task matching the old name and structure. Setup leaves tasks untouched. If the previous task was registered from an elevated account, check Task Scheduler from that account before installing.
 
 ### Update or roll back
 

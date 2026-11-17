@@ -9,6 +9,10 @@ on:
         description: Tag to prepare as a draft prerelease (optional)
         required: false
         type: string
+      installer_qa:
+        description: Run installer lifecycle in a fresh standard-user profile
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -63,10 +67,16 @@ jobs:
           New-Item -ItemType Directory -Path 'release-files'
           Copy-Item -LiteralPath $built -Destination 'release-files/Tilework-Setup-x64.exe'
           Copy-Item -LiteralPath 'target/release/tilework.exe' -Destination 'release-files/Tilework-Portable-x64.exe'
+          "Tilework v$version from commit $env:GITHUB_SHA" | Set-Content -Encoding ascii 'release-files/BUILDINFO.txt'
           Get-ChildItem -LiteralPath 'release-files' -Filter '*.exe' | Sort-Object Name | ForEach-Object {
             $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
             "$hash  $($_.Name)"
           } | Set-Content -Encoding ascii 'release-files/SHA256SUMS.txt'
+      - name: Test installer lifecycle in the Windows runner VM
+        if: inputs.installer_qa
+        shell: pwsh
+        run: |
+          ./scripts/installer-qa-ci.ps1 -Compiler (Join-Path $env:RUNNER_TEMP 'tilework-inno/ISCC.exe')
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: Tilework-Windows-x64
@@ -92,4 +102,4 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
         shell: pwsh
         run: |
-          gh release create $env:RELEASE_TAG release-files/Tilework-Setup-x64.exe release-files/Tilework-Portable-x64.exe release-files/SHA256SUMS.txt --draft --prerelease --title "Tilework $env:RELEASE_TAG" --generate-notes --verify-tag
+          gh release create $env:RELEASE_TAG release-files/Tilework-Setup-x64.exe release-files/Tilework-Portable-x64.exe release-files/SHA256SUMS.txt release-files/BUILDINFO.txt --draft --prerelease --title "Tilework $env:RELEASE_TAG" --generate-notes --verify-tag

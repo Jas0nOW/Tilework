@@ -3,6 +3,9 @@
   #error Pass /DMyAppVersion=MAJOR.MINOR.PATCH from Cargo.toml
 #endif
 #define MyAppPublisher "Tilework contributors"
+#ifndef MyAppExe
+  #define MyAppExe "..\target\release\tilework.exe"
+#endif
 
 [Setup]
 AppId={{AC539AC6-9BC0-4D2B-9B89-3D739FF1342C}
@@ -39,7 +42,7 @@ VersionInfoDescription=Tilework per-user installer
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
 
 [Files]
-Source: "..\target\release\tilework.exe"; DestDir: "{app}"; DestName: "tilework.exe"; Flags: ignoreversion
+Source: "{#MyAppExe}"; DestDir: "{app}"; DestName: "tilework.exe"; Flags: ignoreversion notimestamp
 
 [Icons]
 Name: "{autoprograms}\Tilework"; Filename: "{app}\tilework.exe"
@@ -54,18 +57,60 @@ Root: HKCU; Subkey: "Software\Tilework"; ValueType: string; ValueName: "InstallP
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "Tilework"; Flags: uninsdeletevalue
 
 [Code]
-function InitializeSetup(): Boolean;
+function LegacyTaskNeedsReview(): Boolean;
+var
+  Service, Root, Tasks, Task, Definition, Actions, Triggers, Action, Trigger: Variant;
+  I: Integer;
 begin
+  Result := False;
+  Service := CreateOleObject('Schedule.Service');
+  Service.Connect;
+  Root := Service.GetFolder('\');
+  Tasks := Root.GetTasks(1); { Include hidden tasks the current user can read. }
+  for I := 1 to Tasks.Count do begin
+    Task := Tasks.Item(I);
+    if CompareText(Task.Name, 'Tilework') = 0 then begin
+      Definition := Task.Definition;
+      Actions := Definition.Actions;
+      Triggers := Definition.Triggers;
+      if (Definition.Principal.RunLevel = 1) and (Actions.Count = 1) and
+         (Triggers.Count = 1) then begin
+        Action := Actions.Item(1);
+        Trigger := Triggers.Item(1);
+        { TASK_ACTION_EXEC = 0, TASK_TRIGGER_LOGON = 9. }
+        Result := (IDispatchInvoke(Action, False, 'Type', []) = 0) and
+                  (IDispatchInvoke(Trigger, False, 'Type', []) = 9);
+      end;
+      Exit;
+    end;
+  end;
+end;
+
+function InitializeSetup(): Boolean;
+var
+  LegacyFiles, LegacyTask: Boolean;
+begin
+  Result := False;
   if IsAdmin then begin
     SuppressibleMsgBox('Run Tilework Setup with standard user permissions.', mbError, MB_OK, IDOK);
-    Result := False;
     Exit;
   end;
-  Result := not (FileExists(ExpandConstant('{localappdata}\Tilework\tilework.exe')) or
-                 FileExists(ExpandConstant('{localappdata}\Tilework\tilework.exe.old')));
-  if not Result then
-    SuppressibleMsgBox('An older Tilework installation was found. Disable and remove the legacy Tilework scheduled task and remove the old program files before continuing. See the migration steps in the Tilework README.',
+  LegacyFiles := FileExists(ExpandConstant('{localappdata}\Tilework\tilework.exe')) or
+                 FileExists(ExpandConstant('{localappdata}\Tilework\tilework.exe.old'));
+  try
+    LegacyTask := LegacyTaskNeedsReview();
+  except
+    Log('Could not inspect Task Scheduler: ' + GetExceptionMessage);
+    SuppressibleMsgBox('Setup could not inspect Task Scheduler. Confirm that the Windows Task Scheduler service is available and try again.',
       mbError, MB_OK, IDOK);
+    Exit;
+  end;
+  if LegacyFiles or LegacyTask then begin
+    SuppressibleMsgBox('Old Tilework files or a scheduled task that needs manual review were found. Follow the Tilework README migration steps before continuing. Setup leaves existing tasks untouched.',
+      mbError, MB_OK, IDOK);
+    Exit;
+  end;
+  Result := True;
 end;
 
 function InitializeUninstall(): Boolean;
