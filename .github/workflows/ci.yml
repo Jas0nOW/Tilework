@@ -60,7 +60,9 @@ jobs:
           & (Join-Path $compiler 'ISCC.exe') "/DMyAppVersion=$version" 'packaging/Tilework.iss'
           if ($LASTEXITCODE -ne 0) { throw "Installer compilation failed ($LASTEXITCODE)." }
           $built = "packaging/output/Tilework-Setup-$version-x64.exe"
-          if ((Get-Item -LiteralPath $built).VersionInfo.ProductVersion -cne $version) {
+          $product = (Get-Item -LiteralPath $built).VersionInfo
+          $numericVersion = $product.ProductMajorPart, $product.ProductMinorPart, $product.ProductBuildPart, $product.ProductPrivatePart -join '.'
+          if ($product.ProductVersion.Trim() -cne $version -or $numericVersion -cne "$version.0") {
             throw 'Installer product version does not match the Cargo version.'
           }
 

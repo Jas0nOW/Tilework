@@ -4,5 +4,9 @@ fn main() {
         let manifest = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("app.manifest");
         println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
         println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest.display());
+        if std::env::var("PROFILE").as_deref() == Ok("release") {
+            println!("cargo:rustc-link-arg=/DEBUG:NONE");
+            println!("cargo:rustc-link-arg=/Brepro");
+        }
     }
 }

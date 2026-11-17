@@ -1,4 +1,4 @@
-param([Parameter(Mandatory)][string]$Executable)
+param([Parameter(Mandatory)][string]$Executable, [switch]$TestSnapRecovery)
 # Use an interactive standard-user session with Tilework closed.
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
@@ -24,6 +24,8 @@ public static class TileworkAuditNative {
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr hwnd, uint message, IntPtr wp, IntPtr lp);
     [DllImport("user32.dll")] public static extern bool SystemParametersInfoW(uint action, uint value, out int output, uint flags);
+    [DllImport("user32.dll", EntryPoint="SystemParametersInfoW")]
+    public static extern bool SetSystemParameter(uint action, uint value, IntPtr input, uint flags);
     [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out Rect rect, int size);
     public static Rect Bounds(IntPtr hwnd) {
         if (DwmGetWindowAttribute(hwnd, 9, out Rect rect, Marshal.SizeOf<Rect>()) != 0)
@@ -88,8 +90,14 @@ function New-AuditForm([string]$Name) {
 if ((Get-Process -Id $PID).SessionId -eq 0) { throw 'No interactive Windows session' }
 if ([TileworkAuditNative]::FindWindowW('TileworkMain', 'Tilework') -ne [IntPtr]::Zero) { throw 'Tilework is already running' }
 $token = 'TileworkAudit-' + [guid]::NewGuid().ToString('N').Substring(0, 10)
-$blockedLocalAppData = [IO.Path]::GetTempFileName()
 $beforeSnap = [TileworkAuditNative]::SnapEnabled()
+if ($TestSnapRecovery -and !$beforeSnap) { throw 'Start the recovery smoke with Windows Snap enabled.' }
+$testAppData = if ($TestSnapRecovery) {
+    (New-Item -ItemType Directory -Path (Join-Path ([IO.Path]::GetTempPath()) $token)).FullName
+} else {
+    [IO.Path]::GetTempFileName()
+}
+$marker = Join-Path $testAppData 'Tilework/snap-off.flag'
 $oldDpi = [TileworkAuditNative]::SetThreadDpiAwarenessContext([IntPtr]::new(-4))
 $tilework = $null
 $forms = @()
@@ -100,7 +108,7 @@ try {
     $start = [Diagnostics.ProcessStartInfo]::new((Resolve-Path -LiteralPath $Executable).Path)
     $start.UseShellExecute = $false
     $start.CreateNoWindow = $true
-    $start.Environment['LOCALAPPDATA'] = $blockedLocalAppData
+    $start.Environment['LOCALAPPDATA'] = $testAppData
     $start.ArgumentList.Add('--filter')
     $start.ArgumentList.Add($token)
     $tilework = [Diagnostics.Process]::Start($start)
@@ -136,6 +144,30 @@ try {
         }
         Write-Output 'PASS native visible focus overlay bounds against active tiled window.'
     } else { Write-Output 'NOT TESTED native focus overlay. Windows did not grant foreground activation.' }
+    if ($TestSnapRecovery) {
+        if (!(Wait-AuditCondition { (Test-Path -LiteralPath $marker) -and ![TileworkAuditNative]::SnapEnabled() })) {
+            throw 'Tilework did not take ownership of Windows Snap in the temporary profile.'
+        }
+        $tilework.Kill()
+        if (!$tilework.WaitForExit(5000)) { throw 'Tilework did not terminate.' }
+        if ([TileworkAuditNative]::SnapEnabled() -or (Get-Content -Raw -LiteralPath $marker) -ne '1') {
+            throw 'Forced termination did not leave the expected recovery marker and disabled Snap.'
+        }
+        if ($frame -ne [IntPtr]::Zero -and [TileworkAuditNative]::IsWindowVisible($frame)) {
+            throw 'The focus overlay remained visible after the process terminated.'
+        }
+        $tilework = [Diagnostics.Process]::Start($start)
+        if (!(Wait-AuditCondition {
+            $window = [TileworkAuditNative]::FindWindowW('TileworkMain', 'Tilework')
+            $owner = 0u
+            [void][TileworkAuditNative]::GetWindowThreadProcessId($window, [ref]$owner)
+            $owner -eq $tilework.Id
+        })) { throw 'The replacement Tilework process did not start.' }
+        if (!(Wait-AuditCondition { (Test-Path -LiteralPath $marker) -and ![TileworkAuditNative]::SnapEnabled() })) {
+            throw 'The replacement Tilework process did not acquire its own recovery marker.'
+        }
+        Write-Output 'PASS forced termination retained the original Snap value and restart reached the manager.'
+    }
 } finally {
     if ($tilework -and !$tilework.HasExited) {
         $main = [TileworkAuditNative]::FindWindowW('TileworkMain', 'Tilework')
@@ -153,9 +185,22 @@ try {
     }
     foreach ($form in $forms) { $form.Dispose() }
     if ($oldDpi -ne [IntPtr]::Zero) { [void][TileworkAuditNative]::SetThreadDpiAwarenessContext($oldDpi) }
-    Remove-Item -LiteralPath $blockedLocalAppData
     $afterSnap = [TileworkAuditNative]::SnapEnabled()
-    if ($afterSnap -ne $beforeSnap) { throw 'Unexpected Windows Snap state change' }
+    $markerLeft = $TestSnapRecovery -and (Test-Path -LiteralPath $marker)
+    if ($afterSnap -ne $beforeSnap -and $TestSnapRecovery) {
+        [void][TileworkAuditNative]::SetSystemParameter(0x0083, 0, [IntPtr]::new([int]$beforeSnap), 0)
+    }
+    if ($TestSnapRecovery) {
+        $resolvedAppData = (Resolve-Path -LiteralPath $testAppData).Path
+        if ($resolvedAppData -ne (Join-Path ([IO.Path]::GetTempPath()) $token)) {
+            throw 'Unexpected fixture app-data cleanup path.'
+        }
+        Remove-Item -LiteralPath $resolvedAppData -Recurse
+    } else {
+        Remove-Item -LiteralPath $testAppData
+    }
+    if ($afterSnap -ne $beforeSnap) { throw 'Tilework left Windows Snap in the wrong state after exit.' }
+    if ($markerLeft) { throw 'Tilework left the recovery marker after graceful exit.' }
     Write-Output "PASS Snap state unchanged ($beforeSnap)."
     if ($shutdownFailure) { throw $shutdownFailure }
 }
