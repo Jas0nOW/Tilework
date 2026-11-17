@@ -85,3 +85,7 @@ cargo build --locked --release
 ```
 
 See the [release runbook](docs/RELEASE.md) for packaging and live tests, [CONTRIBUTING.md](CONTRIBUTING.md) for contributions, and [SECURITY.md](SECURITY.md) for private vulnerability reporting. Tilework uses the [MIT license](LICENSE).
+
+## Known limitations
+
+- Tilework runs as a standard user on purpose. Windows blocks it from moving windows of elevated (administrator) programs, for example an "Run as administrator" PowerShell. Tilework leaves those windows alone and keeps them out of the layout.

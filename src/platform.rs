@@ -7,11 +7,12 @@ use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicU8, Ordering};
 use windows::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT};
 use windows::core::{BOOL, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
-use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+use windows::Win32::System::Threading::{OpenProcessToken, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -57,6 +58,7 @@ pub struct Platform {
     desktop_cache: Cell<Option<(Instant, u128)>>,
     vdm: Option<IVirtualDesktopManager>,
     com_initialized: bool,
+    elevated_pids: std::cell::RefCell<std::collections::HashMap<u32, bool>>,
 }
 
 pub fn hwnd_of(h: isize) -> HWND {
@@ -72,7 +74,7 @@ impl Platform {
         unsafe {
             let com_initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
             let vdm = CoCreateInstance::<_, IVirtualDesktopManager>(&VirtualDesktopManager, None, CLSCTX_ALL).ok();
-            Self { vdm, com_initialized, desktop_cache: Cell::new(None) }
+            Self { vdm, com_initialized, desktop_cache: Cell::new(None), elevated_pids: Default::default() }
         }
     }
 
@@ -120,10 +122,48 @@ impl Platform {
     }
 
     /// True for normal application windows that should be tiled.
+    /// True when the window belongs to a process we may not move. Tilework always runs as a standard
+    /// user, so windows of elevated processes reject `SetWindowPos` (UIPI) and would otherwise be
+    /// retried forever and leave a hole in the layout.
+    fn is_elevated_window(&self, h: isize) -> bool {
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd_of(h), Some(&mut pid)); }
+        if pid == 0 { return false; }
+        if let Some(known) = self.elevated_pids.borrow().get(&pid) { return *known; }
+        let elevated = unsafe {
+            match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                Err(_) => false,
+                Ok(process) => {
+                    let mut token = HANDLE::default();
+                    let result = if OpenProcessToken(process, TOKEN_QUERY, &mut token).is_err() {
+                        true // a token we cannot even query belongs to a higher integrity level
+                    } else {
+                        let mut info = TOKEN_ELEVATION::default();
+                        let mut len = 0u32;
+                        let ok = GetTokenInformation(token, TokenElevation, Some(&mut info as *mut TOKEN_ELEVATION as *mut c_void),
+                            std::mem::size_of::<TOKEN_ELEVATION>() as u32, &mut len).is_ok();
+                        let _ = CloseHandle(token);
+                        ok && info.TokenIsElevated != 0
+                    };
+                    let _ = CloseHandle(process);
+                    result
+                }
+            }
+        };
+        let mut cache = self.elevated_pids.borrow_mut();
+        if cache.len() > 512 { cache.clear(); }
+        cache.insert(pid, elevated);
+        if elevated { crate::app::log(&format!("ignoring elevated window {h:x} (pid {pid}): a standard-user Tilework cannot move it")); }
+        elevated
+    }
+
     pub fn is_manageable(&self, h: isize, current_desktop: u128) -> bool {
         unsafe {
             let hw = hwnd_of(h);
             if !IsWindow(Some(hw)).as_bool() || !IsWindowVisible(hw).as_bool() && self.cloaked(h) != 2 {
+                return false;
+            }
+            if self.is_elevated_window(h) {
                 return false;
             }
             if IsIconic(hw).as_bool() {
@@ -317,7 +357,7 @@ impl Platform {
                 target.w + il + ir,
                 target.h + it + ib,
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS,
-            ).is_ok()
+            ).map_err(|e| crate::app::log(&format!("SetWindowPos {h:x} failed: {e}"))).is_ok()
         }
     }
 }
