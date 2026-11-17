@@ -8,7 +8,7 @@ Tilework automatically arranges Windows apps into tiles. Drag by the title bar t
 
 ## Try the interactive V3 demo
 
-Open [the browser demo on GitHub Pages](https://jas0now.github.io/Tilework/demo/) once Pages is enabled. Until then, open [the standalone HTML file](docs/demo/index.html) in your browser from a local checkout.
+Open [the browser demo on GitHub Pages](https://jas0now.github.io/Tilework/demo/) (a simulation, not the real app).
 
 The demo is a single-monitor simulation. Add five windows to see the layout progression, then drag one to a different tile or a screen edge.
 
