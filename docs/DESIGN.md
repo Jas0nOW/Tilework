@@ -112,11 +112,12 @@ out.
 - Tiling is switched **per virtual desktop** (tray icon click, `Win + Y`, tray menu). Desktops
   with tiling on and off can coexist. Paused trees preserve their manual weights for the process
   lifetime; enabling reconciles windows that have since closed or moved.
-- Desktop identity uses the foreground window's confirmed ID where possible, then a majority of
-  visible confirmed window IDs. This tolerates an isolated pinned window. Results are cached briefly
-  and invalidated on foreground or desktop-switch events. For an empty desktop, the shell's current
-  desktop registry value is a best-effort fallback. This shell data is undocumented and may change;
-  if identity is unavailable, placement and hover focus pause and owned Snap changes are restored.
+- Desktop identity uses the most common confirmed visible-window ID when at least two windows
+  support it. Foreground evidence breaks ties between equally supported IDs. With sparse evidence,
+  the shell's current desktop registry value takes precedence; a confirmed sole foreground window
+  can serve as a last fallback. Results are cached briefly and invalidated on foreground or
+  desktop-switch events. The shell value is undocumented and may change. When identity is unknown,
+  placement and hover focus pause and Tilework restores any Snap change it owns.
 - A desktop switch or disabling tiling cancels any active drag. Display/work-area notifications
   rebuild surface monitor keys from live windows and trigger a full reconcile.
 - Windows that Windows itself hides (cloaked, ghost UWP frames on the shown desktop) are ignored.
@@ -153,21 +154,20 @@ retried until the cursor moves to another window.
 
 ## 10a. Focus border accent overlay
 
-Windows 10/11 apps (especially borderless, Electron, Terminal, and modern custom-rendered windows) frequently ignore DWM window border attributes. To guarantee a clear, unmistakable focus indicator, Tilework creates a dedicated topmost layered click-through overlay window (`TileworkFocusBorder`). It paints a clean 3 px accent frame (`ACCENT = 0x00FF823C`) around the active tiled window without stealing focus, intercepting clicks, or causing flicker.
+Windows 10/11 apps (especially borderless, Electron, Terminal, and modern custom-rendered windows) frequently ignore DWM window border attributes. Tilework uses a layered, click-through overlay window (`TileworkFocusBorder`) to draw a 3 px accent around the focused tiled window. Eligibility follows the current foreground window and current desktop. Minimized, maximized, fullscreen and untracked windows clear the overlay.
 
 ## 11. Architecture
 
 ```
-main.rs      early DPI, single instance, CLI actions (--install, --uninstall, --autostart-on/off/status,
-             --check-update, --update, --dump, --filter, --snap-status, --restore-snap)
-setup.rs     installer (%LOCALAPPDATA%\Tilework), Start Menu shortcut, scheduled task autostart
-             (highest privileges without UAC prompt at logon), and robust GitHub self-updater
+main.rs      DPI awareness, standard-user guard, single instance, CLI and diagnostics
+setup.rs     per-user sign-in entry and stable-release checks against the fixed GitHub repository
+packaging/   per-user Inno Setup installer, Start Menu shortcut and uninstall registration
 config.rs    key=value settings file (%LOCALAPPDATA%\<name>\config.ini), tolerant parser
 tree.rs      pure logic, no Windows calls: zone tree, placement policy (V3 progression), drop zones,
              nested splitting, bounded depth, minimum-aware layout, previews
 platform.rs  thin Windows layer: window/monitor/virtual-desktop queries, placement, Snap control
 app.rs       event loop: WinEvent hooks -> debounced reconcile -> apply; drag preview overlay;
-             focus border accent overlay; tray menu (autostart, updates, install/uninstall);
+             focus border accent overlay; tray menu (autostart, updates, settings);
              hotkey; focus follows mouse
 ```
 
@@ -180,13 +180,10 @@ Key design decisions:
   dependencies; the previews are computed with exactly the same code as real moves.
 - **Fail safe.** The program only ever moves and resizes windows; it never closes, hides or
   changes them. Settings it changes (Snap, window border colour) are session-only or restored.
-- **Robust self-updater.** Downloads latest release from GitHub, validates PE executable headers
-  before touching files, uses Windows atomic rename semantics with rollback protection, and
-  cleans up old binaries on startup.
-- **No dependencies** except the official `windows` crate.
+- **Manual update installation.** Release discovery uses HTTPS and validates the version and expected installer metadata. The application can open the official release page. The standalone installer handles installation and replacement after Tilework exits.
+- **Dependencies.** The official `windows` bindings provide Windows APIs, and `serde_json` parses release metadata.
 
-The tray icon is re-added after Explorer restarts. A named process mutex prevents a second manager.
-The Windows manifest requests the caller's existing privileges; it does not request elevation.
+The tray icon is re-added after Explorer restarts. A named process mutex prevents a second manager in the same session. Tilework runs as the invoking standard user.
 
 Diagnostics: a log at `%LOCALAPPDATA%\<name>\tilework.log` records adds, removals, drops,
 learned minimum sizes and desktop switches. The log is capped at 1 MB with one rotated backup.
@@ -196,7 +193,7 @@ without touching any window; `--filter TEXT` limits management to matching windo
 
 ## 12. Settings
 
-Settings are created only when missing. Tray changes reread the file and atomically update only the selected keys, preserving other manual edits. When elevated, the settings command shows the path instead of launching its file handler. Read errors use defaults without replacing the unreadable file. If `LOCALAPPDATA` is unavailable, config writes and logging are disabled.
+Settings are created only when missing. Tray changes reread the file and atomically update only the selected keys, preserving other manual edits. Read errors use defaults without replacing the unreadable file. If `LOCALAPPDATA` is unavailable, config writes and logging are disabled.
 
 Tray menu and `config.ini`:
 
@@ -207,73 +204,14 @@ Tray menu and `config.ini`:
 | `focus_delay_ms` | `300` | how long the cursor must rest (50–5000) |
 | `min_zone_width` / `min_zone_height` | `260` / `160` | smallest zone |
 
-## 13. Roadmap
+## 13. Browser simulation and release verification
 
-Completed in 0.2.0:
+The [V3 browser demo](demo/index.html) exercises the layout and drop rules on one simulated monitor. The browser controls represent window transitions using local state. Native window sizing, handles, focus, accessibility permissions, mixed-DPI monitors, Explorer and the installer are covered by separate Windows checks.
 
-- V3 layout engine: 2 full columns -> 2x2 vertical splits -> 5th window 3rd column; manual precedence.
-- Nested window splitting, outer edge full-length zones, center window swap, bounded depth (≤ 5).
-- Dedicated 3 px focus border accent frame overlay for active tiled windows.
-- One-click installer (`--install`, Start Menu shortcut, uninstaller `--uninstall`).
-- Silent admin autostart via Windows Task Scheduler (`schtasks` with highest privileges, no UAC prompt on logon).
-- Robust self-updater with PE validation, atomic rollback, CLI (`--check-update`, `--update`) and tray integration.
+The [release matrix](RELEASE.md) lists the current verification evidence. The `Win` test interface drives the same reconcile, drag and placement logic with simulated delayed moves, DPI changes, foreground changes, minimize and restore. Native behavior can differ where Windows or the target app declines a requested placement or focus change.
 
-Later:
+Per-monitor layouts use Windows monitor handles and monitor work areas. After a successful cross-monitor drop Tilework briefly allows queued positioning to complete before reconciling against the observed monitor. Learned physical window minima are invalidated when DPI changes. Resizing a divider uses the displayed layout and preserves the stored share of minimized siblings.
 
-- keyboard shortcuts (focus/move/resize/toggle) for those who want them (planned for 0.3)
-- a settings window instead of the tray submenu and the text file
-- more live multi-monitor coverage (hot-plug and DPI changes)
-- optional stacking/tabbed zones
+Virtual desktop detection uses visible window evidence and Explorer's registry fallback. With one visible app and no usable shell information, a confirmed foreground desktop can supply the result. A sole pinned window is ambiguous on systems without shell information. An empty desktop with no usable shell identity pauses until Tilework can identify it.
 
-## 14. Open source plan
-
-- Licence: MIT (`LICENSE`).
-- Public repository with README, this design document, a contribution guide and an issue template
-  that asks for the log file and `--dump` output.
-- The tree logic is intentionally independent of Windows so it can be tested and reused.
-- Security: the program runs elevated to manage elevated windows. It reads no network data,
-  executes nothing from configuration files and only writes its log and settings under
-  `%LOCALAPPDATA%`.
-
-
-## 15. Hardening and live verification
-
-The manager uses the caller's privileges and does not request elevation. Data paths containing a
-reparse point are rejected for managed writes. Desktop and filesystem behavior still depend on
-Windows APIs and require live verification, especially on elevated and mixed-DPI desktops.
-
-**Live checks:** ordinary, maximized and full-screen reservation across minimize/restore and Win+D;
-apps with real minimum sizes, saved geometry, self-resizing and DPI changes; manual layouts and
-divider weights; pinned windows and empty virtual desktops; drag/drop across monitors; focus behavior
-and foreground restrictions; Explorer restart, work-area changes, and Snap restoration after changes
-on a paused desktop. Use isolated test windows with `--filter`.
-
-
-### Audit outcome and remaining boundary
-
-F1–F6 and F8–F14 are implemented with offline regression coverage where feasible. The `Win`
-interface drives the real apply/reconcile/drag logic against simulated refusal, drift, DPI
-rescaling, self-resizing, minimize/restore and full-screen style loss. Each message dispatch
-uses one desktop snapshot; window desktop fallback reuses that evidence during enumeration.
-Minimized tracked windows reserve their tiles for their top-level lifetime, with no expiry.
-
-F7 is **partly resolved**. Elevated settings commands show the path, existing reparse points
-are refused, leaf reads/creates use `FILE_FLAG_OPEN_REPARSE_POINT`, and directory handles deny
-replacement during data operations. Log append also rejects hard-linked files. Directory
-replacement and hard-linked log regressions pass. Three focused directory-guard attempts
-showed that denying write sharing also prevents ordinary atomic saves and log rotation;
-the working guard allows read/write sharing and denies delete sharing. A writable directory
-handle can still change reparse data between validation and a path-based operation. Complete
-race resistance would require handle-relative file operations or a separate protected storage
-boundary. Elevated hostile-filesystem safety is therefore not certified by this change.
-
-Empty-desktop detection uses Explorer's undocumented registry value only when there is no
-visible application evidence. If that value is absent, identity pauses with a tray explanation;
-it does not guess the desktop from the last one visited. This fallback needs live checks on
-supported Windows versions. Synthetic zero-movement mouse input also remains subject to
-Windows foreground/UIPI policy; a rejected focus request is attempted only once per hovered
-window until the cursor visits another window.
-
-Offline validation: `cargo test` (90 tests), `cargo clippy --all-targets -- -D warnings`, and
-one final `cargo build --release`. No manager instance was started, installed or committed.
-CI artifact publication is configured and must be exercised by the orchestrator's next PR.
+Tilework uses per-user storage. It rejects elevated launches because data files and executable paths are writable by the account running it. The previous development build requires manual removal of its elevated scheduled task before migration.

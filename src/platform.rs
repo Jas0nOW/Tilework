@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicU8, Ordering};
 use windows::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT};
 use windows::core::{BOOL, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
@@ -28,6 +28,8 @@ pub trait Win {
     fn is_visible(&self, h: isize, current: u128) -> bool;
     fn is_ghost(&self, _h: isize, _current: u128) -> bool { false }
     fn cursor_position(&self) -> Option<(i32, i32)> { None }
+    fn cursor_surface(&self, desktop: u128) -> Option<(SurfaceKey, Rect, i32, i32)>;
+    fn foreground_window(&self) -> isize;
     fn resize_intent(&self, _h: isize) -> Option<bool> { None }
     fn dpi(&self, _h: isize) -> u32 { 96 }
     fn move_size_active(&self, _h: isize) -> Option<bool> { None }
@@ -333,6 +335,20 @@ impl Win for Platform {
         unsafe { GetCursorPos(&mut pt).ok()?; }
         Some((pt.x, pt.y))
     }
+    fn cursor_surface(&self, desktop: u128) -> Option<(SurfaceKey, Rect, i32, i32)> {
+        let (x, y) = self.cursor_position()?;
+        unsafe {
+            let monitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+            let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            if !GetMonitorInfoW(monitor, &mut info).as_bool() { return None; }
+            let r = info.rcWork;
+            let area = Rect::new(r.left, r.top, r.right - r.left, r.bottom - r.top);
+            Some((SurfaceKey { desktop, monitor: monitor.0 as isize }, area, x, y))
+        }
+    }
+    fn foreground_window(&self) -> isize {
+        id_of(unsafe { GetForegroundWindow() })
+    }
     fn resize_intent(&self, h: isize) -> Option<bool> {
         use windows::Win32::Foundation::WPARAM;
         let (x, y) = self.cursor_position()?;
@@ -424,7 +440,12 @@ fn identify_desktop(foreground: isize, evidence: &[(isize, u128)], empty: impl F
         *counts.entry(id).or_insert(0usize) += 1;
     }
     let highest = counts.values().copied().max().unwrap_or(0);
-    if highest < 2 { return empty(); }
+    if highest < 2 {
+        let shell = empty();
+        if shell != 0 || counts.len() != 1 { return shell; }
+        // Only the foreground window may break the tie with unavailable shell evidence.
+        return evidence.iter().find_map(|&(h, id)| (h == foreground && id != 0).then_some(id)).unwrap_or(0);
+    }
     let winners: Vec<_> = counts.into_iter().filter_map(|(id, n)| (n == highest).then_some(id)).collect();
     if winners.len() == 1 { return winners[0]; }
     if let Some((_, id)) = evidence.iter().find(|(h, id)| *h == foreground && winners.contains(id)) { return *id; }
@@ -677,6 +698,10 @@ mod snap_tests {
         windows[2].1 = 99;
         assert_eq!(identify_desktop(2, &windows, || 0), 99);
         assert_eq!(identify_desktop(0, &[(1, 99)], || 42), 42);
+        assert_eq!(identify_desktop(1, &[(1, 99)], || 42), 42);
+        assert_eq!(identify_desktop(1, &[(1, 99)], || 0), 99);
+        assert_eq!(identify_desktop(0, &[(1, 99)], || 0), 0);
+        assert_eq!(identify_desktop(1, &[(1, 99), (2, 42)], || 0), 0);
         assert_eq!(identify_desktop(3, &[(1, 42), (2, 42), (3, 99), (4, 99)], || 7), 99);
         assert_eq!(identify_desktop(0, &[(1, 42), (2, 42), (3, 99), (4, 99)], || 7), 7);
         windows.clear(); // The empty desktop is resolved through shell evidence.

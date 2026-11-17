@@ -12,11 +12,12 @@ Thanks for helping. Tilework moves real windows, so changes are checked carefull
 ## Before you open a pull request
 
 ```
-cargo test
-cargo clippy --all-targets -- -D warnings
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
 ```
 
 CI runs the same on Windows for every pull request.
+The [release runbook](docs/RELEASE.md) covers the native smoke test and installer verification.
 
 ## Testing safely
 

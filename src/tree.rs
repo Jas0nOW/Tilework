@@ -528,9 +528,8 @@ impl Tree {
     /// Moves the divider that forms the given edge of a window (or of the whole zone the window
     /// is part of) to a new coordinate. Returns false for outer edges without a divider.
     pub fn set_edge(&mut self, area: Rect, h: Hwnd, edge: Edge, coordinate: i32) -> bool {
-        let mins = self.mins.clone();
         match &mut self.root {
-            Some(root) => matches!(set_edge_node(root, area, h, edge, coordinate, &mins), EdgeState::Done),
+            Some(root) => matches!(set_edge_node(root, area, h, edge, coordinate, &self.mins, &self.skipped), EdgeState::Done),
             None => false,
         }
     }
@@ -797,15 +796,19 @@ enum EdgeState {
     Done,
 }
 
-fn set_edge_node(n: &mut Node, r: Rect, h: Hwnd, edge: Edge, coord: i32, mins: &Mins) -> EdgeState {
+fn set_edge_node(n: &mut Node, r: Rect, h: Hwnd, edge: Edge, coord: i32, mins: &Mins, skipped: &HashSet<Hwnd>) -> EdgeState {
     match n {
         Node::Leaf(id) => {
             if *id == h { EdgeState::Pending } else { EdgeState::NotHere }
         }
         Node::Container { orient, children, weights, auto } => {
-            let rects = child_rects(*orient, children, weights, r, mins);
-            for i in 0..children.len() {
-                match set_edge_node(&mut children[i], rects[i], h, edge, coord, mins) {
+            let (indices, visible): (Vec<_>, Vec<_>) = children.iter().enumerate()
+                .filter_map(|(i, child)| visible_node(child, skipped).map(|child| (i, child)))
+                .unzip();
+            let visible_weights: Vec<_> = indices.iter().map(|&i| weights[i]).collect();
+            let rects = child_rects(*orient, &visible, &visible_weights, r, mins);
+            for (i, &child) in indices.iter().enumerate() {
+                match set_edge_node(&mut children[child], rects[i], h, edge, coord, mins, skipped) {
                     EdgeState::NotHere => continue,
                     EdgeState::Done => return EdgeState::Done,
                     EdgeState::Pending => {
@@ -815,7 +818,7 @@ fn set_edge_node(n: &mut Node, r: Rect, h: Hwnd, edge: Edge, coord: i32, mins: &
                         }
                         // divider between zone `d` and `d + 1`
                         let d = match edge {
-                            Edge::Right | Edge::Bottom if i + 1 < children.len() => i,
+                            Edge::Right | Edge::Bottom if i + 1 < visible.len() => i,
                             Edge::Left | Edge::Top if i > 0 => i - 1,
                             _ => return EdgeState::Pending,
                         };
@@ -825,8 +828,8 @@ fn set_edge_node(n: &mut Node, r: Rect, h: Hwnd, edge: Edge, coord: i32, mins: &
                             let (w, h) = min_size(child, mins);
                             if horizontal_edge { w } else { h }
                         };
-                        let left_min = axis_min(&children[d]);
-                        let right_min = axis_min(&children[d + 1]);
+                        let left_min = axis_min(&visible[d]);
+                        let right_min = axis_min(&visible[d + 1]);
                         let left = if i64::from(left_min) + i64::from(right_min) <= i64::from(pair) {
                             (i64::from(coord) - i64::from(start)).clamp(i64::from(left_min), i64::from(pair - right_min)) as i32
                         } else {
@@ -836,7 +839,11 @@ fn set_edge_node(n: &mut Node, r: Rect, h: Hwnd, edge: Edge, coord: i32, mins: &
                         let mut px: Vec<f64> = rects.iter().map(|rc| (if horizontal_edge { rc.w as f64 } else { rc.h as f64 }).max(f64::EPSILON)).collect();
                         px[d] = (left as f64).max(f64::EPSILON);
                         px[d + 1] = ((pair - left) as f64).max(f64::EPSILON);
-                        *weights = px;
+                        // Keep the total visible weight unchanged so minimized zones retain their share.
+                        let scale = visible_weights.iter().sum::<f64>() / px.iter().sum::<f64>();
+                        for (&child, size) in indices.iter().zip(px) {
+                            weights[child] = size * scale;
+                        }
                         *auto = false;
                         return EdgeState::Done;
                     }
@@ -1305,6 +1312,18 @@ mod tests {
         tree.skipped.remove(&1);
         let leaves = tree.leaves();
         assert!(leaves.contains(&1) && leaves.contains(&3));
+    }
+
+    #[test]
+    fn resizing_moves_the_visible_divider_and_preserves_the_minimized_zone_share() {
+        let mut tree = three_column_tree();
+        tree.skipped.insert(2);
+        assert!(tree.set_edge(SCREEN, 1, Edge::Right, 1200));
+        assert_eq!(rect(&tree, 1).right(), 1200);
+        assert_eq!(rect(&tree, 3).x, 1200);
+
+        tree.skipped.clear();
+        assert_eq!([rect(&tree, 1).w, rect(&tree, 2).w, rect(&tree, 3).w], [800, 640, 480]);
     }
 
     #[test]

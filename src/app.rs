@@ -12,7 +12,7 @@ use std::io::Write;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
-use windows::Win32::Graphics::Gdi::{BeginPaint, CreateBitmap, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT};
+use windows::Win32::Graphics::Gdi::{BeginPaint, CreateBitmap, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect, PAINTSTRUCT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, RegisterHotKey, MOD_NOREPEAT, MOD_WIN, VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2};
@@ -32,7 +32,6 @@ const MENU_EXIT: usize = 2;
 const MENU_OPEN_CONFIG: usize = 3;
 const MENU_AUTOSTART: usize = 4;
 const MENU_CHECK_UPDATE: usize = 5;
-const MENU_INSTALL_TOGGLE: usize = 6;
 const MENU_FFM_OFF: usize = 10;
 const MENU_FFM_BASE: usize = 20;
 const FFM_PRESETS: [u64; 5] = [150, 300, 500, 800, 1200];
@@ -78,6 +77,17 @@ struct Surface {
     area: Rect,
 }
 
+struct MonitorMove {
+    from: SurfaceKey,
+    to: SurfaceKey,
+    started: Instant,
+}
+
+struct LearnedMinimum {
+    size: (i32, i32),
+    dpi: u32,
+}
+
 struct Drag {
     hwnd: Hwnd,
     key: SurfaceKey,
@@ -115,13 +125,13 @@ pub struct App<P: Win = Platform> {
     dispatch_desktop: Cell<Option<u128>>,
     dispatching: bool,
     /// Minimum sizes some windows insist on, learned from windows that refuse to shrink.
-    mins: HashMap<Hwnd, (i32, i32)>,
+    mins: HashMap<Hwnd, LearnedMinimum>,
     /// Last target we placed a window at, and what we measured afterwards.
     placed: HashMap<Hwnd, Placement>,
+    monitor_moves: HashMap<Hwnd, MonitorMove>,
     /// Windows that currently fit nowhere (they stay floating).
     floating: HashSet<Hwnd>,
     surfaces: HashMap<SurfaceKey, Surface>,
-    focused: Option<Hwnd>,
     last_tracked_focus: Option<Hwnd>,
     bordered: Option<Hwnd>,
     border_original: HashMap<Hwnd, u32>,
@@ -256,6 +266,10 @@ impl<P: Win> App<P> {
         find_enabled_surface(&self.surfaces, &self.disabled, h)
     }
 
+    fn tree_minima(&self) -> HashMap<Hwnd, (i32, i32)> {
+        self.mins.iter().map(|(&h, min)| (h, min.size)).collect()
+    }
+
     /// Brings the trees in line with the windows that really exist, then lays out what changed.
     fn reconcile(&mut self, force_all: bool) {
         let cur = self.current_desktop();
@@ -291,9 +305,16 @@ impl<P: Win> App<P> {
                 self.reserved.insert(h);
             }
         }
-        self.mins.retain(|h, _| tops.contains(h));
+        self.mins.retain(|h, min| {
+            if !tops.contains(h) { return false; }
+            let dpi = self.p.dpi(*h);
+            if dpi != 0 && dpi != min.dpi {
+                self.placed.remove(h);
+                false
+            } else { true }
+        });
         self.border_original.retain(|h, _| tops.contains(h));
-        let current: HashMap<Hwnd, (SurfaceKey, Rect)> = tops
+        let mut current: HashMap<Hwnd, (SurfaceKey, Rect)> = tops
             .iter()
             .rev()
             .copied()
@@ -305,12 +326,23 @@ impl<P: Win> App<P> {
             .map(|h| (h, self.p.surface_of(h)))
             .filter(|&(_, (k, _))| self.desktop_on(k.desktop))
             .collect();
+        // An asynchronous placement may still report the source monitor after a committed drop.
+        self.monitor_moves.retain(|h, pending| {
+            let Some(observed) = current.get_mut(h) else { return false; };
+            let Some(destination) = self.surfaces.get(&pending.to) else { return false; };
+            if observed.0 != pending.from || pending.started.elapsed() >= Duration::from_secs(3) {
+                return false;
+            }
+            *observed = (pending.to, destination.area);
+            true
+        });
         let mut dirty: HashSet<SurfaceKey> = HashSet::new();
         if force_all {
             dirty.extend(self.surfaces.keys().copied());
         }
+        let minima = self.tree_minima();
         for s in self.surfaces.values_mut() {
-            s.tree.mins = self.mins.clone();
+            s.tree.mins = minima.clone();
             s.tree.skipped = tops.iter().copied().filter(|h| self.p.is_minimized(*h)).collect();
         }
 
@@ -342,10 +374,9 @@ impl<P: Win> App<P> {
             }
             let focused = self.last_tracked_focus;
             let info = if self.cfg.verbose_log { format!("{h:x} {} ({})", clean_text(&self.p.title(h), 40), self.p.exe_name(h)) } else { format!("{h:x}") };
-            let mins = self.mins.clone();
             let s = self.surfaces.entry(key).or_insert_with(|| Surface { tree: Tree::new(), area });
             s.area = area;
-            s.tree.mins = mins;
+            s.tree.mins = minima.clone();
             s.tree.skipped = tops.iter().copied().filter(|h| self.p.is_minimized(*h)).collect();
             if s.tree.add(h, area, focused) {
                 dirty.insert(key);
@@ -362,15 +393,7 @@ impl<P: Win> App<P> {
         for key in keys {
             self.apply(key, force_all);
         }
-        if let Some(f) = self.focused {
-            if self.surface_containing(f).is_some() && self.desktop_on(cur) {
-                self.show_focus_border(f);
-            } else {
-                self.hide_focus_border();
-            }
-        } else {
-            self.hide_focus_border();
-        }
+        self.refresh_focus();
     }
 
     fn apply(&mut self, key: SurfaceKey, force: bool) {
@@ -407,9 +430,14 @@ impl<P: Win> App<P> {
                 if elapsed < Duration::from_millis(500) { continue; }
                 let refusal = vis.filter(|v| (v.x - r.x).abs() <= 1 && (v.y - r.y).abs() <= 1 && (v.w > r.w + 2 || v.h > r.h + 2));
                 if stable && p.confirmation == refusal && let Some(v) = refusal {
-                    let old = self.mins.get(&h).copied().unwrap_or((0, 0));
+                    let dpi = self.p.dpi(h);
+                    let old = self.mins.get(&h).map(|min| min.size).unwrap_or((0, 0));
                     let new = (old.0.max(if v.w > r.w + 2 { v.w.min(area.w) } else { 0 }), old.1.max(if v.h > r.h + 2 { v.h.min(area.h) } else { 0 }));
-                    if old != new { self.mins.insert(h, new); learned = true; log(&format!("{h:x} needs at least {}x{}", new.0, new.1)); }
+                    if old != new && dpi != 0 {
+                        self.mins.insert(h, LearnedMinimum { size: new, dpi });
+                        learned = true;
+                        log(&format!("{h:x} needs at least {}x{} at {dpi} DPI", new.0, new.1));
+                    }
                     continue;
                 }
                 if refusal.is_some() && !stable { continue; }
@@ -430,7 +458,8 @@ impl<P: Win> App<P> {
             if placed_ok { self.placed.insert(h, Placement::new(r)); }
         }
         if learned {
-            for s in self.surfaces.values_mut() { s.tree.mins = self.mins.clone(); }
+            let minima = self.tree_minima();
+            for s in self.surfaces.values_mut() { s.tree.mins = minima.clone(); }
             if let Some(s) = self.surfaces.get_mut(&key) {
                 s.tree.reseat(s.area);
                 // Place changed targets only; never sample a window twice in this poll.
@@ -473,20 +502,22 @@ impl<P: Win> App<P> {
         }
     }
 
-    fn on_focus(&mut self, h: Hwnd) {
+    fn refresh_focus(&mut self) {
+        let h = self.p.foreground_window();
         self.observe_foreground(h);
-        if !self.desktop_on(self.shown) || self.surface_containing(h).is_none() {
-            self.focused = None;
+        if h == 0 || self.shown == 0 || self.current_desktop() != self.shown || !self.desktop_on(self.shown)
+            || !self.is_tracked_here(h) || self.p.is_minimized(h) || self.p.is_maximized(h) || self.p.is_fullscreen(h) {
             if let Some(prev) = self.bordered.take() { self.set_border(prev, COLOR_DEFAULT); }
             self.hide_focus_border();
             return;
         }
-        self.focused = Some(h);
         self.last_tracked_focus = Some(h);
-        if let Some(prev) = self.bordered.take() && prev != h { self.set_border(prev, COLOR_DEFAULT); }
-        self.set_border(h, ACCENT);
-        self.bordered = Some(h);
-        self.show_focus_border(h);
+        if self.bordered != Some(h) {
+            if let Some(prev) = self.bordered.replace(h) { self.set_border(prev, COLOR_DEFAULT); }
+            self.set_border(h, ACCENT);
+        }
+        if self.drag.is_some() { self.hide_focus_border(); }
+        else { self.show_focus_border(h); }
     }
 
     /// Switches tiling on or off for the desktop that is shown right now.
@@ -548,6 +579,7 @@ impl<P: Win> App<P> {
     }
 
     fn refresh_surfaces(&mut self) {
+        self.monitor_moves.clear();
         if self.current_desktop() == 0 { self.reconcile(true); return; }
         self.cancel_drag();
         let tops = self.p.all_top_level();
@@ -584,18 +616,6 @@ impl<P: Win> App<P> {
         set_timer(self.main, TIMER_DRAG, 30);
     }
 
-    fn cursor_surface(&self, desktop: u128) -> Option<(SurfaceKey, Rect, i32, i32)> {
-        unsafe {
-            let mut pt = POINT::default();
-            GetCursorPos(&mut pt).ok()?;
-            let m = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-            let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-            let _ = GetMonitorInfoW(m, &mut mi);
-            let w = mi.rcWork;
-            Some((SurfaceKey { desktop, monitor: m.0 as isize }, Rect::new(w.left, w.top, w.right - w.left, w.bottom - w.top), pt.x, pt.y))
-        }
-    }
-
     /// Outer screen edge the cursor is at (if any): dropping there creates a full-length zone.
     fn edge_at(area: Rect, cx: i32, cy: i32) -> Option<DropZone> {
         let cands = [
@@ -607,28 +627,29 @@ impl<P: Win> App<P> {
         cands.into_iter().filter(|(d, _)| *d < EDGE_PX).min_by_key(|(d, _)| *d).map(|(_, z)| z)
     }
 
-    fn drag_tick(&mut self) {
-        let Some(d) = &self.drag else { return };
+    fn drag_tick(&mut self) -> Option<Rect> {
+        let d = self.drag.as_ref()?;
         let (h, home) = (d.hwnd, d.key);
-        if !self.drag_desktop_valid(home.desktop) { self.cancel_drag(); return; }
+        if !self.drag_desktop_valid(home.desktop) { self.cancel_drag(); return None; }
         let visible = self.p.visible_rect(h);
         let changed = self.p.monitor_of(h).0 != home.monitor || self.p.dpi(h) != d.dpi;
         if let Some(d) = self.drag.as_mut() {
             d.monitor_changed |= changed;
             if d.monitor_changed { d.resize = false; }
         }
-        let cursor = self.cursor_surface(self.shown);
+        let cursor = self.p.cursor_surface(self.shown);
         let preview = update_drag(self.drag.as_mut().expect("drag was checked"), visible, cursor, &self.surfaces);
         match preview {
             Some((bounds, layout)) => self.show_overlay(bounds, &layout, h),
             None => self.hide_overlay(),
         }
+        cursor.map(|(_, area, _, _)| area)
     }
 
     fn drag_end(&mut self, h: Hwnd) {
         if self.drag.as_ref().map(|d| d.hwnd) != Some(h) { return; }
         // Release can arrive before the first 30 ms tick or after the last cursor move.
-        self.drag_tick();
+        let drop_area = self.drag_tick();
         let Some(d) = self.drag.take() else { return };
         unsafe {
             let _ = KillTimer(Some(self.main), TIMER_DRAG);
@@ -690,7 +711,7 @@ impl<P: Win> App<P> {
                     (Some(s), Some(t)) => s.tree.insert(h, t, z),
                     (Some(s), None) => s.tree.insert_edge(h, z),
                     (None, _) => {
-                        if let Some((_, area, _, _)) = self.cursor_surface(key.desktop) {
+                        if let Some(area) = drop_area {
                             let mut tree = Tree::new();
                             tree.add(h, area, None);
                             self.surfaces.insert(key, Surface { tree, area });
@@ -702,11 +723,13 @@ impl<P: Win> App<P> {
         self.surfaces.retain(|_, s| !s.tree.is_empty());
         self.apply(home, true);
         if key != home {
+            let observed = self.p.surface_of(h).0;
+            if observed.desktop == key.desktop && observed.monitor != key.monitor {
+                self.monitor_moves.insert(h, MonitorMove { from: observed, to: key, started: Instant::now() });
+            }
             self.apply(key, true);
         }
-        if let Some(f) = self.focused {
-            self.show_focus_border(f);
-        }
+        self.refresh_focus();
     }
 
     // ---------- focus follows mouse ----------
@@ -865,112 +888,17 @@ impl<P: Win> App<P> {
             match cmd {
                 MENU_TOGGLE => app.toggle(),
                 MENU_AUTOSTART => {
-                    if crate::setup::is_autostart_enabled() {
-                        if let Err(e) = crate::setup::disable_autostart() {
-                            log(&format!("could not disable autostart: {e}"));
-                        } else {
-                            log("autostart disabled");
-                        }
-                    } else if let Ok(exe) = std::env::current_exe() {
-                        if let Err(e) = crate::setup::enable_autostart(&exe) {
-                            log(&format!("could not enable autostart: {e}"));
-                        } else {
-                            log("autostart enabled with highest privileges");
+                    let enabled = !crate::setup::is_autostart_enabled();
+                    match crate::setup::set_autostart(enabled) {
+                        Ok(()) => log(if enabled { "autostart entry registered" } else { "autostart entry removed" }),
+                        Err(e) => {
+                            log(&e);
+                            let message = wide(&e);
+                            MessageBoxW(Some(app.main), PCWSTR(message.as_ptr()), w!("Tilework Autostart"), MB_OK | MB_ICONERROR);
                         }
                     }
                 }
-                MENU_INSTALL_TOGGLE => {
-                    if crate::setup::is_running_installed() {
-                        let msg = wide("Are you sure you want to uninstall Tilework?\n\nThis will remove autostart, the Start Menu shortcut, and the installed files.");
-                        let title = wide("Uninstall Tilework");
-                        let res = MessageBoxW(None, PCWSTR(msg.as_ptr()), PCWSTR(title.as_ptr()), MB_YESNO | MB_ICONQUESTION);
-                        if res == IDYES {
-                            if let Err(e) = crate::setup::uninstall() {
-                                let err_msg = wide(&format!("Failed to uninstall: {e}"));
-                                MessageBoxW(None, PCWSTR(err_msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
-                            } else {
-                                let ok_msg = wide("Tilework has been uninstalled. The app will now exit.");
-                                MessageBoxW(None, PCWSTR(ok_msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
-                                PostQuitMessage(0);
-                            }
-                        }
-                    } else {
-                        match crate::setup::install() {
-                            Ok(()) => {
-                                let ok_msg = wide("Tilework was successfully installed to %LOCALAPPDATA%\\Tilework with silent admin autostart and Start Menu shortcut!");
-                                let title = wide("Install Tilework");
-                                MessageBoxW(None, PCWSTR(ok_msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
-                            }
-                            Err(e) => {
-                                let err_msg = wide(&format!("Installation failed: {e}"));
-                                let title = wide("Install Tilework Error");
-                                MessageBoxW(None, PCWSTR(err_msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
-                            }
-                        }
-                    }
-                }
-                MENU_CHECK_UPDATE => {
-                    std::thread::spawn(move || {
-                        let status = crate::setup::check_for_update();
-                        match status {
-                            crate::setup::UpdateStatus::Available(rel) => {
-                                let msg = wide(&format!(
-                                    "A new version of Tilework is available: {}\n\nRelease notes:\n{}\n\nDo you want to download and install this update now?",
-                                    rel.tag,
-                                    rel.release_notes.chars().take(400).collect::<String>()
-                                ));
-                                let title = wide("Tilework Update Available");
-                                let res = MessageBoxW(
-                                    None,
-                                    PCWSTR(msg.as_ptr()),
-                                    PCWSTR(title.as_ptr()),
-                                    MB_YESNO | MB_ICONINFORMATION | MB_TOPMOST,
-                                );
-                                if res == IDYES {
-                                    let temp_path = std::env::temp_dir().join("tilework_update.exe");
-                                    if let Err(e) = crate::setup::download_and_verify(&rel.download_url, &temp_path) {
-                                        let err_msg = wide(&format!("Failed to download update:\n{e}"));
-                                        let err_title = wide("Tilework Update Error");
-                                        MessageBoxW(None, PCWSTR(err_msg.as_ptr()), PCWSTR(err_title.as_ptr()), MB_OK | MB_ICONERROR);
-                                        return;
-                                    }
-                                    let current_exe = match std::env::current_exe() {
-                                        Ok(e) => e,
-                                        Err(e) => {
-                                            let err_msg = wide(&format!("Could not locate current binary:\n{e}"));
-                                            MessageBoxW(None, PCWSTR(err_msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
-                                            return;
-                                        }
-                                    };
-                                    if let Err(e) = crate::setup::apply_update(&current_exe, &temp_path) {
-                                        let err_msg = wide(&format!("Failed to apply update:\n{e}"));
-                                        MessageBoxW(None, PCWSTR(err_msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
-                                        return;
-                                    }
-                                    let success_msg = wide("Tilework was updated successfully! The application will restart now.");
-                                    MessageBoxW(None, PCWSTR(success_msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
-                                    let _ = std::process::Command::new(&current_exe).spawn();
-                                    std::process::exit(0);
-                                }
-                            }
-                            crate::setup::UpdateStatus::UpToDate(tag) => {
-                                let msg = wide(&format!("Tilework is up to date ({tag})."));
-                                let title = wide("Tilework Update");
-                                MessageBoxW(None, PCWSTR(msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
-                            }
-                            crate::setup::UpdateStatus::NoReleaseFound => {
-                                let msg = wide("No releases found on GitHub yet.");
-                                let title = wide("Tilework Update");
-                                MessageBoxW(None, PCWSTR(msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
-                            }
-                            crate::setup::UpdateStatus::Error(e) => {
-                                let msg = wide(&format!("Could not check for updates:\n{e}"));
-                                let title = wide("Tilework Update Error");
-                                MessageBoxW(None, PCWSTR(msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONWARNING);
-                            }
-                        }
-                    });
-                }
+                MENU_CHECK_UPDATE => check_update_async(),
                 MENU_OPEN_CONFIG => {
                     app.cfg.ensure_exists();
                     return Config::path();
@@ -1022,6 +950,42 @@ fn foreground_has_menu(foreground: HWND) -> bool {
     found
 }
 
+fn check_update_async() {
+    use crate::setup::UpdateStatus;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static CHECKING: AtomicBool = AtomicBool::new(false);
+    if CHECKING.swap(true, Ordering::Relaxed) { return; }
+    if let Err(e) = std::thread::Builder::new().spawn(|| {
+        let (message, release_url, buttons) = match crate::setup::check_for_update() {
+            UpdateStatus::Available { tag, release_url } => (
+                format!("Tilework {tag} is available. Open the official release page?"),
+                Some(release_url), MB_YESNO | MB_ICONINFORMATION,
+            ),
+            UpdateStatus::UpToDate => ("Tilework is up to date.".into(), None, MB_OK | MB_ICONINFORMATION),
+            UpdateStatus::NoReleaseFound => ("No public stable release found.".into(), None, MB_OK | MB_ICONINFORMATION),
+            UpdateStatus::Error(e) => (format!("Could not check for updates:\n{e}"), None, MB_OK | MB_ICONWARNING),
+        };
+        let message = wide(&message);
+        unsafe {
+            if MessageBoxW(None, PCWSTR(message.as_ptr()), w!("Tilework Update"), buttons | MB_SETFOREGROUND) == IDYES
+                && let Some(release_url) = release_url
+            {
+                let url = wide(&release_url);
+                let result = ShellExecuteW(None, w!("open"), PCWSTR(url.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+                if result.0 as isize <= 32 {
+                    log("could not open the official Tilework release page");
+                    MessageBoxW(None, w!("Could not open the browser. Visit github.com/Jas0nOW/Tilework/releases."), w!("Tilework Update"), MB_OK | MB_ICONWARNING);
+                }
+            }
+        }
+        CHECKING.store(false, Ordering::Relaxed);
+    }) {
+        CHECKING.store(false, Ordering::Relaxed);
+        log(&format!("could not start update check: {e}"));
+    }
+}
+
 fn open_config(path: &std::path::Path) {
     let path = wide(&path.to_string_lossy());
     unsafe {
@@ -1063,21 +1027,13 @@ unsafe fn build_and_track_menu(cfg: &Config, main: HWND, on: bool) -> usize {
                 log(&format!("could not append tray menu item: {e}"));
             }
 
-            let autostart_on = crate::setup::is_autostart_enabled();
-            if let Err(e) = AppendMenuW(menu, check(autostart_on), MENU_AUTOSTART, w!("Start with Windows (Admin)")) {
-                log(&format!("could not append tray menu item: {e}"));
+            if crate::setup::is_running_installed() {
+                let autostart_on = crate::setup::is_autostart_enabled();
+                if let Err(e) = AppendMenuW(menu, check(autostart_on), MENU_AUTOSTART, w!("Start with Windows")) {
+                    log(&format!("could not append tray menu item: {e}"));
+                }
             }
-
             if let Err(e) = AppendMenuW(menu, MF_STRING, MENU_CHECK_UPDATE, w!("Check for updates...")) {
-                log(&format!("could not append tray menu item: {e}"));
-            }
-
-            let install_label = if crate::setup::is_running_installed() {
-                w!("Uninstall Tilework")
-            } else {
-                w!("Install Tilework")
-            };
-            if let Err(e) = AppendMenuW(menu, MF_STRING, MENU_INSTALL_TOGGLE, install_label) {
                 log(&format!("could not append tray menu item: {e}"));
             }
 
@@ -1205,7 +1161,7 @@ fn dispatch<P: Win>(app: &mut App<P>, event: PendingEvent) -> bool {
     app.dispatching = true;
     match msg {
         WM_EVENT => match wp as u32 {
-            0x0003 => { app.on_focus(lp); set_timer(app.main, TIMER_RECONCILE, 80); },
+            0x0003 => { app.refresh_focus(); set_timer(app.main, TIMER_RECONCILE, 80); },
             0x0020 => { app.reconcile(false); },
             0x000A => app.drag_start(lp),
             0x000B => app.drag_end(lp),
@@ -1213,7 +1169,7 @@ fn dispatch<P: Win>(app: &mut App<P>, event: PendingEvent) -> bool {
         },
         WM_TIMER => match wp {
             TIMER_RECONCILE => { unsafe { let _ = KillTimer(Some(app.main), TIMER_RECONCILE); } if app.drag.is_none() { app.reconcile(false); } },
-            TIMER_DRAG => { app.drag_tick(); app.poll_drag_release(); },
+            TIMER_DRAG => { let _ = app.drag_tick(); app.poll_drag_release(); },
             TIMER_HOVER => app.hover_tick(),
             TIMER_POLL => app.poll_tick(),
             _ => {},
@@ -1342,9 +1298,10 @@ pub fn run(filter: Option<String>) {
             dispatch_desktop: Cell::new(None), dispatching: false,
             mins: HashMap::new(),
             placed: HashMap::new(),
+            monitor_moves: HashMap::new(),
             floating: HashSet::new(),
             surfaces: HashMap::new(),
-            focused: None, last_tracked_focus: None,
+            last_tracked_focus: None,
             bordered: None,
             border_original: HashMap::new(),
             taskbar_created,
@@ -1398,6 +1355,7 @@ pub fn run(filter: Option<String>) {
             let _ = DestroyIcon(app.icon_off);
         } });
         let _ = DestroyWindow(overlay);
+        let _ = DestroyWindow(focus_border);
         let _ = DestroyWindow(main);
         MAIN_HANDLE.with(|h| h.set(HWND(std::ptr::null_mut())));
         let _ = DeleteObject(accent_brush.into());
@@ -1716,6 +1674,8 @@ mod scenarios {
     struct FakeWin {
         windows: RefCell<HashMap<Hwnd, Window>>,
         area: Cell<Rect>, desktop: Cell<u128>, desktop_queries: Cell<usize>, requests: RefCell<Vec<(Hwnd, Rect)>>, cursor: Cell<(i32, i32)>,
+        foreground: Cell<Hwnd>,
+        dpi: Cell<u32>,
     }
     impl Win for FakeWin {
         fn visible_rect(&self, h: Hwnd) -> Option<Rect> { self.windows.borrow().get(&h).map(|w| w.rect) }
@@ -1733,7 +1693,7 @@ mod scenarios {
         }
         fn desktop_id(&self, h: Hwnd) -> u128 { self.windows.borrow()[&h].desktop }
         fn all_top_level(&self) -> Vec<Hwnd> { let mut v: Vec<_> = self.windows.borrow().keys().copied().collect(); v.sort(); v }
-        fn monitor_of(&self, _: Hwnd) -> (isize, Rect) { (1, self.area.get()) }
+        fn monitor_of(&self, h: Hwnd) -> (isize, Rect) { self.fake_monitor(self.windows.borrow()[&h].rect.x) }
         fn is_manageable(&self, h: Hwnd, _: u128) -> bool { let w = &self.windows.borrow()[&h]; w.styled && !w.minimized }
         fn is_visible(&self, h: Hwnd, _: u128) -> bool { !self.windows.borrow()[&h].hidden }
         fn title(&self, _: Hwnd) -> String { "test".into() }
@@ -1742,15 +1702,29 @@ mod scenarios {
         fn current_desktop(&self) -> u128 { self.desktop_queries.set(self.desktop_queries.get() + 1); self.desktop.get() }
         fn invalidate_desktop(&self) {}
         fn cursor_position(&self) -> Option<(i32, i32)> { Some(self.cursor.get()) }
+        fn cursor_surface(&self, desktop: u128) -> Option<(SurfaceKey, Rect, i32, i32)> {
+            let (x, y) = self.cursor.get();
+            let (monitor, area) = self.fake_monitor(x);
+            Some((SurfaceKey { desktop, monitor }, area, x, y))
+        }
+        fn foreground_window(&self) -> Hwnd { self.foreground.get() }
+        fn dpi(&self, _: Hwnd) -> u32 { self.dpi.get() }
+    }
+    impl FakeWin {
+        fn fake_monitor(&self, x: i32) -> (isize, Rect) {
+            let primary = self.area.get();
+            if x < primary.right() { (1, primary) }
+            else { (2, Rect { x: primary.right(), ..primary }) }
+        }
     }
     fn app() -> (App<FakeWin>, SurfaceKey) {
         let area = Rect::new(0, 0, 1920, 1080);
         let mut windows = HashMap::new();
         for h in [1, 2] { windows.insert(h, Window { rect: Rect::new(50, 50, 1000, 700), minimum: (0, 0), maximized: false, minimized: false, fullscreen: false, hung: false, styled: true, desktop: 1, ignores: false, hidden: false }); }
-        let p = FakeWin { windows: RefCell::new(windows), area: Cell::new(area), desktop: Cell::new(1), desktop_queries: Cell::new(0), requests: RefCell::new(Vec::new()), cursor: Cell::new((0, 0)) };
+        let p = FakeWin { windows: RefCell::new(windows), area: Cell::new(area), desktop: Cell::new(1), desktop_queries: Cell::new(0), requests: RefCell::new(Vec::new()), cursor: Cell::new((0, 0)), foreground: Cell::new(0), dpi: Cell::new(96) };
         let (drag, surfaces, _) = super::tests::drag_fixture();
         let key = drag.key;
-        (App { p, disabled: HashSet::new(), cfg: Config::default(), hover: None, hover_attempted: None, hover_foreground: None, hover_attempt_position: None, ghost_seen: HashSet::new(), reserved: HashSet::new(), shown: 1, desktop_error_logged: false, dispatch_desktop: Cell::new(None), dispatching: false, mins: HashMap::new(), placed: HashMap::new(), floating: HashSet::new(), surfaces, focused: None, last_tracked_focus: None, bordered: None, border_original: HashMap::new(), taskbar_created: 0, drag: None, overlay: HWND::default(), focus_border: HWND::default(), main: HWND::default(), filter: None, icon_on: HICON::default(), icon_off: HICON::default() }, key)
+        (App { p, disabled: HashSet::new(), cfg: Config::default(), hover: None, hover_attempted: None, hover_foreground: None, hover_attempt_position: None, ghost_seen: HashSet::new(), reserved: HashSet::new(), shown: 1, desktop_error_logged: false, dispatch_desktop: Cell::new(None), dispatching: false, mins: HashMap::new(), placed: HashMap::new(), monitor_moves: HashMap::new(), floating: HashSet::new(), surfaces, last_tracked_focus: None, bordered: None, border_original: HashMap::new(), taskbar_created: 0, drag: None, overlay: HWND::default(), focus_border: HWND::default(), main: HWND::default(), filter: None, icon_on: HICON::default(), icon_off: HICON::default() }, key)
     }
     fn poll(app: &mut App<FakeWin>, key: SurfaceKey) {
         for p in app.placed.values_mut() { p.requested = Instant::now() - Duration::from_secs(1); }
@@ -1777,7 +1751,7 @@ mod scenarios {
         poll(&mut a, key); assert!(a.mins.is_empty());
         assert!(a.p.requests.borrow().len() > requests);
         poll(&mut a, key); assert!(a.mins.is_empty());
-        poll(&mut a, key); assert_eq!(a.mins[&1].0, 1100);
+        poll(&mut a, key); assert_eq!(a.mins[&1].size.0, 1100);
         assert_eq!(a.p.visible_rect(1).unwrap().w, 1100);
     }
     #[test]
@@ -1804,7 +1778,7 @@ mod scenarios {
         a.p.windows.borrow_mut().get_mut(&1).unwrap().minimum = (5000, 5000);
         a.apply(key, false);
         for _ in 0..4 { poll(&mut a, key); }
-        assert_eq!(a.mins[&1], (1920, 1080));
+        assert_eq!(a.mins[&1].size, (1920, 1080));
         assert_eq!(a.placed[&1].measured, None); // Changed target was placed, not sampled again.
     }
     #[test]
@@ -1817,6 +1791,22 @@ mod scenarios {
         a.placed.get_mut(&1).unwrap().requested = Instant::now() - Duration::from_secs(31);
         a.apply(key, false);
         assert_eq!(a.p.requests.borrow().iter().filter(|(h, _)| *h == 1).count(), 5);
+    }
+    #[test]
+    fn a_learned_pixel_minimum_is_discarded_when_window_dpi_changes() {
+        let (mut a, key) = app();
+        a.p.dpi.set(144);
+        a.p.windows.borrow_mut().get_mut(&1).unwrap().minimum = (1100, 0);
+        a.apply(key, false);
+        for _ in 0..4 { poll(&mut a, key); }
+        assert_eq!(a.mins[&1].size, (1100, 0));
+        assert_eq!(a.mins[&1].dpi, 144);
+
+        a.p.dpi.set(96);
+        a.p.windows.borrow_mut().get_mut(&1).unwrap().minimum = (0, 0);
+        a.reconcile(false);
+        assert!(a.mins.is_empty());
+        assert!(a.surfaces[&key].tree.mins.is_empty());
     }
     #[test]
     fn maximization_survives_minimize_restore_and_win_d_preserves_weights() {
@@ -1853,6 +1843,31 @@ mod scenarios {
         assert!(!a.reserved.contains(&1)); assert!(!a.surfaces[&key].tree.contains(1));
     }
     #[test]
+    fn focus_uses_actual_foreground_and_leaves_fullscreen_windows_alone() {
+        let (mut a, key) = app();
+        a.p.foreground.set(1);
+        a.reconcile(false);
+        assert_eq!(a.bordered, Some(1));
+
+        // A delayed event names window 1, but 2 now owns the keyboard focus.
+        a.p.foreground.set(2);
+        dispatch(&mut a, PendingEvent { msg: WM_EVENT, wp: 0x0003, lp: 1 });
+        assert_eq!(a.bordered, Some(2));
+
+        a.p.windows.borrow_mut().get_mut(&2).unwrap().fullscreen = true;
+        a.reconcile(false);
+        assert_eq!(a.bordered, None);
+        assert!(a.surfaces[&key].tree.contains(2));
+
+        a.p.windows.borrow_mut().get_mut(&2).unwrap().fullscreen = false;
+        a.reconcile(false);
+        assert_eq!(a.bordered, Some(2));
+
+        a.p.desktop.set(2);
+        a.reconcile(false);
+        assert_eq!(a.bordered, None);
+    }
+    #[test]
     fn newly_adopted_maximized_window_restores_on_a_separate_placement() {
         let (mut a, key) = app();
         a.p.windows.borrow_mut().get_mut(&1).unwrap().maximized = true;
@@ -1871,6 +1886,30 @@ mod scenarios {
         update_drag(drag, Some(Rect::new(300, 0, 1200, 700)), Some((key, a.p.area.get(), 1400, 500)), &a.surfaces);
         assert!(!drag.resize); assert!(drag.target.is_some());
         a.p.desktop.set(2); a.poll_drag_release(); assert!(a.drag.is_none());
+    }
+    #[test]
+    fn a_cross_monitor_drop_survives_delayed_native_placement_and_eventually_reconciles_failures() {
+        for placement_succeeds in [true, false] {
+            let (mut a, home) = app();
+            a.apply(home, false);
+            a.p.windows.borrow_mut().get_mut(&1).unwrap().ignores = true;
+            a.drag_start(1);
+            let destination = SurfaceKey { monitor: 2, ..home };
+            a.p.cursor.set((2200, 500));
+            a.drag_end(1);
+            assert_eq!(a.surface_containing(1), Some(destination));
+            assert_eq!(a.p.monitor_of(1).0, home.monitor);
+            a.reconcile(false);
+            assert_eq!(a.surface_containing(1), Some(destination));
+            if placement_succeeds {
+                a.p.windows.borrow_mut().get_mut(&1).unwrap().rect = a.surfaces[&destination].area;
+            } else {
+                a.monitor_moves.get_mut(&1).unwrap().started -= Duration::from_secs(4);
+            }
+            a.reconcile(false);
+            assert_eq!(a.surface_containing(1), Some(if placement_succeeds { destination } else { home }));
+            assert!(a.monitor_moves.is_empty());
+        }
     }
     #[test]
     fn deferred_events_keep_drag_identity_and_each_toggle() {

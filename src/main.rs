@@ -10,16 +10,6 @@ use std::collections::HashMap;
 use tree::Tree;
 
 fn main() {
-    // Clean up any old binary from a previous update
-    setup::cleanup_old_binary();
-
-    // DPI must be established before creating any window or querying geometry.
-    unsafe {
-        use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
-        if let Err(e) = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) {
-            app::log(&format!("could not enable per-monitor DPI awareness: {e}"));
-        }
-    }
     let args: Vec<String> = std::env::args().collect();
     let action = match parse_cli_action(&args) {
         Ok(a) => a,
@@ -29,8 +19,35 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if action == CliAction::Version {
+        attach_console();
+        println!("Tilework {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    // Elevated window management would cross the trust boundary of per-user state.
+    if unsafe { windows::Win32::UI::Shell::IsUserAnAdmin().as_bool() } {
+        let message = "Tilework runs with standard user permissions. Start it without Run as administrator.";
+        if matches!(action, CliAction::Run(_)) {
+            use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+            use windows::core::{PCWSTR, w};
+            let message: Vec<u16> = message.encode_utf16().chain([0]).collect();
+            unsafe { MessageBoxW(None, PCWSTR(message.as_ptr()), w!("Tilework"), MB_OK | MB_ICONERROR); }
+        } else {
+            attach_console();
+            eprintln!("{message}");
+        }
+        std::process::exit(1);
+    }
+    // DPI must be established before creating any window or querying geometry.
+    unsafe {
+        use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+        if let Err(e) = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) {
+            app::log(&format!("could not enable per-monitor DPI awareness: {e}"));
+        }
+    }
 
     match action {
+        CliAction::Version => unreachable!(),
         CliAction::SnapStatus => {
             unsafe { let _ = windows::Win32::System::Console::AttachConsole(windows::Win32::System::Console::ATTACH_PARENT_PROCESS); }
             match platform::snap_status() {
@@ -42,122 +59,40 @@ fn main() {
             unsafe { let _ = windows::Win32::System::Console::AttachConsole(windows::Win32::System::Console::ATTACH_PARENT_PROCESS); }
             dump();
         }
-        CliAction::Install => {
-            unsafe { let _ = windows::Win32::System::Console::AttachConsole(windows::Win32::System::Console::ATTACH_PARENT_PROCESS); }
-            match setup::install() {
-                Ok(()) => {
-                    println!("Tilework installed successfully.");
-                    println!("Binary: %LOCALAPPDATA%\\Tilework\\tilework.exe");
-                    println!("Start Menu shortcut created.");
-                    println!("Silent admin autostart registered via Windows Task Scheduler.");
-                }
-                Err(e) => {
-                    eprintln!("Installation failed: {e}");
-                    std::process::exit(1);
-                }
-            }
-        }
-        CliAction::Uninstall => {
-            unsafe { let _ = windows::Win32::System::Console::AttachConsole(windows::Win32::System::Console::ATTACH_PARENT_PROCESS); }
-            match setup::uninstall() {
-                Ok(()) => println!("Tilework uninstalled successfully."),
-                Err(e) => {
-                    eprintln!("Uninstall failed: {e}");
-                    std::process::exit(1);
-                }
-            }
-        }
-        CliAction::AutostartOn => {
-            unsafe { let _ = windows::Win32::System::Console::AttachConsole(windows::Win32::System::Console::ATTACH_PARENT_PROCESS); }
-            let exe = match std::env::current_exe() {
-                Ok(e) => e,
-                Err(e) => {
-                    eprintln!("Could not locate executable: {e}");
-                    std::process::exit(1);
-                }
+        CliAction::Install | CliAction::Uninstall | CliAction::Update => {
+            attach_console();
+            let message = match action {
+                CliAction::Install => "Download and run Tilework-Setup-x64.exe from the official releases.",
+                CliAction::Uninstall => "Exit Tilework and uninstall it in Windows Settings > Apps.",
+                _ => "Use --check-update and install the new version with the official setup.",
             };
-            match setup::enable_autostart(&exe) {
-                Ok(()) => println!("Autostart enabled with highest privileges."),
-                Err(e) => {
-                    eprintln!("Failed to enable autostart: {e}");
-                    std::process::exit(1);
-                }
-            }
+            eprintln!("{message}\n{}", setup::RELEASES_URL);
+            std::process::exit(2);
         }
-        CliAction::AutostartOff => {
-            unsafe { let _ = windows::Win32::System::Console::AttachConsole(windows::Win32::System::Console::ATTACH_PARENT_PROCESS); }
-            match setup::disable_autostart() {
-                Ok(()) => println!("Autostart disabled."),
-                Err(e) => {
-                    eprintln!("Failed to disable autostart: {e}");
-                    std::process::exit(1);
-                }
+        CliAction::AutostartOn | CliAction::AutostartOff => {
+            attach_console();
+            let enabled = action == CliAction::AutostartOn;
+            if let Err(e) = setup::set_autostart(enabled) {
+                eprintln!("{e}");
+                std::process::exit(1);
             }
+            println!("Tilework autostart entry {}", if enabled { "registered" } else { "removed" });
         }
         CliAction::AutostartStatus => {
-            unsafe { let _ = windows::Win32::System::Console::AttachConsole(windows::Win32::System::Console::ATTACH_PARENT_PROCESS); }
+            attach_console();
             let enabled = setup::is_autostart_enabled();
-            println!("Tilework autostart: {}", if enabled { "enabled" } else { "disabled" });
+            println!("Tilework autostart entry: {}", if enabled { "registered" } else { "absent" });
         }
         CliAction::CheckUpdate => {
-            unsafe { let _ = windows::Win32::System::Console::AttachConsole(windows::Win32::System::Console::ATTACH_PARENT_PROCESS); }
-            println!("Checking GitHub releases for Tilework...");
+            attach_console();
             match setup::check_for_update() {
-                setup::UpdateStatus::Available(rel) => {
-                    println!("Update available: {} (current: v{})", rel.tag, env!("CARGO_PKG_VERSION"));
-                    println!("Download URL: {}", rel.download_url);
-                    if !rel.release_notes.is_empty() {
-                        println!("\nRelease Notes:\n{}", rel.release_notes);
-                    }
+                setup::UpdateStatus::Available { tag, release_url } => {
+                    println!("Update available: {tag} (current: v{})\n{release_url}", env!("CARGO_PKG_VERSION"));
                 }
-                setup::UpdateStatus::UpToDate(tag) => {
-                    println!("Tilework is up to date (version {tag}).");
-                }
-                setup::UpdateStatus::NoReleaseFound => {
-                    println!("No releases found on GitHub repository yet.");
-                }
+                setup::UpdateStatus::UpToDate => println!("Tilework v{} is up to date.", env!("CARGO_PKG_VERSION")),
+                setup::UpdateStatus::NoReleaseFound => println!("No public stable release found."),
                 setup::UpdateStatus::Error(e) => {
                     eprintln!("Update check failed: {e}");
-                    std::process::exit(1);
-                }
-            }
-        }
-        CliAction::Update => {
-            unsafe { let _ = windows::Win32::System::Console::AttachConsole(windows::Win32::System::Console::ATTACH_PARENT_PROCESS); }
-            println!("Checking for updates...");
-            match setup::check_for_update() {
-                setup::UpdateStatus::Available(rel) => {
-                    println!("Found update: {}", rel.tag);
-                    let temp_path = std::env::temp_dir().join("tilework_update.exe");
-                    println!("Downloading {}...", rel.download_url);
-                    if let Err(e) = setup::download_and_verify(&rel.download_url, &temp_path) {
-                        eprintln!("Download/verification failed: {e}");
-                        std::process::exit(1);
-                    }
-                    let current_exe = match std::env::current_exe() {
-                        Ok(e) => e,
-                        Err(e) => {
-                            eprintln!("Could not locate current binary: {e}");
-                            std::process::exit(1);
-                        }
-                    };
-                    println!("Applying update...");
-                    if let Err(e) = setup::apply_update(&current_exe, &temp_path) {
-                        eprintln!("Update failed: {e}");
-                        std::process::exit(1);
-                    }
-                    println!("Successfully updated to {}! Restarting...", rel.tag);
-                    let _ = std::process::Command::new(&current_exe).spawn();
-                    std::process::exit(0);
-                }
-                setup::UpdateStatus::UpToDate(tag) => {
-                    println!("Already up to date ({tag}).");
-                }
-                setup::UpdateStatus::NoReleaseFound => {
-                    println!("No releases found on GitHub repository.");
-                }
-                setup::UpdateStatus::Error(e) => {
-                    eprintln!("Update failed: {e}");
                     std::process::exit(1);
                 }
             }
@@ -205,6 +140,11 @@ fn main() {
     }
 }
 
+fn attach_console() {
+    use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    unsafe { let _ = AttachConsole(ATTACH_PARENT_PROCESS); }
+}
+
 /// Read-only: prints which windows would be tiled and where, without touching any window.
 fn dump() {
     let cfg = config::Config::load();
@@ -236,6 +176,7 @@ fn dump() {
 
 #[derive(Debug, PartialEq, Eq)]
 enum CliAction {
+    Version,
     Run(Option<String>),
     Dump,
     SnapStatus,
@@ -256,6 +197,10 @@ fn parse_cli_action(args: &[String]) -> Result<CliAction, &'static str> {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--version" => {
+                if action.is_some() { return Err("multiple command flags cannot be combined"); }
+                action = Some(CliAction::Version);
+            }
             "--filter" => {
                 if filter.is_some() { return Err("--filter may only be supplied once"); }
                 match args.get(i + 1) {

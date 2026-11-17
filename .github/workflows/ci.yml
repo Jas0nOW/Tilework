@@ -3,21 +3,93 @@ on:
   pull_request:
   push:
     branches: [main]
-    tags: ['*']
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Tag to prepare as a draft prerelease (optional)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
 jobs:
   verify:
-    runs-on: windows-latest
+    runs-on: windows-2025
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: stable
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: 1.100.0
           components: clippy
-      - run: cargo test
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo build --release
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo build --locked --release
+      - name: Prepare release files
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $version = (cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ($LASTEXITCODE -ne 0 -or $version -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw 'Cargo release version must use MAJOR.MINOR.PATCH.'
+          }
+          if ($env:RELEASE_TAG -and ($env:RELEASE_TAG -cne "v$version" -or $env:GITHUB_REF -cne "refs/tags/v$version")) {
+            throw 'Select the same release tag as the workflow ref and match the Cargo version.'
+          }
+
+          $inno = Join-Path $env:RUNNER_TEMP 'inno-setup-6.7.4.exe'
+          $compiler = Join-Path $env:RUNNER_TEMP 'tilework-inno'
+          Invoke-WebRequest -Uri 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-6.7.4.exe' -OutFile $inno
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $inno).Hash -ne 'a549929319f9120716677c685535ca4671e4b937b5fdc87e2585f32d8eb30e8c') {
+            throw 'Inno Setup checksum mismatch.'
+          }
+          $signature = Get-AuthenticodeSignature -LiteralPath $inno
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Pyrsys B\.V\.') {
+            throw 'Inno Setup publisher verification failed.'
+          }
+          $arguments = @('/PORTABLE=1', '/CURRENTUSER', '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', ('/DIR="' + $compiler + '"'))
+          $install = Start-Process -FilePath $inno -ArgumentList $arguments -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Inno Setup bootstrap failed ($($install.ExitCode))." }
+          & (Join-Path $compiler 'ISCC.exe') "/DMyAppVersion=$version" 'packaging/Tilework.iss'
+          if ($LASTEXITCODE -ne 0) { throw "Installer compilation failed ($LASTEXITCODE)." }
+          $built = "packaging/output/Tilework-Setup-$version-x64.exe"
+          if ((Get-Item -LiteralPath $built).VersionInfo.ProductVersion -cne $version) {
+            throw 'Installer product version does not match the Cargo version.'
+          }
+
+          New-Item -ItemType Directory -Path 'release-files'
+          Copy-Item -LiteralPath $built -Destination 'release-files/Tilework-Setup-x64.exe'
+          Copy-Item -LiteralPath 'target/release/tilework.exe' -Destination 'release-files/Tilework-Portable-x64.exe'
+          Get-ChildItem -LiteralPath 'release-files' -Filter '*.exe' | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content -Encoding ascii 'release-files/SHA256SUMS.txt'
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: Tilework-Windows
-          path: target/release/tilework.exe
+          name: Tilework-Windows-x64
+          path: release-files/
           if-no-files-found: error
+          retention-days: 14
+
+  draft-release:
+    if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+    needs: verify
+    runs-on: windows-2025
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: Tilework-Windows-x64
+          path: release-files/
+      - name: Create draft prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: pwsh
+        run: |
+          gh release create $env:RELEASE_TAG release-files/Tilework-Setup-x64.exe release-files/Tilework-Portable-x64.exe release-files/SHA256SUMS.txt --draft --prerelease --title "Tilework $env:RELEASE_TAG" --generate-notes --verify-tag

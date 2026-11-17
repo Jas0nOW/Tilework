@@ -1,118 +1,85 @@
 # Tilework
 
-[![CI](https://github.com/Jas0nOW/Tilework/actions/workflows/ci.yml/badge.svg)](https://github.com/Jas0nOW/Tilework/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Windows CI](https://github.com/Jas0nOW/Tilework/actions/workflows/ci.yml/badge.svg)](https://github.com/Jas0nOW/Tilework/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Automatic tiling for Windows 10/11, inspired by the COSMIC desktop (Pop!_OS 24.04).**
-Open a window and it finds its place. Drag it to rearrange, with a live preview of the exact result.
-No layout language, no configuration needed, no gaps.
+Tilework automatically arranges Windows apps into tiles. Drag by the title bar to swap two windows, split one tile, or make a zone along a screen edge. The preview shows the resulting layout before you release.
 
-Written in Rust. The only dependency is the official [`windows`](https://crates.io/crates/windows) crate.
+> **0.3.0 release candidate.** See the [release verification matrix](docs/RELEASE.md) for tested behavior and open Windows checks.
 
-> **Status: early development (0.1).** It is used daily, but only parts of it can be verified automatically.
-> See [Status and limitations](#status-and-limitations) before relying on it.
+## Try the interactive V3 demo
 
-## Features
+Open [the browser demo on GitHub Pages](https://jas0now.github.io/Tilework/demo/) once Pages is enabled. Until then, open [the standalone HTML file](docs/demo/index.html) in your browser from a local checkout.
 
-- **Automatic placement.** First two windows form two full columns (halves), 3rd and 4th windows split vertically inside these columns (2x2 grid), and the 5th window creates a 3rd full column automatically. Manual screen edge drops take precedence and create through zones.
-- **Zones.** Every area holds up to 4 zones side by side or stacked, and every zone can be split again. Dragging a divider resizes whole zones.
-- **Drag & drop with a live preview** of the complete resulting layout:
-  centre of a window = swap, edge of a window = split only that window nested, screen edge = new full-length through zone.
-- **Active focus border overlay.** A crisp 3 px accent frame overlay surrounds the focused tiled window across all apps without stealing focus or intercepting clicks.
-- **Per virtual desktop and monitor.** Every desktop/monitor has its own layout. Tiling can be switched on or off per desktop (tray icon click or `Win + Y`); manual layouts survive switching off and on.
-- **Integrated installer & autostart.** Install in one click to `%LOCALAPPDATA%\Tilework` with Start Menu shortcut and silent admin autostart via Windows Task Scheduler (no UAC prompt on logon).
-- **Production-ready self-updater.** Automatic or manual update checks directly from GitHub releases with PE binary verification, atomic swap with rollback, and startup cleanup.
-- **Respects minimum sizes.** Apps that refuse to get small (Chrome, Discord, ...) get a zone of exactly the size they need instead of overlapping their neighbours.
-- **Leaves full screen alone.** A tiled window that you maximise or put into full screen (F11, video, game) is not pulled back; its tile stays reserved and it returns when you restore it, also across minimise/restore and `Win + D`.
-- **Windows Snap is switched off while tiling is active** (session only, nothing is written to the registry) and restored on exit. A recovery marker restores it after a crash.
-- **Focus follows mouse** after a configurable delay (default 300 ms), with guards for mouse buttons, menus and full-screen windows.
-- **Fail safe.** Tilework only moves and resizes windows. It never closes or hides anything.
+The demo is a single-monitor simulation. Add five windows to see the layout progression, then drag one to a different tile or a screen edge.
 
-How it is meant to behave in detail: [docs/DESIGN.md](docs/DESIGN.md).
-
-## Install
-
-Tilework can run portably or be installed with a single click:
-
-### Quick Install (GUI)
-1. Download `tilework.exe` from the latest release and run it.
-2. Right-click the tray icon and select **Install Tilework**.
-3. It installs to `%LOCALAPPDATA%\Tilework\tilework.exe`, creates a Start Menu shortcut, and registers silent administrator autostart via Windows Task Scheduler (no UAC prompt on logon).
-
-### Command Line Install
-```powershell
-tilework.exe --install
-```
-
-### Uninstallation
-Right-click the tray icon and select **Uninstall Tilework**, or run:
-```powershell
-tilework.exe --uninstall
-```
-
-### Self-Updater
-- **Via Tray:** Right-click tray icon -> **Check for updates...**
-- **Via CLI:** `tilework.exe --check-update` or `tilework.exe --update`
-
-## Usage
-
-| Action | How |
+| Automatic layout | Drag preview |
 |---|---|
-| Turn tiling on/off for the current desktop | Click the tray icon or press `Win + Y` |
-| Rearrange | Drag a window by its title bar; the overlay shows the result |
-| Resize | Drag a window edge; the divider moves for the whole zone |
-| Settings | Right-click the tray icon, or edit `%LOCALAPPDATA%\Tilework\config.ini` (applied after restart) |
-| Quit | Tray menu, Exit |
+| ![Five simulated windows with a third full-height column](docs/demo/layout.png) | ![Simulated drop preview for splitting a single tile](docs/demo/drop-preview.png) |
 
-### Settings (`config.ini`)
+## Install on Windows
 
-| Key | Default | Meaning |
-|---|---|---|
-| `focus_follows_mouse` | `true` | focus the window under the cursor |
-| `focus_delay_ms` | `300` | how long the cursor must rest (50-5000) |
-| `min_zone_width` / `min_zone_height` | `260` / `160` | smallest zone a window can be squeezed into |
-| `verbose_log` | `false` | include (shortened) window titles in the log |
+1. Download `Tilework-Setup-x64.exe` and `SHA256SUMS.txt` for the same version from [Releases](https://github.com/Jas0nOW/Tilework/releases). The candidate targets x64 Windows 10 22H2 and Windows 11.
+2. In PowerShell, run `Get-FileHash -Algorithm SHA256 .\Tilework-Setup-x64.exe` and compare the hash with the published value. The candidate is unsigned, so Windows may show an unknown publisher. A matching hash verifies the downloaded bytes against the published checksum.
+3. Run Setup as your usual user and launch **Tilework** from the Start menu. Setup defaults to `%LOCALAPPDATA%\Programs\Tilework`.
+4. To launch at sign-in, enable **Start with Windows** from the tray menu. Autostart is off by default and Windows may delay or disable it in Startup Apps.
 
-The log is `%LOCALAPPDATA%\Tilework\tilework.log` (1 MB, one backup).
-If you used the former name *CosmicTile*, your settings are migrated on the first start.
+For a portable run, download `Tilework-Portable-x64.exe` and launch it directly. Both variants store settings and diagnostics in `%LOCALAPPDATA%\Tilework`.
 
-### Command line
+### Migrate from the earlier development build
+
+1. Exit the old Tilework from the tray.
+2. In **Task Scheduler**, check the **Task Scheduler Library** for the old `Tilework` task. Verify its action is the old Tilework executable, then delete that task. Use administrator approval if Windows requires it. The old task could run a user-writable executable with elevated permissions. Check the task even if you have already deleted the executable or originally enabled it from a portable location.
+3. Remove the old Start menu shortcut if it remains. Remove `tilework.exe` and `tilework.exe.old` from `%LOCALAPPDATA%\Tilework` if present. Keep `config.ini` to carry your settings forward.
+4. Run the new installer and re-enable **Start with Windows** if desired.
+
+### Update or roll back
+
+Use **Check for updates…** in the tray or `--check-update` from a terminal. The check reports newer public stable releases with the expected installer. Beta testers can check the Releases page for prereleases.
+
+Exit Tilework, verify the checksum for the desired version, then run its installer. Keep a previous verified installer and a backup of `config.ini` if you need to roll back. Exit Tilework and reinstall that version. The app delegates downloads and installation to the user and the standalone installer.
+
+### Uninstall
+
+1. Select **Exit** from the Tilework tray menu.
+2. In **Settings → Apps**, select **Tilework → Uninstall**. The uninstaller removes the program, shortcuts, and Tilework's sign-in entry.
+3. To remove retained user data, first restore Windows Snap if a previous crash left it disabled. Then remove `%LOCALAPPDATA%\Tilework` if you no longer need its settings or logs. If you used the former **CosmicTile** build, you can also remove its old settings folder. Portable users can remove the downloaded executable after exiting.
+
+## Use Tilework
+
+| Action | Control |
+|---|---|
+| Pause or resume for this desktop | Tray icon or `Win + Y` |
+| Swap tiles | Drag the title bar to the centre of another tile |
+| Split one tile | Drag to the edge of another tile |
+| Create a full-length zone | Drag to the screen edge |
+| Resize a divider | Drag a boundary of a tiled window |
+| Change focus-on-hover | Tray menu or `config.ini` |
+
+Settings default to focus on hover after 300 ms, minimum tile size 260×160 px, and verbose logging off. Manual settings edits apply on restart. Diagnostic files include `tilework.log` and one rotated backup. See [DESIGN.md](docs/DESIGN.md) for the layout and recovery rules.
+
+Windows prevents standard-user Tilework from managing elevated windows. App minimum sizes, foreground restrictions, and ambiguous virtual desktop information can also limit tiling. Verify mixed-DPI monitors, pinned windows, and Explorer recovery before depending on those workflows.
+
+### Diagnostics
 
 | Argument | Effect |
 |---|---|
-| `--install` | install Tilework to `%LOCALAPPDATA%\Tilework`, create Start Menu shortcut & autostart task |
-| `--uninstall` | clean uninstall: remove autostart task, Start Menu shortcut, and installed executable |
-| `--autostart-on` | enable scheduled task autostart with highest privileges (no UAC prompt on logon) |
-| `--autostart-off` | disable scheduled task autostart |
-| `--autostart-status` | report whether silent admin autostart is enabled |
-| `--check-update` | check GitHub releases for available updates (non-destructive) |
-| `--update` | download latest release, verify PE integrity, atomically replace binary, and restart |
-| `--dump` | print what would be tiled and where, without touching any window |
-| `--snap-status` | report whether Windows Snap is enabled (read-only) |
-| `--restore-snap` | enable Windows Snap again and clear the recovery marker (refused while Tilework runs, unless `--force`) |
-| `--filter TEXT` | manage only windows whose title contains `TEXT` (safe testing) |
+| `--version` | Show the executable version |
+| `--dump` | Print eligible windows and proposed bounds without moving them |
+| `--filter TEXT` | Run with management restricted to matching window titles |
+| `--snap-status` | Read the current Windows Snap setting |
+| `--restore-snap` | Enable Windows Snap and clear a recovery marker after Tilework has exited |
+| `--autostart-on`, `--autostart-off`, `--autostart-status` | Manage or inspect the current user's sign-in entry |
+
+Review diagnostic output before sharing it. `--dump` can contain window titles.
 
 ## Build
 
-Requires a recent stable Rust toolchain on Windows (MSVC).
+Use Rust 1.100.0 with the Windows MSVC toolchain. The locked dependency graph is checked in.
 
+```powershell
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked --release
 ```
-cargo build --release     # target\release\tilework.exe
-cargo test
-cargo clippy --all-targets -- -D warnings
-```
 
-## Status and limitations
-
-- The layout logic is covered by unit and property-style tests. The window handling is tested against a simulated platform (windows that refuse a size, drift, rescale or hide). Real desktop behaviour (mixed DPI, pinned windows, Explorer restart, multi-monitor hot-plug) still needs live checks; the list is in [docs/DESIGN.md](docs/DESIGN.md#15-hardening).
-- Windows enforces the minimum size of some apps; no tiling program can shrink them further.
-- Pinned windows (shown on all desktops) can confuse virtual-desktop detection; Tilework then pauses instead of guessing.
-- Planned for 0.3: optional keyboard shortcuts for moving/focusing.
-
-## Contributing
-
-Bug reports and pull requests are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md).
-Security issues: [SECURITY.md](SECURITY.md).
-
-## License
-
-[MIT](LICENSE)
+See the [release runbook](docs/RELEASE.md) for packaging and live tests, [CONTRIBUTING.md](CONTRIBUTING.md) for contributions, and [SECURITY.md](SECURITY.md) for private vulnerability reporting. Tilework uses the [MIT license](LICENSE).

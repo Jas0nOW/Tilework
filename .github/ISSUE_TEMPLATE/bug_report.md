@@ -10,7 +10,7 @@ about: A window is placed wrongly, overlaps, or Tilework does not respond
 **Environment**
 - Windows version:
 - Monitors and scaling (for example 2 x 1920x1080 at 100 %):
-- Running as administrator: yes / no
+- Tilework version and installer or portable build:
 
 **Diagnostics** (check for private data first)
 - Output of `tilework.exe --dump`
