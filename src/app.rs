@@ -30,6 +30,9 @@ const HOTKEY_TOGGLE: i32 = 1;
 const MENU_TOGGLE: usize = 1;
 const MENU_EXIT: usize = 2;
 const MENU_OPEN_CONFIG: usize = 3;
+const MENU_AUTOSTART: usize = 4;
+const MENU_CHECK_UPDATE: usize = 5;
+const MENU_INSTALL_TOGGLE: usize = 6;
 const MENU_FFM_OFF: usize = 10;
 const MENU_FFM_BASE: usize = 20;
 const FFM_PRESETS: [u64; 5] = [150, 300, 500, 800, 1200];
@@ -125,6 +128,7 @@ pub struct App<P: Win = Platform> {
     taskbar_created: u32,
     drag: Option<Drag>,
     overlay: HWND,
+    focus_border: HWND,
     main: HWND,
     filter: Option<String>,
     icon_on: HICON,
@@ -261,6 +265,7 @@ impl<P: Win> App<P> {
             self.shown = 0;
             self.hover = None;
             if let Some(h) = self.bordered.take() { self.set_border(h, COLOR_DEFAULT); }
+            self.hide_focus_border();
             self.sync_snap();
             if was_known { self.update_tray(); }
             if !self.desktop_error_logged { log("current virtual desktop unavailable; tiling suspended"); self.desktop_error_logged = true; }
@@ -356,6 +361,15 @@ impl<P: Win> App<P> {
         let keys: Vec<SurfaceKey> = self.surfaces.keys().copied().filter(|k| dirty.contains(k) || k.desktop == cur).collect();
         for key in keys {
             self.apply(key, force_all);
+        }
+        if let Some(f) = self.focused {
+            if self.surface_containing(f).is_some() && self.desktop_on(cur) {
+                self.show_focus_border(f);
+            } else {
+                self.hide_focus_border();
+            }
+        } else {
+            self.hide_focus_border();
         }
     }
 
@@ -464,6 +478,7 @@ impl<P: Win> App<P> {
         if !self.desktop_on(self.shown) || self.surface_containing(h).is_none() {
             self.focused = None;
             if let Some(prev) = self.bordered.take() { self.set_border(prev, COLOR_DEFAULT); }
+            self.hide_focus_border();
             return;
         }
         self.focused = Some(h);
@@ -471,6 +486,7 @@ impl<P: Win> App<P> {
         if let Some(prev) = self.bordered.take() && prev != h { self.set_border(prev, COLOR_DEFAULT); }
         self.set_border(h, ACCENT);
         self.bordered = Some(h);
+        self.show_focus_border(h);
     }
 
     /// Switches tiling on or off for the desktop that is shown right now.
@@ -491,6 +507,7 @@ impl<P: Win> App<P> {
         if let Some(b) = self.bordered.take() {
             self.set_border(b, COLOR_DEFAULT);
         }
+        self.hide_focus_border();
         self.sync_snap();
         if on {
             self.reconcile(true);
@@ -562,6 +579,7 @@ impl<P: Win> App<P> {
         let v = if move_only { self.surfaces[&key].tree.rect_of(self.surfaces[&key].area, h).unwrap_or(v) } else { v };
         let intent = self.p.resize_intent(h);
         log(&format!("drag start {h:x} class={} rect={}x{}@{},{} intent={intent:?} move_only={move_only}", self.p.class_name(h), v.w, v.h, v.x, v.y));
+        self.hide_focus_border();
         self.drag = Some(Drag { hwnd: h, key, start: v, resize: false, move_only, intent, dpi: self.p.dpi(h), monitor_changed: false, released_since: None, target: None, last: None });
         set_timer(self.main, TIMER_DRAG, 30);
     }
@@ -686,6 +704,9 @@ impl<P: Win> App<P> {
         if key != home {
             self.apply(key, true);
         }
+        if let Some(f) = self.focused {
+            self.show_focus_border(f);
+        }
     }
 
     // ---------- focus follows mouse ----------
@@ -794,6 +815,29 @@ impl<P: Win> App<P> {
         }
     }
 
+    fn show_focus_border(&self, h: Hwnd) {
+        if self.focus_border.is_invalid() { return; }
+        let Some(r) = self.p.visible_rect(h) else {
+            self.hide_focus_border();
+            return;
+        };
+        if r.w <= 0 || r.h <= 0 {
+            self.hide_focus_border();
+            return;
+        }
+        unsafe {
+            let _ = SetWindowPos(self.focus_border, Some(HWND_TOPMOST), r.x, r.y, r.w, r.h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            let _ = InvalidateRect(Some(self.focus_border), None, true);
+        }
+    }
+
+    fn hide_focus_border(&self) {
+        if self.focus_border.is_invalid() { return; }
+        unsafe {
+            let _ = ShowWindow(self.focus_border, SW_HIDE);
+        }
+    }
+
     fn tray_data(&self) -> NOTIFYICONDATAW {
         let mut nid = NOTIFYICONDATAW { cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32, hWnd: self.main, uID: 1, uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP, uCallbackMessage: WM_TRAY, ..Default::default() };
         let on = self.shown != 0 && self.desktop_on(self.shown);
@@ -820,6 +864,113 @@ impl<P: Win> App<P> {
         unsafe {
             match cmd {
                 MENU_TOGGLE => app.toggle(),
+                MENU_AUTOSTART => {
+                    if crate::setup::is_autostart_enabled() {
+                        if let Err(e) = crate::setup::disable_autostart() {
+                            log(&format!("could not disable autostart: {e}"));
+                        } else {
+                            log("autostart disabled");
+                        }
+                    } else if let Ok(exe) = std::env::current_exe() {
+                        if let Err(e) = crate::setup::enable_autostart(&exe) {
+                            log(&format!("could not enable autostart: {e}"));
+                        } else {
+                            log("autostart enabled with highest privileges");
+                        }
+                    }
+                }
+                MENU_INSTALL_TOGGLE => {
+                    if crate::setup::is_running_installed() {
+                        let msg = wide("Are you sure you want to uninstall Tilework?\n\nThis will remove autostart, the Start Menu shortcut, and the installed files.");
+                        let title = wide("Uninstall Tilework");
+                        let res = MessageBoxW(None, PCWSTR(msg.as_ptr()), PCWSTR(title.as_ptr()), MB_YESNO | MB_ICONQUESTION);
+                        if res == IDYES {
+                            if let Err(e) = crate::setup::uninstall() {
+                                let err_msg = wide(&format!("Failed to uninstall: {e}"));
+                                MessageBoxW(None, PCWSTR(err_msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
+                            } else {
+                                let ok_msg = wide("Tilework has been uninstalled. The app will now exit.");
+                                MessageBoxW(None, PCWSTR(ok_msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
+                                PostQuitMessage(0);
+                            }
+                        }
+                    } else {
+                        match crate::setup::install() {
+                            Ok(()) => {
+                                let ok_msg = wide("Tilework was successfully installed to %LOCALAPPDATA%\\Tilework with silent admin autostart and Start Menu shortcut!");
+                                let title = wide("Install Tilework");
+                                MessageBoxW(None, PCWSTR(ok_msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
+                            }
+                            Err(e) => {
+                                let err_msg = wide(&format!("Installation failed: {e}"));
+                                let title = wide("Install Tilework Error");
+                                MessageBoxW(None, PCWSTR(err_msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
+                            }
+                        }
+                    }
+                }
+                MENU_CHECK_UPDATE => {
+                    std::thread::spawn(move || {
+                        let status = crate::setup::check_for_update();
+                        match status {
+                            crate::setup::UpdateStatus::Available(rel) => {
+                                let msg = wide(&format!(
+                                    "A new version of Tilework is available: {}\n\nRelease notes:\n{}\n\nDo you want to download and install this update now?",
+                                    rel.tag,
+                                    rel.release_notes.chars().take(400).collect::<String>()
+                                ));
+                                let title = wide("Tilework Update Available");
+                                let res = MessageBoxW(
+                                    None,
+                                    PCWSTR(msg.as_ptr()),
+                                    PCWSTR(title.as_ptr()),
+                                    MB_YESNO | MB_ICONINFORMATION | MB_TOPMOST,
+                                );
+                                if res == IDYES {
+                                    let temp_path = std::env::temp_dir().join("tilework_update.exe");
+                                    if let Err(e) = crate::setup::download_and_verify(&rel.download_url, &temp_path) {
+                                        let err_msg = wide(&format!("Failed to download update:\n{e}"));
+                                        let err_title = wide("Tilework Update Error");
+                                        MessageBoxW(None, PCWSTR(err_msg.as_ptr()), PCWSTR(err_title.as_ptr()), MB_OK | MB_ICONERROR);
+                                        return;
+                                    }
+                                    let current_exe = match std::env::current_exe() {
+                                        Ok(e) => e,
+                                        Err(e) => {
+                                            let err_msg = wide(&format!("Could not locate current binary:\n{e}"));
+                                            MessageBoxW(None, PCWSTR(err_msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
+                                            return;
+                                        }
+                                    };
+                                    if let Err(e) = crate::setup::apply_update(&current_exe, &temp_path) {
+                                        let err_msg = wide(&format!("Failed to apply update:\n{e}"));
+                                        MessageBoxW(None, PCWSTR(err_msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
+                                        return;
+                                    }
+                                    let success_msg = wide("Tilework was updated successfully! The application will restart now.");
+                                    MessageBoxW(None, PCWSTR(success_msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
+                                    let _ = std::process::Command::new(&current_exe).spawn();
+                                    std::process::exit(0);
+                                }
+                            }
+                            crate::setup::UpdateStatus::UpToDate(tag) => {
+                                let msg = wide(&format!("Tilework is up to date ({tag})."));
+                                let title = wide("Tilework Update");
+                                MessageBoxW(None, PCWSTR(msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
+                            }
+                            crate::setup::UpdateStatus::NoReleaseFound => {
+                                let msg = wide("No releases found on GitHub yet.");
+                                let title = wide("Tilework Update");
+                                MessageBoxW(None, PCWSTR(msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
+                            }
+                            crate::setup::UpdateStatus::Error(e) => {
+                                let msg = wide(&format!("Could not check for updates:\n{e}"));
+                                let title = wide("Tilework Update Error");
+                                MessageBoxW(None, PCWSTR(msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONWARNING);
+                            }
+                        }
+                    });
+                }
                 MENU_OPEN_CONFIG => {
                     app.cfg.ensure_exists();
                     return Config::path();
@@ -848,6 +999,7 @@ impl<P: Win> App<P> {
         if let Some(b) = self.bordered.take() {
             self.set_border(b, COLOR_DEFAULT);
         }
+        self.hide_focus_border();
         notify(NIM_DELETE, &self.tray_data());
         log("exit");
     }
@@ -910,6 +1062,25 @@ unsafe fn build_and_track_menu(cfg: &Config, main: HWND, on: bool) -> usize {
                 let _ = DestroyMenu(focus_menu);
                 log(&format!("could not append tray menu item: {e}"));
             }
+
+            let autostart_on = crate::setup::is_autostart_enabled();
+            if let Err(e) = AppendMenuW(menu, check(autostart_on), MENU_AUTOSTART, w!("Start with Windows (Admin)")) {
+                log(&format!("could not append tray menu item: {e}"));
+            }
+
+            if let Err(e) = AppendMenuW(menu, MF_STRING, MENU_CHECK_UPDATE, w!("Check for updates...")) {
+                log(&format!("could not append tray menu item: {e}"));
+            }
+
+            let install_label = if crate::setup::is_running_installed() {
+                w!("Uninstall Tilework")
+            } else {
+                w!("Install Tilework")
+            };
+            if let Err(e) = AppendMenuW(menu, MF_STRING, MENU_INSTALL_TOGGLE, install_label) {
+                log(&format!("could not append tray menu item: {e}"));
+            }
+
             if let Err(e) = AppendMenuW(menu, MF_STRING, MENU_OPEN_CONFIG, w!("Open settings file")) { log(&format!("could not append tray menu item: {e}")); }
             if let Err(e) = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) { log(&format!("could not append tray menu item: {e}")); }
             if let Err(e) = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Exit Tilework")) { log(&format!("could not append tray menu item: {e}")); }
@@ -978,6 +1149,41 @@ fn paint_overlay(hwnd: HWND) {
         for b in [key, fill, grey, white] {
             let _ = DeleteObject(b.into());
         }
+        let _ = EndPaint(hwnd, &ps);
+    }
+}
+
+unsafe extern "system" fn focus_border_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    callback_guard(|| match msg {
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => {
+            paint_focus_border(hwnd);
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    })
+}
+
+fn paint_focus_border(hwnd: HWND) {
+    unsafe {
+        let mut ps = PAINTSTRUCT::default();
+        let hdc = BeginPaint(hwnd, &mut ps);
+        let mut rc = RECT::default();
+        let _ = GetClientRect(hwnd, &mut rc);
+        let key = CreateSolidBrush(COLORREF(0x00FF00FF));
+        let accent = CreateSolidBrush(COLORREF(ACCENT));
+        FillRect(hdc, &rc, key);
+        let t = 3;
+        for strip in [
+            RECT { left: 0, top: 0, right: rc.right, bottom: t },
+            RECT { left: 0, top: rc.bottom - t, right: rc.right, bottom: rc.bottom },
+            RECT { left: 0, top: 0, right: t, bottom: rc.bottom },
+            RECT { left: rc.right - t, top: 0, right: rc.right, bottom: rc.bottom },
+        ] {
+            FillRect(hdc, &strip, accent);
+        }
+        let _ = DeleteObject(key.into());
+        let _ = DeleteObject(accent.into());
         let _ = EndPaint(hwnd, &ps);
     }
 }
@@ -1098,6 +1304,25 @@ pub fn run(filter: Option<String>) {
         .unwrap();
         let _ = SetLayeredWindowAttributes(overlay, COLORREF(0x00FF00FF), 200, LWA_COLORKEY | LWA_ALPHA);
 
+        let class_focus = w!("TileworkFocusBorder");
+        RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(focus_border_proc), hInstance: hinst.into(), lpszClassName: class_focus, ..Default::default() });
+        let focus_border = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            class_focus,
+            PCWSTR::null(),
+            WS_POPUP,
+            0,
+            0,
+            10,
+            10,
+            None,
+            None,
+            Some(hinst.into()),
+            None,
+        )
+        .unwrap();
+        let _ = SetLayeredWindowAttributes(focus_border, COLORREF(0x00FF00FF), 0, LWA_COLORKEY);
+
         let platform = Platform::new();
         let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
         if taskbar_created == 0 { log("could not register TaskbarCreated message"); }
@@ -1125,6 +1350,7 @@ pub fn run(filter: Option<String>) {
             taskbar_created,
             drag: None,
             overlay,
+            focus_border,
             main,
             filter,
             icon_on: make_icon(true),
@@ -1524,7 +1750,7 @@ mod scenarios {
         let p = FakeWin { windows: RefCell::new(windows), area: Cell::new(area), desktop: Cell::new(1), desktop_queries: Cell::new(0), requests: RefCell::new(Vec::new()), cursor: Cell::new((0, 0)) };
         let (drag, surfaces, _) = super::tests::drag_fixture();
         let key = drag.key;
-        (App { p, disabled: HashSet::new(), cfg: Config::default(), hover: None, hover_attempted: None, hover_foreground: None, hover_attempt_position: None, ghost_seen: HashSet::new(), reserved: HashSet::new(), shown: 1, desktop_error_logged: false, dispatch_desktop: Cell::new(None), dispatching: false, mins: HashMap::new(), placed: HashMap::new(), floating: HashSet::new(), surfaces, focused: None, last_tracked_focus: None, bordered: None, border_original: HashMap::new(), taskbar_created: 0, drag: None, overlay: HWND::default(), main: HWND::default(), filter: None, icon_on: HICON::default(), icon_off: HICON::default() }, key)
+        (App { p, disabled: HashSet::new(), cfg: Config::default(), hover: None, hover_attempted: None, hover_foreground: None, hover_attempt_position: None, ghost_seen: HashSet::new(), reserved: HashSet::new(), shown: 1, desktop_error_logged: false, dispatch_desktop: Cell::new(None), dispatching: false, mins: HashMap::new(), placed: HashMap::new(), floating: HashSet::new(), surfaces, focused: None, last_tracked_focus: None, bordered: None, border_original: HashMap::new(), taskbar_created: 0, drag: None, overlay: HWND::default(), focus_border: HWND::default(), main: HWND::default(), filter: None, icon_on: HICON::default(), icon_off: HICON::default() }, key)
     }
     fn poll(app: &mut App<FakeWin>, key: SurfaceKey) {
         for p in app.placed.values_mut() { p.requested = Instant::now() - Duration::from_secs(1); }

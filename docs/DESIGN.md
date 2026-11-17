@@ -27,36 +27,31 @@ optional addition **(planned)**.
 
 ## 2. Core concepts
 
-**Surface** – one virtual desktop on one monitor. Every surface has its own layout. Surfaces never
+**Surface** â€“ one virtual desktop on one monitor. Every surface has its own layout. Surfaces never
 influence each other; moving a window to another monitor or desktop moves it to that surface's
 layout.
 
-**Zone tree** – the layout of a surface. The tree is made of containers and windows:
+**Zone tree** â€“ the layout of a surface. The tree is made of containers and windows:
 
-- a *container* holds 2–4 zones side by side (horizontal) or stacked (vertical);
+- a *container* holds 2â€“4 zones side by side (horizontal) or stacked (vertical);
 - a *zone* is either a window or another container;
 - each zone has a weight; zones stay equal until the user resizes one.
 
 Invariants (checked by tests): no container has fewer than 2 or more than 4 zones, a zone is never
 empty, the zones always cover the surface completely without gaps or overlaps.
 
-**Work area** – the monitor without the taskbar. Windows are placed so that their *visible* edges
+**Work area** â€“ the monitor without the taskbar. Windows are placed so that their *visible* edges
 match the zone (the invisible resize borders of Windows 10/11 are compensated).
 
 ## 3. Automatic placement
 
-A new window is placed without questions:
+New windows are placed cleanly and predictably according to the confirmed V3 layout progression:
 
-1. It becomes a new **full-length column** next to the focused window's column, until the surface
-   has 4 columns.
-2. After that, columns are split in two (at most **2 windows per column** by default), starting at
-   the focused window's column.
-3. Existing containers with a free slot are used next (up to **4 zones per container**), before
-   creating deeper splits. Second rows take precedence over these denser slots.
-4. Only when every existing container is full may automatic placement split another leaf. It
-   checks all such fallback candidates and takes the one with the fewest minimum-size violations.
-   Earlier placement choices also account for minima; a window is never left out of the layout
-   (except full-screen windows, see 8).
+1. The **first two windows** share the work area as two full-length main columns (halves).
+2. The **3rd and 4th windows** are split vertically inside these existing columns, creating a balanced 2×2 grid.
+3. Only with the **5th window** is a 3rd full-length column automatically created. A 6th window splits that 3rd column vertically, etc.
+4. **Manual precedence:** If the user manually creates a column (e.g. by dragging a window to the outer screen edge) or rearranges zones, manual layout decisions take precedence over the automatic default. New windows prioritize filling available slots in open columns before generating additional main columns.
+5. If every existing container is full (up to 4 zones per container, bounded nesting depth), automatic placement chooses the slot or leaf that minimizes minimum-size violations. Earlier placement choices also account for minima; a window is never left out of the layout (except full-screen windows, see 8).
 
 Closing or moving a window to another desktop removes it; its neighbours grow into the
 space. Restoring it places it like a new window.
@@ -72,12 +67,12 @@ Drop targets, by cursor position over the window below:
 | Cursor on … | Result |
 |---|---|
 | centre of a window (28–72 %) | swap the two windows |
-| edge band of a window | split **that window only** on that side; every other window keeps its place |
-| outer 36 px of the screen | new full-length zone along that screen edge |
+| edge band of a window | split **that window only** nested on that side; every other window keeps its place |
+| outer 36 px of the screen | new full-length zone along that screen edge (takes precedence) |
 | empty monitor | the window fills it |
 | no valid target / would squeeze a window too small | nothing; the window snaps back |
 
-If the target container is already full (4 zones), the drop splits only the target's zone.
+Nested splits work within already divided zones. The tree maintains a bounded hierarchy (maximum nesting depth ≤ 5, container child limit ≤ 4) to ensure flexible yet stable and manageable layouts.
 Dropping onto another monitor inserts the window into that monitor's layout. A centre drop across
 monitors inserts below the target (trees cannot swap directly). Both source and destination layouts
 are previewed. The outer 36 px are measured from the work-area edge, excluding the taskbar.
@@ -92,10 +87,10 @@ added or removed; there is an "equalise" operation in the tree **(UI planned)**.
 
 ## 6. Minimum sizes
 
-Some apps refuse to get small (Chrome ≈ 502 px wide, Discord ≈ 802×501, ChatGPT ≈ 480×600). The
+Some apps refuse to get small (Chrome â‰ˆ 502 px wide, Discord â‰ˆ 802Ã—501, ChatGPT â‰ˆ 480Ã—600). The
 program does not fight them:
 
-- Every zone has a global floor (default 260×160 px, configurable) so that part of the title bar
+- Every zone has a global floor (default 260Ã—160 px, configurable) so that part of the title bar
   always stays grabbable.
 - Placement requests are asynchronous and skip hung and minimized windows. A displaced window is
   placed again with bounded retries and backoff. A larger result is considered a possible refusal
@@ -156,15 +151,23 @@ All five common mouse buttons suppress hover focus. A harmless zero-movement inp
 foreground request without joining input queues. Windows can still decline it; a failure is not
 retried until the cursor moves to another window.
 
+## 10a. Focus border accent overlay
+
+Windows 10/11 apps (especially borderless, Electron, Terminal, and modern custom-rendered windows) frequently ignore DWM window border attributes. To guarantee a clear, unmistakable focus indicator, Tilework creates a dedicated topmost layered click-through overlay window (`TileworkFocusBorder`). It paints a clean 3 px accent frame (`ACCENT = 0x00FF823C`) around the active tiled window without stealing focus, intercepting clicks, or causing flicker.
+
 ## 11. Architecture
 
 ```
-main.rs      early DPI, single instance, arguments (--dump, --filter, --snap-status, --restore-snap)
+main.rs      early DPI, single instance, CLI actions (--install, --uninstall, --autostart-on/off/status,
+             --check-update, --update, --dump, --filter, --snap-status, --restore-snap)
+setup.rs     installer (%LOCALAPPDATA%\Tilework), Start Menu shortcut, scheduled task autostart
+             (highest privileges without UAC prompt at logon), and robust GitHub self-updater
 config.rs    key=value settings file (%LOCALAPPDATA%\<name>\config.ini), tolerant parser
-tree.rs      pure logic, no Windows calls: zone tree, placement policy, drop zones,
-             minimum-aware layout, previews. Covered by unit and invariant tests; Win32 integration needs desktop checks.
+tree.rs      pure logic, no Windows calls: zone tree, placement policy (V3 progression), drop zones,
+             nested splitting, bounded depth, minimum-aware layout, previews
 platform.rs  thin Windows layer: window/monitor/virtual-desktop queries, placement, Snap control
-app.rs       event loop: WinEvent hooks -> debounced reconcile -> apply; drag overlay; tray;
+app.rs       event loop: WinEvent hooks -> debounced reconcile -> apply; drag preview overlay;
+             focus border accent overlay; tray menu (autostart, updates, install/uninstall);
              hotkey; focus follows mouse
 ```
 
@@ -177,6 +180,9 @@ Key design decisions:
   dependencies; the previews are computed with exactly the same code as real moves.
 - **Fail safe.** The program only ever moves and resizes windows; it never closes, hides or
   changes them. Settings it changes (Snap, window border colour) are session-only or restored.
+- **Robust self-updater.** Downloads latest release from GitHub, validates PE executable headers
+  before touching files, uses Windows atomic rename semantics with rollback protection, and
+  cleans up old binaries on startup.
 - **No dependencies** except the official `windows` crate.
 
 The tray icon is re-added after Explorer restarts. A named process mutex prevents a second manager.
@@ -203,19 +209,20 @@ Tray menu and `config.ini`:
 
 ## 13. Roadmap
 
-Near term (before a public 0.2):
+Completed in 0.2.0:
 
-- live verification of the hardening changes (see section 15), especially desktop and Snap paths
-- autostart as administrator without a UAC prompt (scheduled task) and a clean uninstall
-- the thin colour frame around the focused window as a real 4 px overlay
-- persisted learned minimum sizes; per-app overrides and an ignore list
+- V3 layout engine: 2 full columns -> 2x2 vertical splits -> 5th window 3rd column; manual precedence.
+- Nested window splitting, outer edge full-length zones, center window swap, bounded depth (≤ 5).
+- Dedicated 3 px focus border accent frame overlay for active tiled windows.
+- One-click installer (`--install`, Start Menu shortcut, uninstaller `--uninstall`).
+- Silent admin autostart via Windows Task Scheduler (`schtasks` with highest privileges, no UAC prompt on logon).
+- Robust self-updater with PE validation, atomic rollback, CLI (`--check-update`, `--update`) and tray integration.
 
 Later:
 
-- keyboard shortcuts (focus/move/resize/toggle) for those who want them
+- keyboard shortcuts (focus/move/resize/toggle) for those who want them (planned for 0.3)
 - a settings window instead of the tray submenu and the text file
-- more live multi-monitor coverage (hot-plug and DPI changes); the platform test seam covers simulated geometry changes
-- installer / winget package, signed releases
+- more live multi-monitor coverage (hot-plug and DPI changes)
 - optional stacking/tabbed zones
 
 ## 14. Open source plan
@@ -244,7 +251,7 @@ on a paused desktop. Use isolated test windows with `--filter`.
 
 ### Audit outcome and remaining boundary
 
-F1�F6 and F8�F14 are implemented with offline regression coverage where feasible. The `Win`
+F1–F6 and F8–F14 are implemented with offline regression coverage where feasible. The `Win`
 interface drives the real apply/reconcile/drag logic against simulated refusal, drift, DPI
 rescaling, self-resizing, minimize/restore and full-screen style loss. Each message dispatch
 uses one desktop snapshot; window desktop fallback reuses that evidence during enumeration.

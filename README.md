@@ -13,11 +13,14 @@ Written in Rust. The only dependency is the official [`windows`](https://crates.
 
 ## Features
 
-- **Automatic placement.** New windows become new columns (up to 4), then second rows, then free slots in a container; deeper splits only happen when you drag.
+- **Automatic placement.** First two windows form two full columns (halves), 3rd and 4th windows split vertically inside these columns (2x2 grid), and the 5th window creates a 3rd full column automatically. Manual screen edge drops take precedence and create through zones.
 - **Zones.** Every area holds up to 4 zones side by side or stacked, and every zone can be split again. Dragging a divider resizes whole zones.
 - **Drag & drop with a live preview** of the complete resulting layout:
-  centre of a window = swap, edge of a window = split only that window, screen edge = new full-length zone.
+  centre of a window = swap, edge of a window = split only that window nested, screen edge = new full-length through zone.
+- **Active focus border overlay.** A crisp 3 px accent frame overlay surrounds the focused tiled window across all apps without stealing focus or intercepting clicks.
 - **Per virtual desktop and monitor.** Every desktop/monitor has its own layout. Tiling can be switched on or off per desktop (tray icon click or `Win + Y`); manual layouts survive switching off and on.
+- **Integrated installer & autostart.** Install in one click to `%LOCALAPPDATA%\Tilework` with Start Menu shortcut and silent admin autostart via Windows Task Scheduler (no UAC prompt on logon).
+- **Production-ready self-updater.** Automatic or manual update checks directly from GitHub releases with PE binary verification, atomic swap with rollback, and startup cleanup.
 - **Respects minimum sizes.** Apps that refuse to get small (Chrome, Discord, ...) get a zone of exactly the size they need instead of overlapping their neighbours.
 - **Leaves full screen alone.** A tiled window that you maximise or put into full screen (F11, video, game) is not pulled back; its tile stays reserved and it returns when you restore it, also across minimise/restore and `Win + D`.
 - **Windows Snap is switched off while tiling is active** (session only, nothing is written to the registry) and restored on exit. A recovery marker restores it after a crash.
@@ -28,16 +31,27 @@ How it is meant to behave in detail: [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Install
 
-There is no installer yet.
+Tilework can run portably or be installed with a single click:
 
-1. Build it (see below) or take `tilework.exe` from a release.
-2. Copy it anywhere (for example `%LOCALAPPDATA%\Tilework\tilework.exe`) and start it. A tray icon appears.
-3. Run it **as administrator** if you also want to tile elevated windows (admin terminals, etc.).
+### Quick Install (GUI)
+1. Download `tilework.exe` from the latest release and run it.
+2. Right-click the tray icon and select **Install Tilework**.
+3. It installs to `%LOCALAPPDATA%\Tilework\tilework.exe`, creates a Start Menu shortcut, and registers silent administrator autostart via Windows Task Scheduler (no UAC prompt on logon).
 
-Autostart is not built in yet. Until then, add a shortcut to `shell:startup`, or create a scheduled task
-with "run with highest privileges" for an elevated start without a UAC prompt.
+### Command Line Install
+```powershell
+tilework.exe --install
+```
 
-To remove it: exit via the tray menu, then delete the exe and `%LOCALAPPDATA%\Tilework`.
+### Uninstallation
+Right-click the tray icon and select **Uninstall Tilework**, or run:
+```powershell
+tilework.exe --uninstall
+```
+
+### Self-Updater
+- **Via Tray:** Right-click tray icon -> **Check for updates...**
+- **Via CLI:** `tilework.exe --check-update` or `tilework.exe --update`
 
 ## Usage
 
@@ -65,6 +79,13 @@ If you used the former name *CosmicTile*, your settings are migrated on the firs
 
 | Argument | Effect |
 |---|---|
+| `--install` | install Tilework to `%LOCALAPPDATA%\Tilework`, create Start Menu shortcut & autostart task |
+| `--uninstall` | clean uninstall: remove autostart task, Start Menu shortcut, and installed executable |
+| `--autostart-on` | enable scheduled task autostart with highest privileges (no UAC prompt on logon) |
+| `--autostart-off` | disable scheduled task autostart |
+| `--autostart-status` | report whether silent admin autostart is enabled |
+| `--check-update` | check GitHub releases for available updates (non-destructive) |
+| `--update` | download latest release, verify PE integrity, atomically replace binary, and restart |
 | `--dump` | print what would be tiled and where, without touching any window |
 | `--snap-status` | report whether Windows Snap is enabled (read-only) |
 | `--restore-snap` | enable Windows Snap again and clear the recovery marker (refused while Tilework runs, unless `--force`) |
@@ -85,7 +106,7 @@ cargo clippy --all-targets -- -D warnings
 - The layout logic is covered by unit and property-style tests. The window handling is tested against a simulated platform (windows that refuse a size, drift, rescale or hide). Real desktop behaviour (mixed DPI, pinned windows, Explorer restart, multi-monitor hot-plug) still needs live checks; the list is in [docs/DESIGN.md](docs/DESIGN.md#15-hardening).
 - Windows enforces the minimum size of some apps; no tiling program can shrink them further.
 - Pinned windows (shown on all desktops) can confuse virtual-desktop detection; Tilework then pauses instead of guessing.
-- Not implemented yet: autostart, keyboard shortcuts for moving/focusing, an installer.
+- Planned for 0.3: optional keyboard shortcuts for moving/focusing.
 
 ## Contributing
 

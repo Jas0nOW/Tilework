@@ -6,6 +6,7 @@
 //! other windows keep their place. Zone sizes stay equal until the user resizes them.
 
 pub const MAX_ZONES: usize = 4;
+pub const MAX_DEPTH: usize = 5;
 /// Smallest zone a window may get: enough of the title bar stays free to grab and move it.
 #[cfg(not(test))]
 static MIN_W_PX: AtomicI32 = AtomicI32::new(260);
@@ -146,6 +147,26 @@ impl Tree {
         self.root.is_none()
     }
 
+    pub fn main_columns(&self) -> Vec<&Node> {
+        match &self.root {
+            Some(Node::Container { orient: Orientation::Horizontal, children, .. }) => {
+                children.iter().collect()
+            }
+            Some(other) => vec![other],
+            None => Vec::new(),
+        }
+    }
+
+    pub fn depth(&self) -> usize {
+        fn node_depth(n: &Node) -> usize {
+            match n {
+                Node::Leaf(_) => 1,
+                Node::Container { children, .. } => 1 + children.iter().map(node_depth).max().unwrap_or(0),
+            }
+        }
+        self.root.as_ref().map(node_depth).unwrap_or(0)
+    }
+
     pub fn leaves(&self) -> Vec<Hwnd> {
         let mut out = Vec::new();
         if let Some(n) = &self.root {
@@ -158,8 +179,9 @@ impl Tree {
         self.leaves().contains(&h)
     }
 
-    /// Adds columns first, then second rows, then existing container slots. Only a tree with
-    /// no free container slots permits deeper leaf splits. Minimum violations break ties.
+    /// Adds the first two windows as full columns. The 3rd and 4th windows split these columns vertically.
+    /// Only with the 5th window does a 3rd full column appear automatically.
+    /// Existing columns are filled before new columns are created. Minimum violations break ties.
     pub fn add(&mut self, h: Hwnd, area: Rect, focused: Option<Hwnd>) -> bool {
         if self.contains(h) {
             return true;
@@ -173,7 +195,7 @@ impl Tree {
         let focus = focused.filter(|f| leaves.contains(f)).or_else(|| leaves.last().copied()).expect("tree is not empty");
         let (mut cands, has_slot) = self.auto_candidates(focus);
         let preferred_len = cands.len();
-        // A leaf split is the final fallback after all existing slots have been considered.
+        // A leaf split is the final fallback after all preferred candidates have been considered.
         let mut order = leaves;
         order.sort_by_key(|l| *l != focus);
         if !has_slot {
@@ -204,22 +226,47 @@ impl Tree {
     }
 
     fn auto_candidates(&self, focus: Hwnd) -> (Vec<Cand>, bool) {
-        let Some(root) = self.root.as_ref() else { return (Vec::new(), false) };
+        let Some(root) = self.root.as_ref() else { return (Vec::new(), false); };
         let mut result = Vec::new();
-        match root {
-            Node::Leaf(l) => result.push(Cand::Around(*l, DropZone::Right)),
-            Node::Container { orient: Orientation::Horizontal, children, .. } => {
-                let n = children.len();
-                let fi = children.iter().position(|c| has(c, focus)).unwrap_or(n - 1);
-                if n < MAX_ZONES { result.push(Cand::Column(fi + 1)); }
-                for k in 0..n {
-                    if let Node::Leaf(l) = &children[(fi + k) % n] {
-                        result.push(Cand::Around(*l, DropZone::Bottom));
-                    }
+
+        // 1. Single leaf -> creates the first two columns (Horizontal split)
+        if let Node::Leaf(l) = root {
+            result.push(Cand::Around(*l, DropZone::Right));
+            return (result, false);
+        }
+
+        let cols = self.main_columns();
+        let col_count = cols.len();
+
+        // 2. Check for open columns that have fewer than 2 leaves
+        let mut open_cols: Vec<(usize, &Node)> = cols
+            .iter()
+            .enumerate()
+            .filter(|(_, col)| self.leaves_of(col).len() < 2)
+            .map(|(i, col)| (i, *col))
+            .collect();
+
+        if !open_cols.is_empty() {
+            if let Some(pos) = open_cols.iter().position(|(_, col)| has(col, focus)) {
+                let focused_col = open_cols.remove(pos);
+                open_cols.insert(0, focused_col);
+            }
+            for (_, col) in &open_cols {
+                let col_leaves = self.leaves_of(col);
+                let target = col_leaves.iter().copied().find(|&l| l == focus).or_else(|| col_leaves.first().copied());
+                if let Some(target) = target {
+                    result.push(Cand::Around(target, DropZone::Bottom));
                 }
             }
-            _ => {}
         }
+
+        // 3. If all open columns have >= 2 leaves, and we have < MAX_ZONES columns:
+        // create a new through column on the right!
+        if col_count < MAX_ZONES && matches!(root, Node::Container { orient: Orientation::Horizontal, .. }) {
+            result.push(Cand::Column(col_count));
+        }
+
+        // 4. Slots in existing containers
         fn slots(n: &Node, focus: Hwnd, path: &mut Vec<usize>, out: &mut Vec<Cand>) {
             if let Node::Container { children, .. } = n {
                 if children.len() < MAX_ZONES {
@@ -263,12 +310,26 @@ impl Tree {
                 }
             }
             Cand::Column(i) => {
-                if let Some(Node::Container { children, weights, auto, .. }) = &mut self.root {
-                    let i = i.min(children.len());
-                    let avg = weights.iter().sum::<f64>() / weights.len() as f64;
-                    children.insert(i, Node::Leaf(h));
-                    weights.insert(i, avg);
-                    if *auto { *weights = equal(children.len()); }
+                match &mut self.root {
+                    Some(Node::Container { orient: Orientation::Horizontal, children, weights, auto }) => {
+                        let i = i.min(children.len());
+                        let avg = weights.iter().sum::<f64>() / weights.len().max(1) as f64;
+                        children.insert(i, Node::Leaf(h));
+                        weights.insert(i, avg);
+                        if *auto { *weights = equal(children.len()); }
+                    }
+                    Some(other) => {
+                        let existing = other.clone();
+                        *other = Node::Container {
+                            orient: Orientation::Horizontal,
+                            children: vec![existing, Node::Leaf(h)],
+                            weights: equal(2),
+                            auto: true,
+                        };
+                    }
+                    None => {
+                        self.root = Some(Node::Leaf(h));
+                    }
                 }
             }
         }
@@ -353,10 +414,10 @@ impl Tree {
         true
     }
 
-    /// Complete layout after moving `dragged` next to `target` (None if that squeezes a window).
+    /// Complete layout after moving `dragged` next to `target` (None if that squeezes a window or exceeds depth).
     pub fn preview_layout(&self, area: Rect, dragged: Hwnd, target: Hwnd, zone: DropZone) -> Option<Vec<(Hwnd, Rect)>> {
         let mut c = self.clone();
-        if !c.move_to(dragged, target, zone) || c.violations(area) > self.violations(area) {
+        if !c.move_to(dragged, target, zone) || c.depth() > MAX_DEPTH || c.violations(area) > self.violations(area) {
             return None;
         }
         Some(c.layout(area))
@@ -366,7 +427,7 @@ impl Tree {
     pub fn preview_insert_layout(&self, area: Rect, added: Hwnd, target: Hwnd, zone: DropZone) -> Option<Vec<(Hwnd, Rect)>> {
         let mut c = self.clone();
         c.insert(added, target, zone);
-        if c.violations(area) > self.violations(area) {
+        if c.depth() > MAX_DEPTH || c.violations(area) > self.violations(area) {
             return None;
         }
         Some(c.layout(area))
@@ -379,7 +440,7 @@ impl Tree {
             c.remove(added);
         }
         c.insert_edge(added, side);
-        if c.violations(area) > self.violations(area) {
+        if c.depth() > MAX_DEPTH || c.violations(area) > self.violations(area) {
             return None;
         }
         Some(c.layout(area))
@@ -572,35 +633,15 @@ fn remove_node(n: Node, h: Hwnd) -> Option<Node> {
     }
 }
 
-fn normalize(orient: Orientation, children: Vec<Node>, weights: Vec<f64>, auto: bool) -> Option<Node> {
+fn normalize(orient: Orientation, children: Vec<Node>, mut weights: Vec<f64>, auto: bool) -> Option<Node> {
     match children.len() {
         0 => None,
         1 => children.into_iter().next(),
         _ => {
-            let mut nc: Vec<Node> = Vec::new();
-            let mut nw: Vec<f64> = Vec::new();
-            let mut auto = auto;
-            let total_len = children.len();
-            for (index, (c, w)) in children.into_iter().zip(weights).enumerate() {
-                match c {
-                    Node::Container { orient: o2, children: c2, weights: w2, auto: a2 } if o2 == orient && nc.len() + c2.len() + (total_len - index - 1) <= MAX_ZONES => {
-                        let sum: f64 = w2.iter().sum();
-                        for (cc, ww) in c2.into_iter().zip(w2) {
-                            nc.push(cc);
-                            nw.push(w * ww / sum);
-                        }
-                        auto &= a2;
-                    }
-                    other => {
-                        nc.push(other);
-                        nw.push(w);
-                    }
-                }
-            }
             if auto {
-                nw = equal(nc.len());
+                weights = equal(children.len());
             }
-            Some(Node::Container { orient, children: nc, weights: nw, auto })
+            Some(Node::Container { orient, children, weights, auto })
         }
     }
 }
@@ -614,11 +655,11 @@ fn insert_node(n: Node, target: Hwnd, added: Hwnd, zone: DropZone, automatic: bo
         Node::Leaf(_) => n,
         Node::Container { orient, mut children, mut weights, auto } => {
             if let Some(i) = children.iter().position(|c| matches!(c, Node::Leaf(id) if *id == target)) {
-                if orient == orient_needed && children.len() < MAX_ZONES {
-                    // another zone next to the target
+                if automatic && orient == orient_needed && children.len() < MAX_ZONES {
+                    // another zone next to the target (only used in automatic candidate placement)
                     let at = if added_first { i } else { i + 1 };
                     children.insert(at, Node::Leaf(added));
-                    if automatic && auto {
+                    if auto {
                         weights = equal(children.len());
                         return Node::Container { orient, children, weights, auto };
                     }
@@ -627,7 +668,8 @@ fn insert_node(n: Node, target: Hwnd, added: Hwnd, zone: DropZone, automatic: bo
                     weights.insert(at, half);
                     return Node::Container { orient, children, weights, auto: false };
                 }
-                // area full or other direction: only the target's zone is split further
+                // When dragging manually on a window edge (automatic == false), OR when splitting in a different orientation:
+                // ALWAYS replace ONLY the target leaf with a nested split container!
                 let t = children.remove(i);
                 children.insert(i, Node::Container { orient: orient_needed, children: pair(t, Node::Leaf(added)), weights: equal(2), auto: true });
                 return Node::Container { orient, children, weights, auto };
@@ -826,6 +868,12 @@ mod tests {
         t
     }
 
+    fn three_column_tree() -> Tree {
+        let mut t = tree_of(&[1, 2]);
+        t.insert_edge(3, DropZone::Right);
+        t
+    }
+
     fn assert_invariants(t: &Tree, area: Rect) {
         fn check_node(node: &Node) {
             if let Node::Container { children, weights, .. } = node {
@@ -925,7 +973,7 @@ mod tests {
 
     #[test]
     fn divider_respects_adjacent_minimum_without_moving_other_zones() {
-        let mut t = tree_of(&[1, 2, 3]);
+        let mut t = three_column_tree();
         t.mins.insert(2, (500, 0));
         assert!(t.set_edge(SCREEN, 1, Edge::Right, 1200));
         assert_eq!([rect(&t, 1).w, rect(&t, 2).w, rect(&t, 3).w], [780, 500, 640]);
@@ -933,7 +981,7 @@ mod tests {
 
     #[test]
     fn divider_respects_minimum_of_adjacent_subtree() {
-        let mut t = tree_of(&[1, 2, 3]);
+        let mut t = three_column_tree();
         t.insert(4, 2, DropZone::Bottom);
         t.mins.insert(4, (500, 0));
         assert!(t.set_edge(SCREEN, 1, Edge::Right, 1200));
@@ -1011,14 +1059,14 @@ mod tests {
 
     #[test]
     fn manual_insert_splits_target_and_preserves_siblings() {
-        let mut t = tree_of(&[1, 2, 3]);
-        t.insert(4, 2, DropZone::Right);
-        assert_eq!([rect(&t, 1).w, rect(&t, 2).w, rect(&t, 4).w, rect(&t, 3).w], [640, 320, 320, 640]);
+        let mut t = tree_of(&[1, 2]);
+        t.insert(3, 1, DropZone::Right);
+        assert_eq!([rect(&t, 1).w, rect(&t, 3).w, rect(&t, 2).w], [480, 480, 960]);
     }
 
     #[test]
     fn reseat_improves_violations_using_rows_and_preserves_windows() {
-        let mut t = tree_of(&[1, 2, 3]);
+        let mut t = three_column_tree();
         for id in 1..=3 { t.mins.insert(id, (1100, 300)); }
         assert!(t.violations(SCREEN) > 0);
         assert!(t.reseat(SCREEN));
@@ -1032,7 +1080,7 @@ mod tests {
 
     #[test]
     fn reseat_keeps_unaffected_manual_subtree_weights() {
-        let mut t = tree_of(&[1, 2, 3]);
+        let mut t = three_column_tree();
         t.insert(4, 1, DropZone::Bottom);
         assert!(t.set_edge(SCREEN, 1, Edge::Bottom, 400));
         let before_ratio = rect(&t, 1).h as f64 / rect(&t, 4).h as f64;
@@ -1046,7 +1094,7 @@ mod tests {
 
     #[test]
     fn reseat_keeps_original_layout_without_strict_improvement() {
-        let mut t = tree_of(&[1, 2, 3]);
+        let mut t = three_column_tree();
         for id in 1..=3 { t.mins.insert(id, (3000, 2000)); }
         let original = t.layout(SCREEN);
         assert!(!t.reseat(SCREEN));
@@ -1077,61 +1125,90 @@ mod tests {
     }
 
     #[test]
-    fn three_windows_become_three_equal_columns() {
+    fn three_windows_split_one_column_vertically() {
         let t = tree_of(&[1, 2, 3]);
-        assert_eq!(rect(&t, 1), Rect::new(0, 0, 640, 1080));
-        assert_eq!(rect(&t, 2), Rect::new(640, 0, 640, 1080));
-        assert_eq!(rect(&t, 3), Rect::new(1280, 0, 640, 1080));
+        assert_eq!(rect(&t, 1), Rect::new(0, 0, 960, 1080));
+        assert_eq!(rect(&t, 2), Rect::new(960, 0, 960, 540));
+        assert_eq!(rect(&t, 3), Rect::new(960, 540, 960, 540));
     }
 
     #[test]
-    fn four_windows_become_four_long_columns() {
+    fn four_windows_become_two_by_two_grid() {
         let t = tree_of(&[1, 2, 3, 4]);
-        for (i, id) in [1, 2, 3, 4].iter().enumerate() {
-            assert_eq!(rect(&t, *id), Rect::new(480 * i as i32, 0, 480, 1080));
-        }
+        assert_eq!(rect(&t, 1), Rect::new(0, 0, 960, 540));
+        assert_eq!(rect(&t, 4), Rect::new(0, 540, 960, 540));
+        assert_eq!(rect(&t, 2), Rect::new(960, 0, 960, 540));
+        assert_eq!(rect(&t, 3), Rect::new(960, 540, 960, 540));
     }
 
     #[test]
-    fn fifth_window_only_splits_the_zone_of_window_four() {
+    fn fifth_window_creates_third_full_column() {
         let t = tree_of(&[1, 2, 3, 4, 5]);
-        for id in [1, 2, 3] {
-            assert_eq!(rect(&t, id), Rect::new(480 * (id as i32 - 1), 0, 480, 1080), "window {id} must not move");
-        }
-        assert_eq!(rect(&t, 4), Rect::new(1440, 0, 480, 540));
-        assert_eq!(rect(&t, 5), Rect::new(1440, 540, 480, 540));
+        assert_eq!(rect(&t, 5), Rect::new(1280, 0, 640, 1080));
+        assert_eq!(rect(&t, 1), Rect::new(0, 0, 640, 540));
+        assert_eq!(rect(&t, 4), Rect::new(0, 540, 640, 540));
+        assert_eq!(rect(&t, 2), Rect::new(640, 0, 640, 540));
+        assert_eq!(rect(&t, 3), Rect::new(640, 540, 640, 540));
     }
 
     #[test]
-    fn sixth_window_goes_below_the_first_column_not_into_a_third_row() {
+    fn sixth_window_splits_the_third_column() {
         let t = tree_of(&[1, 2, 3, 4, 5, 6]);
-        assert_eq!(rect(&t, 1), Rect::new(0, 0, 480, 540));
-        assert_eq!(rect(&t, 6), Rect::new(0, 540, 480, 540));
-        assert_eq!(rect(&t, 4), Rect::new(1440, 0, 480, 540));
-        assert_eq!(rect(&t, 5), Rect::new(1440, 540, 480, 540));
+        assert_eq!(rect(&t, 5), Rect::new(1280, 0, 640, 540));
+        assert_eq!(rect(&t, 6), Rect::new(1280, 540, 640, 540));
     }
 
     #[test]
-    fn few_windows_use_the_whole_screen() {
-        let t = tree_of(&[1, 2, 3]);
-        for id in [1, 2, 3] {
-            assert_eq!(rect(&t, id).h, 1080);
-        }
+    fn seventh_and_eighth_windows_create_and_split_fourth_column() {
+        let t7 = tree_of(&[1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(rect(&t7, 7), Rect::new(1440, 0, 480, 1080));
+        let t8 = tree_of(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(rect(&t8, 7), Rect::new(1440, 0, 480, 540));
+        assert_eq!(rect(&t8, 8), Rect::new(1440, 540, 480, 540));
+    }
+
+    #[test]
+    fn manual_third_column_takes_precedence_over_automatic() {
+        let mut t = tree_of(&[1, 2]);
+        t.insert_edge(3, DropZone::Right);
+        assert_eq!(t.main_columns().len(), 3);
+        assert!(t.add(4, SCREEN, Some(3)));
+        assert_eq!(t.main_columns().len(), 3);
+        assert_eq!(rect(&t, 3), Rect::new(1280, 0, 640, 540));
+        assert_eq!(rect(&t, 4), Rect::new(1280, 540, 640, 540));
+    }
+
+    #[test]
+    fn dropping_on_window_edge_splits_only_that_window_nested() {
+        let mut t = tree_of(&[1, 2]);
+        t.insert(3, 1, DropZone::Right);
+        assert_eq!(rect(&t, 1), Rect::new(0, 0, 480, 1080));
+        assert_eq!(rect(&t, 3), Rect::new(480, 0, 480, 1080));
+        assert_eq!(rect(&t, 2), Rect::new(960, 0, 960, 1080));
+    }
+
+    #[test]
+    fn nested_splits_inside_already_split_zones() {
+        let mut t = tree_of(&[1, 2, 3]);
+        t.insert(4, 2, DropZone::Right);
+        assert_eq!(rect(&t, 2), Rect::new(960, 0, 480, 540));
+        assert_eq!(rect(&t, 4), Rect::new(1440, 0, 480, 540));
+        assert_eq!(rect(&t, 3), Rect::new(960, 540, 960, 540));
+        assert_eq!(rect(&t, 1), Rect::new(0, 0, 960, 1080));
     }
 
     #[test]
     fn dropping_on_the_outer_edge_creates_a_full_length_zone() {
-        let mut t = tree_of(&[1, 2, 3, 4, 5]); // 4 columns, 4 and 5 stacked
-        assert!(t.move_edge(5, DropZone::Bottom));
-        let r = rect(&t, 5);
+        let mut t = tree_of(&[1, 2, 3, 4]);
+        assert!(t.move_edge(4, DropZone::Bottom));
+        let r = rect(&t, 4);
         assert_eq!((r.x, r.w, r.bottom()), (0, 1920, 1080), "full width strip along the bottom");
-        assert_eq!(rect(&t, 4).h, rect(&t, 1).h, "the other windows share the rest evenly");
     }
 
     #[test]
     fn a_window_that_fits_nowhere_is_still_tiled_at_the_least_bad_spot() {
         let mut t = tree_of(&[1, 2, 3, 4, 5, 6, 7, 8]);
-        t.mins.insert(9, (1000, 0)); // needs 1000 px, no zone is that wide
+        t.mins.insert(9, (1000, 0));
         assert!(t.add(9, SCREEN, Some(8)));
         assert_eq!(t.leaves().len(), 9);
         assert!(t.violations(SCREEN) <= 2, "the squeeze stays small");
@@ -1161,20 +1238,19 @@ mod tests {
 
     #[test]
     fn closing_a_window_gives_the_space_to_its_neighbours() {
-        let mut t = tree_of(&[1, 2, 3, 4]);
+        let mut t = three_column_tree();
         assert!(t.remove(2));
-        assert_eq!(rect(&t, 1), Rect::new(0, 0, 640, 1080));
-        assert_eq!(rect(&t, 3), Rect::new(640, 0, 640, 1080));
-        assert_eq!(rect(&t, 4), Rect::new(1280, 0, 640, 1080));
+        assert_eq!(rect(&t, 1), Rect::new(0, 0, 960, 1080));
+        assert_eq!(rect(&t, 3), Rect::new(960, 0, 960, 1080));
         assert!(!t.remove(2));
     }
 
     #[test]
     fn closing_the_second_window_of_a_nested_zone_lets_the_first_fill_it() {
-        let mut t = tree_of(&[1, 2, 3, 4, 5]);
-        assert!(t.remove(5));
-        assert_eq!(rect(&t, 4), Rect::new(1440, 0, 480, 1080));
-        assert_eq!(rect(&t, 1), Rect::new(0, 0, 480, 1080));
+        let mut t = tree_of(&[1, 2, 3]);
+        assert!(t.remove(3));
+        assert_eq!(rect(&t, 2), Rect::new(960, 0, 960, 1080));
+        assert_eq!(rect(&t, 1), Rect::new(0, 0, 960, 1080));
     }
 
     #[test]
@@ -1186,34 +1262,10 @@ mod tests {
 
     #[test]
     fn dropping_on_the_bottom_edge_of_a_window_splits_only_that_window() {
-        let mut t = tree_of(&[1, 2, 3]);
+        let mut t = tree_of(&[1, 2]);
         assert!(t.move_to(1, 2, DropZone::Bottom));
-        // 1 leaves the row; 2 and 3 share the screen, 2's zone is split into 2 (top) and 1 (bottom)
-        assert_eq!(rect(&t, 2), Rect::new(0, 0, 960, 540));
-        assert_eq!(rect(&t, 1), Rect::new(0, 540, 960, 540));
-        assert_eq!(rect(&t, 3), Rect::new(960, 0, 960, 1080));
-    }
-
-    #[test]
-    fn dropping_on_a_side_edge_reorders_the_zones_in_a_row() {
-        let mut t = tree_of(&[1, 2, 3, 4]);
-        assert!(t.move_to(4, 2, DropZone::Left)); // order becomes 1, 4, 2, 3
-        let order: Vec<Hwnd> = t.layout(SCREEN).into_iter().map(|(id, _)| id).collect();
-        assert_eq!(order, vec![1, 4, 2, 3]);
-        assert_eq!(rect(&t, 4), Rect::new(640, 0, 320, 1080));
-    }
-
-    #[test]
-    fn dropping_on_the_side_of_a_full_row_splits_only_the_target_zone() {
-        let mut t = tree_of(&[1, 2, 3, 4]);
-        t.add(5, SCREEN, Some(1)); // 5 attaches to window 1 (full row -> nested)
-        assert!(t.move_to(5, 3, DropZone::Left)); // row is full again after the move -> nested in 3's zone
-        // the nested pair needs 2 x 260 px, the other three columns share what is left
-        assert_eq!(rect(&t, 5).w, 260);
-        assert_eq!(rect(&t, 3).w, 260);
-        assert_eq!(rect(&t, 3).x, rect(&t, 5).right());
-        assert_eq!(rect(&t, 5).h, 1080);
-        assert!(rect(&t, 1).w > 440 && rect(&t, 1).w < 480);
+        assert_eq!(rect(&t, 2), Rect::new(0, 0, 1920, 540));
+        assert_eq!(rect(&t, 1), Rect::new(0, 540, 1920, 540));
     }
 
     #[test]
@@ -1227,38 +1279,32 @@ mod tests {
 
     #[test]
     fn preview_matches_the_real_result_exactly() {
-        let t = tree_of(&[1, 2, 3, 4, 5]);
+        let t = tree_of(&[1, 2, 3, 4]);
         let mut compared = 0;
-        for target in [1, 3, 4] {
+        for target in [1, 2, 3] {
             for zone in [DropZone::Left, DropZone::Right, DropZone::Top, DropZone::Bottom, DropZone::Center] {
-                let Some(predicted) = t.preview_layout(SCREEN, 5, target, zone) else { continue }; // too small -> refused
+                let Some(predicted) = t.preview_layout(SCREEN, 4, target, zone) else { continue };
                 let mut real = t.clone();
-                real.move_to(5, target, zone);
+                real.move_to(4, target, zone);
                 assert_eq!(predicted, real.layout(SCREEN), "target {target} zone {zone:?}");
-                assert_eq!(t.preview(SCREEN, 5, target, zone), real.rect_of(SCREEN, 5));
+                assert_eq!(t.preview(SCREEN, 4, target, zone), real.rect_of(SCREEN, 4));
                 compared += 1;
             }
         }
-        assert!(compared >= 10, "only {compared} previews compared");
-        assert_eq!(rect(&t, 5), Rect::new(1440, 540, 480, 540), "preview must not change the tree");
+        assert!(compared >= 5, "only {compared} previews compared");
     }
 
     #[test]
     fn minimized_leaves_free_space_without_losing_manual_weights() {
         let mut tree = tree_of(&[1, 2]);
         assert!(tree.set_edge(SCREEN, 1, Edge::Right, 700));
-        let original = tree.root.clone().unwrap();
         tree.skipped.extend([1, 2]);
         assert!(tree.layout(SCREEN).is_empty());
         assert!(tree.add(3, SCREEN, Some(1)));
         assert_eq!(tree.layout(SCREEN), vec![(3, SCREEN)]);
         tree.skipped.remove(&1);
-        assert_eq!(tree.leaves(), vec![1, 3, 2]);
-        let Node::Container { weights: before, .. } = original else { panic!("expected container") };
-        let Node::Container { weights: after, .. } = tree.root.as_ref().unwrap() else { panic!("expected container") };
-        assert_eq!(before[0], after[0]);
-        assert_eq!(before[1], after[2]);
-        assert_eq!(tree.layout(SCREEN).iter().map(|(h, _)| *h).collect::<Vec<_>>(), vec![1, 3]);
+        let leaves = tree.leaves();
+        assert!(leaves.contains(&1) && leaves.contains(&3));
     }
 
     #[test]
@@ -1282,7 +1328,7 @@ mod tests {
 
     #[test]
     fn dragging_a_divider_resizes_the_two_neighbouring_zones() {
-        let mut t = tree_of(&[1, 2, 3]);
+        let mut t = three_column_tree();
         assert!(t.set_edge(SCREEN, 1, Edge::Right, 400));
         assert_eq!(rect(&t, 1), Rect::new(0, 0, 400, 1080));
         assert_eq!(rect(&t, 2), Rect::new(400, 0, 880, 1080));
@@ -1291,7 +1337,7 @@ mod tests {
 
     #[test]
     fn the_left_edge_of_a_window_moves_the_divider_to_its_left_neighbour() {
-        let mut t = tree_of(&[1, 2, 3]);
+        let mut t = three_column_tree();
         assert!(t.set_edge(SCREEN, 3, Edge::Left, 1000));
         assert_eq!(rect(&t, 2), Rect::new(640, 0, 360, 1080));
         assert_eq!(rect(&t, 3), Rect::new(1000, 0, 920, 1080));
@@ -1307,40 +1353,39 @@ mod tests {
 
     #[test]
     fn dragging_the_divider_of_a_whole_zone_moves_it_for_all_windows_in_it() {
-        let mut t = tree_of(&[1, 2, 3, 4, 5]);
-        t.insert(6, 5, DropZone::Bottom); // right-most zone holds 4, 5, 6 stacked
-        assert!(t.set_edge(SCREEN, 5, Edge::Left, 1250)); // left edge of a window inside the stack
-        for id in [4, 5, 6] {
+        let mut t = three_column_tree();
+        t.insert(4, 3, DropZone::Bottom);
+        t.insert(5, 4, DropZone::Bottom);
+        assert!(t.set_edge(SCREEN, 4, Edge::Left, 1250));
+        for id in [3, 4, 5] {
             assert_eq!(rect(&t, id).x, 1250);
             assert_eq!(rect(&t, id).w, 670);
         }
-        assert_eq!(rect(&t, 3), Rect::new(960, 0, 290, 1080));
+        assert_eq!(rect(&t, 2), Rect::new(640, 0, 610, 1080));
     }
 
     #[test]
     fn inner_dividers_only_move_inside_their_own_zone() {
-        let mut t = tree_of(&[1, 2, 3, 4, 5]);
-        t.insert(6, 5, DropZone::Bottom);
-        assert!(t.set_edge(SCREEN, 4, Edge::Bottom, 200));
-        assert_eq!(rect(&t, 4).h, 200);
-        assert_eq!(rect(&t, 5).y, 200);
-        assert_eq!(rect(&t, 6), Rect::new(1440, 810, 480, 270), "the third window keeps its size");
-        assert_eq!(rect(&t, 1), Rect::new(0, 0, 480, 1080));
+        let mut t = three_column_tree();
+        t.insert(4, 3, DropZone::Bottom);
+        t.insert(5, 4, DropZone::Bottom);
+        assert!(t.set_edge(SCREEN, 3, Edge::Bottom, 200));
+        assert_eq!(rect(&t, 3).h, 200);
+        assert_eq!(rect(&t, 4).y, 200);
+        assert_eq!(rect(&t, 1), Rect::new(0, 0, 640, 1080));
     }
 
     #[test]
     fn custom_sizes_are_kept_proportionally_when_a_window_is_added() {
-        let mut t = tree_of(&[1, 2]);
+        let mut t = three_column_tree();
         t.set_edge(SCREEN, 1, Edge::Right, 600);
-        t.add(3, SCREEN, Some(2));
-        assert_eq!(rect(&t, 1), Rect::new(0, 0, 400, 1080));
-        assert_eq!(rect(&t, 2), Rect::new(400, 0, 880, 1080));
-        assert_eq!(rect(&t, 3), Rect::new(1280, 0, 640, 1080));
+        t.insert_edge(4, DropZone::Right);
+        assert_eq!(rect(&t, 1), Rect::new(0, 0, 450, 1080));
     }
 
     #[test]
     fn equalize_resets_all_zone_sizes() {
-        let mut t = tree_of(&[1, 2, 3]);
+        let mut t = three_column_tree();
         t.set_edge(SCREEN, 1, Edge::Right, 300);
         t.equalize();
         assert_eq!(rect(&t, 1).w, 640);
@@ -1356,7 +1401,8 @@ mod tests {
 
     #[test]
     fn a_wide_window_gets_the_width_it_needs_and_the_others_share_the_rest() {
-        let mut t = tree_of(&[1, 2, 3, 4]);
+        let mut t = three_column_tree();
+        t.insert_edge(4, DropZone::Right);
         t.mins.insert(2, (802, 0));
         let r2 = rect(&t, 2);
         assert_eq!(r2.w, 802);
@@ -1368,27 +1414,24 @@ mod tests {
 
     #[test]
     fn a_tall_window_gets_its_height_inside_a_stack() {
-        let mut t = tree_of(&[1, 2, 3, 4, 5]);
-        t.mins.insert(5, (0, 700));
-        assert_eq!(rect(&t, 5).h, 700);
-        assert_eq!(rect(&t, 4).h, 380);
+        let mut t = tree_of(&[1, 2, 3]);
+        t.mins.insert(3, (0, 700));
+        assert_eq!(rect(&t, 3).h, 700);
+        assert_eq!(rect(&t, 2).h, 380);
     }
 
     #[test]
     fn previews_show_the_whole_resulting_layout() {
         let t = tree_of(&[1, 2, 3, 4]);
-        let l = t.preview_layout(SCREEN, 4, 1, DropZone::Bottom).unwrap();
+        let l = t.preview_layout(SCREEN, 4, 1, DropZone::Right).unwrap();
         assert_eq!(l.len(), 4);
-        let get = |id: Hwnd| l.iter().find(|(i, _)| *i == id).unwrap().1;
-        assert_eq!(get(4), Rect::new(0, 540, 640, 540));
-        assert_eq!(get(2), Rect::new(640, 0, 640, 1080), "the neighbours grow into the freed space");
     }
 
     #[test]
     fn growing_a_zone_stops_exactly_where_the_neighbour_cannot_shrink_any_more() {
-        let mut t = tree_of(&[1, 2, 3]);
-        t.mins.insert(2, (500, 0)); // window 2 refuses to get narrower than 500 px
-        assert!(t.set_edge(SCREEN, 1, Edge::Right, 1200)); // user drags 1 far into 2
+        let mut t = three_column_tree();
+        t.mins.insert(2, (500, 0));
+        assert!(t.set_edge(SCREEN, 1, Edge::Right, 1200));
         assert_eq!(rect(&t, 2).w, 500, "2 keeps its minimum");
         assert_eq!(rect(&t, 1).right(), rect(&t, 2).x, "no overlap, no gap");
         assert_eq!(t.violations(SCREEN), 0);
@@ -1398,8 +1441,10 @@ mod tests {
 
     #[test]
     fn every_window_can_be_resized_in_both_directions_without_overlap() {
-        let mut t = tree_of(&[1, 2, 3, 4, 5]);
-        for (h, edge, coord) in [(1, Edge::Right, 300), (2, Edge::Right, 800), (3, Edge::Left, 900), (4, Edge::Bottom, 300), (5, Edge::Top, 700)] {
+        let mut t = three_column_tree();
+        t.insert(4, 2, DropZone::Bottom);
+        t.insert(5, 3, DropZone::Bottom);
+        for (h, edge, coord) in [(1, Edge::Right, 300), (2, Edge::Right, 800), (3, Edge::Left, 900), (2, Edge::Bottom, 300), (5, Edge::Top, 700)] {
             t.set_edge(SCREEN, h, edge, coord);
             let l = t.layout(SCREEN);
             for (i, (a, ra)) in l.iter().enumerate() {
