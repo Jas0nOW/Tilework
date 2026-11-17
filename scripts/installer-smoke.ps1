@@ -57,20 +57,24 @@ function Assert-LegacyGuard([string]$Reason) {
     Remove-Item -LiteralPath $setupLog
 }
 
-function Assert-InstalledVersion([string]$Version, [string]$Label) {
+function Invoke-InstalledCommand([string]$Command) {
     $program = Join-Path $env:LOCALAPPDATA 'Programs/Tilework/tilework.exe'
-    Assert-Condition ((Get-ProductVersion) -eq $Version) "$Label registry version is not $Version."
-    Assert-Condition (Test-Path -LiteralPath $program) "$Label executable is missing."
-    $capture = Join-Path $env:TEMP 'tilework-version-output.txt'
-    $errors = Join-Path $env:TEMP 'tilework-version-error.txt'
+    Assert-Condition (Test-Path -LiteralPath $program) 'Installed executable is missing.'
+    $capture = Join-Path $env:TEMP 'tilework-command-output.txt'
+    $errors = Join-Path $env:TEMP 'tilework-command-error.txt'
     try {
-        $process = Start-Process -FilePath $program -ArgumentList '--version' -RedirectStandardOutput $capture -RedirectStandardError $errors -WindowStyle Hidden -Wait -PassThru
-        Assert-Condition ($process.ExitCode -eq 0) "$Label executable did not start successfully."
-        $reported = (Get-Content -LiteralPath $capture -Raw).Trim()
-        Assert-Condition ($reported -eq "Tilework $Version") "$Label executable reported '$reported'."
+        $process = Start-Process -FilePath $program -ArgumentList $Command -RedirectStandardOutput $capture -RedirectStandardError $errors -WindowStyle Hidden -Wait -PassThru
+        Assert-Condition ($process.ExitCode -eq 0) "Tilework $Command exited $($process.ExitCode): $(Get-Content -LiteralPath $errors -Raw)"
+        ([string](Get-Content -LiteralPath $capture -Raw)).Trim()
     } finally {
         Remove-Item -LiteralPath $capture,$errors -ErrorAction SilentlyContinue
     }
+}
+
+function Assert-InstalledVersion([string]$Version, [string]$Label) {
+    Assert-Condition ((Get-ProductVersion) -eq $Version) "$Label registry version is not $Version."
+    $reported = Invoke-InstalledCommand '--version'
+    Assert-Condition ($reported -eq "Tilework $Version") "$Label executable reported '$reported'."
 }
 
 function Assert-RunEntry([bool]$Enabled, [string]$Label) {
@@ -155,12 +159,9 @@ function Invoke-Lifecycle {
     Assert-InstalledVersion $CurrentVersion 'Fresh install'
     Assert-RunEntry $false 'Fresh install'
     Assert-Shortcuts $true 'Fresh install'
-    $program = Join-Path $programDir 'tilework.exe'
-    & $program '--autostart-on'
-    Assert-Condition ($LASTEXITCODE -eq 0) 'Installed app could not enable its own-user sign-in entry.'
+    Invoke-InstalledCommand '--autostart-on' | Out-Null
     Assert-RunEntry $true 'Autostart enable'
-    & $program '--autostart-status'
-    Assert-Condition ($LASTEXITCODE -eq 0) 'Installed app autostart status command failed.'
+    Assert-Condition ((Invoke-InstalledCommand '--autostart-status') -eq 'Tilework autostart entry: registered') 'Installed app autostart status did not report the entry.'
     Write-Pass 'fresh per-user install, executable launch, shortcuts, and opt-in autostart'
 
     $config = Join-Path $legacyDir 'config.ini'
@@ -208,11 +209,9 @@ function Invoke-Lifecycle {
     Assert-Condition ((Get-FileHash -Algorithm SHA256 -LiteralPath $config).Hash -eq $configHash) 'Downgrade changed the user config.'
     Write-Pass "verified earlier installer returns the app to $CurrentVersion and preserves user data"
 
-    & $program '--autostart-off'
-    Assert-Condition ($LASTEXITCODE -eq 0) 'Installed app could not disable its own-user sign-in entry.'
+    Invoke-InstalledCommand '--autostart-off' | Out-Null
     Assert-RunEntry $false 'Autostart disable'
-    & $program '--autostart-on'
-    Assert-Condition ($LASTEXITCODE -eq 0) 'Installed app could not re-enable its own-user sign-in entry.'
+    Invoke-InstalledCommand '--autostart-on' | Out-Null
     Assert-RunEntry $true 'Autostart re-enable'
     Write-Pass 'autostart can be disabled and re-enabled'
 
