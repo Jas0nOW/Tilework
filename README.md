@@ -24,7 +24,7 @@ The demo is a single-monitor simulation. Add five windows to see the layout prog
 2. Open the downloaded file. If Windows says *"Windows protected your PC"*, click **More info** and then **Run anyway**. This warning appears because the app is new and not yet signed with a paid certificate.
 3. Click **Next** until it finishes, then start **Tilework** from the Start menu. A small icon appears next to the clock, and your windows arrange themselves.
 
-That's it. Works on Windows 10 (22H2) and Windows 11, 64-bit. No administrator rights needed.
+That's it. Works on Windows 10 (22H2) and Windows 11, 64-bit. No administrator rights needed. To also tile administrator windows, see [Administrator windows](#administrator-windows).
 
 **Handy to know**
 - **Start together with Windows:** right-click the Tilework icon next to the clock and tick **Start with Windows**.
@@ -79,7 +79,7 @@ Exit Tilework, verify the checksum for the desired version, then run its install
 
 Settings default to focus on hover after 300 ms, minimum tile size 260×160 px, and verbose logging off. Manual settings edits apply on restart. Diagnostic files include `tilework.log` and one rotated backup. See [DESIGN.md](docs/DESIGN.md) for the layout and recovery rules.
 
-Windows prevents standard-user Tilework from managing elevated windows. App minimum sizes, foreground restrictions, and ambiguous virtual desktop information can also limit tiling. Verify mixed-DPI monitors, pinned windows, and Explorer recovery before depending on those workflows.
+App minimum sizes, foreground restrictions, and ambiguous virtual desktop information can also limit tiling. Verify mixed-DPI monitors, pinned windows, and Explorer recovery before depending on those workflows.
 
 ### Diagnostics
 
@@ -106,6 +106,10 @@ cargo build --locked --release
 
 See the [release runbook](docs/RELEASE.md) for packaging and live tests, [CONTRIBUTING.md](CONTRIBUTING.md) for contributions, and [SECURITY.md](SECURITY.md) for private vulnerability reporting. Tilework uses the [MIT license](LICENSE).
 
+## Administrator windows
+
+Tilework starts with normal rights by default. To tile administrator windows too, start it with administrator rights: right-click `tilework.exe` (or its Start menu entry) and choose **Run as administrator**, or right-click the tray icon and choose **Restart as administrator** (Windows asks for confirmation; if you cancel, Tilework keeps running as before). The tray tooltip then ends with "(Administrator)". **Start with Windows** always starts Tilework with normal rights; it never asks for administrator approval at sign-in. Settings and logs stay in your own `%LOCALAPPDATA%\Tilework` folder and remain editable without administrator rights.
+
 ## Known limitations
 
-- Tilework runs as a standard user on purpose. Windows blocks it from moving windows of elevated (administrator) programs, for example an "Run as administrator" PowerShell. Tilework leaves those windows alone and keeps them out of the layout.
+- Started normally, Tilework cannot move windows of elevated (administrator) programs, for example a "Run as administrator" PowerShell. Windows forbids it, so Tilework leaves those windows alone and keeps them out of the layout. To include them, start Tilework as administrator (see [Administrator windows](#administrator-windows)).

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Allow starting Tilework with administrator rights. An elevated Tilework also tiles elevated windows; a normal one keeps leaving them alone.
+- Add **Restart as administrator** to the tray menu, show "Running as administrator" and an "(Administrator)" tooltip suffix when elevated.
+- Treat a Tilework instance with other elevation as already running instead of logging an error.
+- Re-check cached window elevation after 30 seconds so reused process ids are not misclassified.
+
 ## 0.3.0 (beta)
 
 - Prepare the V3 tiling layout and focus frame for a standalone per-user Windows installer and portable distribution.

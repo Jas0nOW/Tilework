@@ -159,7 +159,7 @@ Windows 10/11 apps (especially borderless, Electron, Terminal, and modern custom
 ## 11. Architecture
 
 ```
-main.rs      DPI awareness, standard-user guard, single instance, CLI and diagnostics
+main.rs      DPI awareness, single instance, CLI and diagnostics
 setup.rs     per-user sign-in entry and stable-release checks against the fixed GitHub repository
 packaging/   per-user Inno Setup installer, Start Menu shortcut and uninstall registration
 config.rs    key=value settings file (%LOCALAPPDATA%\<name>\config.ini), tolerant parser
@@ -183,7 +183,7 @@ Key design decisions:
 - **Manual update installation.** Release discovery uses HTTPS and validates the version and expected installer metadata. The application can open the official release page. The standalone installer handles installation and replacement after Tilework exits.
 - **Dependencies.** The official `windows` bindings provide Windows APIs, and `serde_json` parses release metadata.
 
-The tray icon is re-added after Explorer restarts. A named process mutex prevents a second manager in the same session. Tilework runs as the invoking standard user.
+The tray icon is re-added after Explorer restarts. A named process mutex prevents a second manager in the same session. Tilework runs with the rights it was started with. A standard-user instance skips windows of elevated processes (UIPI blocks moving them); an elevated instance manages them. A standard instance that finds an elevated instance's mutex (access denied) treats it as already running. The tray item "Restart as administrator" starts an elevated copy with the internal `--replace` flag, which waits up to 10 s for the old instance to release the mutex; the old instance exits only after the UAC prompt was accepted.
 
 Diagnostics: a log at `%LOCALAPPDATA%\<name>\tilework.log` records adds, removals, drops,
 learned minimum sizes and desktop switches. The log is capped at 1 MB with one rotated backup.
@@ -214,4 +214,4 @@ Per-monitor layouts use Windows monitor handles and monitor work areas. After a 
 
 Virtual desktop detection uses visible window evidence and Explorer's registry fallback. With one visible app and no usable shell information, a confirmed foreground desktop can supply the result. A sole pinned window is ambiguous on systems without shell information. An empty desktop with no usable shell identity pauses until Tilework can identify it.
 
-Tilework uses per-user storage. It rejects elevated launches because data files and executable paths are writable by the account running it. The previous development build requires manual removal of its elevated scheduled task before migration.
+Tilework uses per-user storage. It runs elevated or not under the same user profile, so files an elevated instance creates inherit the profile's ACL and stay editable by the standard user. Sign-in autostart is a per-user Run entry and always starts without elevation. The previous development build requires manual removal of its elevated scheduled task before migration.
