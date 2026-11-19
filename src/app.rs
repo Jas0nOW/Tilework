@@ -758,6 +758,13 @@ impl<P: Win> App<P> {
 
     fn drag_end(&mut self, h: Hwnd) {
         if self.drag.as_ref().map(|d| d.hwnd) != Some(h) { return; }
+        self.finish_drag(h);
+        // drag_start hid the focus border; every outcome (drop, resize, snap back) brings it back,
+        // also when the window ends exactly at its tile and no location event follows.
+        self.refresh_focus();
+    }
+
+    fn finish_drag(&mut self, h: Hwnd) {
         // Release can arrive before the first 30 ms tick or after the last cursor move.
         let drop_area = self.drag_tick();
         let Some(d) = self.drag.take() else { return };
@@ -836,7 +843,6 @@ impl<P: Win> App<P> {
             }
             self.apply(key, true);
         }
-        self.refresh_focus();
     }
 
     // ---------- focus follows mouse ----------
@@ -2245,6 +2251,25 @@ mod scenarios {
         let s = &a.surfaces[&second];
         assert_eq!(s.tree.layout(s.area), vec![(1, s.area)]);
         assert!(s.tree.contains(3));
+    }
+
+    #[test]
+    fn the_focus_border_returns_after_a_drag_that_ends_without_a_drop() {
+        let (mut a, key) = app(); a.apply(key, false);
+        a.p.foreground.set(1);
+        a.refresh_focus();
+        // A resize that the layout accepts exactly: no placement, so no location event follows.
+        a.drag_start(1);
+        let start = a.drag.as_ref().unwrap().start;
+        let resized = Rect { w: start.w - 200, ..start };
+        a.p.windows.borrow_mut().get_mut(&1).unwrap().rect = resized;
+        a.drag_end(1);
+        assert_eq!(a.focus_border.state, OverlayState::Shown(resized));
+        // A move released over nothing snaps back and also restores the border.
+        a.drag_start(1);
+        a.p.cursor.set((resized.x + 100, resized.y + 300));
+        a.drag_end(1);
+        assert_eq!(a.focus_border.state, OverlayState::Shown(resized));
     }
 
     #[test]
