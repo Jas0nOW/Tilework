@@ -6,6 +6,7 @@
 - Add **Restart as administrator** to the tray menu, show "Running as administrator" and an "(Administrator)" tooltip suffix when elevated.
 - Treat a Tilework instance with other elevation as already running instead of logging an error.
 - Re-check cached window elevation after 30 seconds so reused process ids are not misclassified.
+- Make the drag preview and focus frame cheaper and steadier: unchanged previews cost no window calls, paints allocate no GDI objects, and the focus frame follows its window immediately and hides on minimize, close or cloak.
 
 ## 0.3.0 (beta)
 

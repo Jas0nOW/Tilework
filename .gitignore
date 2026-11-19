@@ -1,3 +1,4 @@
 target/
 packaging/output/
 release-files/
+.claude/worktrees/
