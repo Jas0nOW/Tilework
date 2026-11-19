@@ -1543,10 +1543,14 @@ fn update_drag(d: &mut Drag, visible: Option<Rect>, cursor: Option<(SurfaceKey, 
     let h = d.hwnd;
     let candidate: DropTarget = match surfaces.get(&key) {
         Some(s) => {
+            let layout = s.tree.layout(area);
             if let Some(side) = App::<Platform>::edge_at(area, cx, cy) {
                 (key, None, side)
+            } else if key != d.key && layout.is_empty() {
+                // Every tile of that monitor is minimized: it looks empty, so the window fills it.
+                (key, None, DropZone::Center)
             } else {
-                let (target, rect) = s.tree.layout(area).into_iter().find(|(id, r)| *id != h && r.contains(cx, cy))?;
+                let (target, rect) = layout.into_iter().find(|(id, r)| *id != h && r.contains(cx, cy))?;
                 (key, Some(target), zone_at(rect, cx, cy))
             }
         }
@@ -2221,6 +2225,26 @@ mod scenarios {
         a.drag_start(1);
         dispatch(&mut a, PendingEvent { msg: WM_EVENT, wp: 0x800B, lp: 1 });
         assert_eq!(a.focus_border.state, OverlayState::Hidden);
+    }
+
+    #[test]
+    fn a_monitor_whose_tiles_are_all_minimized_accepts_a_drop_like_an_empty_one() {
+        let (mut a, home) = app(); a.apply(home, false);
+        // Window 3 lives alone on the second monitor and is minimized there.
+        a.p.windows.borrow_mut().insert(3, Window { rect: Rect::new(2000, 50, 800, 600), minimum: (0, 0), maximized: false, minimized: false, fullscreen: false, hung: false, styled: true, desktop: 1, ignores: false, hidden: false });
+        a.reconcile(false);
+        let second = SurfaceKey { monitor: 2, ..home };
+        assert!(a.surfaces[&second].tree.contains(3));
+        a.p.windows.borrow_mut().get_mut(&3).unwrap().minimized = true;
+        a.reconcile(false);
+        a.drag_start(1);
+        a.p.cursor.set((2900, 500));
+        a.drag_end(1);
+        assert_eq!(a.surface_containing(1), Some(second));
+        // The dropped window fills the monitor; the minimized one keeps its reserved tile.
+        let s = &a.surfaces[&second];
+        assert_eq!(s.tree.layout(s.area), vec![(1, s.area)]);
+        assert!(s.tree.contains(3));
     }
 
     #[test]
