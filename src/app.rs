@@ -471,6 +471,12 @@ impl<P: Win> App<P> {
     fn apply(&mut self, key: SurfaceKey, force: bool) {
         if self.shown == 0 || key.desktop != self.shown || !self.desktop_on(key.desktop) { return; }
         let Some(s) = self.surfaces.get_mut(&key) else { return };
+        // A monitor query that fails mid display change reports an empty work area. Laying out
+        // into it would shrink every window to its minimum; wait for the next poll instead.
+        if s.area.w <= 0 || s.area.h <= 0 {
+            log(&format!("apply skipped for monitor {:x}: empty work area", key.monitor));
+            return;
+        }
         s.tree.skipped = s.tree.leaves().into_iter().filter(|h| self.p.is_minimized(*h)).collect();
         let area = s.area;
         let layout = s.tree.layout(area);
@@ -2271,6 +2277,18 @@ mod scenarios {
         let (mut a, _) = app(); a.filter = Some("probe".into());
         // The UAC prompt runs a nested message loop; it must not run inside menu_command.
         assert!(matches!(a.menu_command(MENU_RESTART_ADMIN), Some(MenuFollowUp::RestartAsAdministrator(Some(f))) if f == "probe"));
+    }
+
+    #[test]
+    fn an_unreadable_monitor_work_area_never_squeezes_windows() {
+        let (mut a, key) = app(); a.apply(key, false);
+        let tiles: Vec<_> = [1, 2].iter().map(|h| a.p.visible_rect(*h)).collect();
+        // GetMonitorInfoW failing during a monitor hot-unplug reports an empty work area.
+        a.p.area.set(Rect::new(0, 0, 0, 0));
+        a.p.requests.borrow_mut().clear();
+        a.reconcile(true);
+        assert!(a.p.requests.borrow().is_empty(), "no placement into an empty area: {:?}", a.p.requests.borrow());
+        assert_eq!([1, 2].iter().map(|h| a.p.visible_rect(*h)).collect::<Vec<_>>(), tiles);
     }
 
 }
