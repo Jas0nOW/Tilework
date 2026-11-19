@@ -284,14 +284,37 @@ fn run_manager(filter: Option<String>, replace: bool) {
 /// An instance running with different elevation owns a mutex we may not open (access denied), which
 /// also means "already running". `None` means the check itself failed (logged).
 fn claim_instance() -> Option<(windows::Win32::Foundation::HANDLE, bool)> {
-    use windows::Win32::Foundation::{GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, HANDLE};
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE};
+    match create_instance_mutex(windows::core::w!("Local\\TileworkSingleInstance"), platform::self_elevated()) {
+        Ok(result) => Some(result),
+        Err(e) if e.code() == ERROR_ACCESS_DENIED.to_hresult() => Some((HANDLE::default(), true)),
+        Err(e) => { app::log(&format!("could not create single-instance mutex: {e}")); None }
+    }
+}
+
+/// Creates or opens the named mutex; the flag tells whether it already existed. An elevated
+/// process's default DACL admits only administrators, so a standard-user process could not even
+/// open the mutex to see that Tilework runs: the per-user installer and uninstaller (Inno Setup
+/// `AppMutex`, opened with SYNCHRONIZE) would then replace or delete the exe while it is in use.
+/// `shared` grants everyone in the session SYNCHRONIZE and query access, at medium integrity, and
+/// keeps full access for administrators and SYSTEM.
+fn create_instance_mutex(name: windows::core::PCWSTR, shared: bool) -> windows::core::Result<(windows::Win32::Foundation::HANDLE, bool)> {
+    use windows::Win32::Foundation::{GetLastError, LocalFree, ERROR_ALREADY_EXISTS, HLOCAL};
+    use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
+    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
     use windows::Win32::System::Threading::CreateMutexW;
     unsafe {
-        match CreateMutexW(None, false, windows::core::w!("Local\\TileworkSingleInstance")) {
-            Ok(m) => Some((m, GetLastError() == ERROR_ALREADY_EXISTS)),
-            Err(e) if e.code() == ERROR_ACCESS_DENIED.to_hresult() => Some((HANDLE::default(), true)),
-            Err(e) => { app::log(&format!("could not create single-instance mutex: {e}")); None }
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        if shared && let Err(e) = ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            windows::core::w!("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100001;;;AU)S:(ML;;NW;;;ME)"), SDDL_REVISION_1, &mut sd, None) {
+            app::log(&format!("could not build the shared single-instance mutex descriptor: {e}"));
         }
+        let attributes = SECURITY_ATTRIBUTES { nLength: size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: sd.0, bInheritHandle: false.into() };
+        let result = CreateMutexW((!sd.0.is_null()).then_some(&attributes as *const _), false, name);
+        // Read before LocalFree, which may overwrite the last error.
+        let existed = GetLastError() == ERROR_ALREADY_EXISTS;
+        if !sd.0.is_null() { let _ = LocalFree(Some(HLOCAL(sd.0))); }
+        result.map(|handle| (handle, existed))
     }
 }
 
@@ -326,6 +349,28 @@ mod tests {
         assert!(!restore_refused(false, true, false));
         assert!(parse_filter(&["app".into(), "--force".into()]).is_err());
         assert!(parse_filter(&["app".into(), "--force".into(), "--restore-snap".into()]).is_ok());
+    }
+
+    #[test]
+    fn a_shared_instance_mutex_is_visible_but_not_claimable_by_standard_users() {
+        use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED};
+        use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+        let name: Vec<u16> = format!("Local\\TileworkTest{}", std::process::id()).encode_utf16().chain([0]).collect();
+        let name = windows::core::PCWSTR(name.as_ptr());
+        let (owner, existed) = create_instance_mutex(name, true).unwrap();
+        assert!(!existed);
+        // What Inno Setup's AppMutex check does.
+        let probe = unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, name) }.expect("installer must see the instance");
+        unsafe { let _ = CloseHandle(probe); }
+        // A second instance without administrator rights is refused full access: "already running".
+        match create_instance_mutex(name, false) {
+            Err(e) => assert_eq!(e.code(), ERROR_ACCESS_DENIED.to_hresult()),
+            Ok((other, existed)) => {
+                assert!(platform::self_elevated() && existed, "only an administrator may open it fully");
+                unsafe { let _ = CloseHandle(other); }
+            }
+        }
+        unsafe { let _ = CloseHandle(owner); }
     }
 
     #[test]
