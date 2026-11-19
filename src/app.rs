@@ -689,6 +689,7 @@ impl<P: Win> App<P> {
 
     fn poll_tick(&mut self) {
         if !TRAY_ADDED.with(Cell::get) { self.add_tray(true); }
+        self.p.reconnect_shell(false);
         self.poll_drag_release();
         if self.drag.is_none() { self.reconcile(false); }
     }
@@ -1157,7 +1158,7 @@ fn restart_as_administrator(filter: Option<&str>) -> bool {
         Err(e) => { log(&format!("restart as administrator: cannot resolve own path: {e}")); return false; }
     };
     let mut args = String::from("--replace");
-    if let Some(f) = filter { args.push_str(&format!(" --filter \"{}\"", f.replace('"', ""))); }
+    if let Some(f) = filter { args.push_str(" --filter "); args.push_str(&quote_arg(f)); }
     let file = wide(&exe.to_string_lossy());
     let params = wide(&args);
     let mut info = SHELLEXECUTEINFOW {
@@ -1173,6 +1174,23 @@ fn restart_as_administrator(filter: Option<&str>) -> bool {
         Err(e) if e.code() == ERROR_CANCELLED.to_hresult() => { log("restart as administrator cancelled"); false }
         Err(e) => { log(&format!("restart as administrator failed: {e}")); false }
     }
+}
+
+/// Quotes one command-line argument so `CommandLineToArgvW` returns it unchanged.
+fn quote_arg(arg: &str) -> String {
+    let mut out = String::from("\"");
+    let mut backslashes = 0;
+    for c in arg.chars() {
+        if c == '\\' { backslashes += 1; continue; }
+        // Backslashes are literal unless they precede a quote; then each must be doubled.
+        let n = if c == '"' { backslashes * 2 + 1 } else { backslashes };
+        out.extend(std::iter::repeat_n('\\', n));
+        out.push(c);
+        backslashes = 0;
+    }
+    out.extend(std::iter::repeat_n('\\', backslashes * 2));
+    out.push('"');
+    out
 }
 
 unsafe fn build_and_track_menu(cfg: &Config, main: HWND, on: bool) -> usize {
@@ -1340,7 +1358,7 @@ fn queue_pending(msg: u32, wp: WPARAM, lp: LPARAM) -> bool {
 
 fn dispatch<P: Win>(app: &mut App<P>, event: PendingEvent) -> bool {
     let PendingEvent { msg, wp, lp } = event;
-    if app.taskbar_created != 0 && msg == app.taskbar_created { app.add_tray(false); return true; }
+    if app.taskbar_created != 0 && msg == app.taskbar_created { app.p.reconnect_shell(true); app.add_tray(false); return true; }
     if msg == WM_EVENT && matches!(wp as u32, 0x0003 | 0x0020 | 0x8017 | 0x8018) { app.p.invalidate_desktop(); }
     if msg == WM_TIMER && wp == TIMER_HOVER && !app.cfg.focus_follows_mouse { return true; }
     app.dispatch_desktop.set(None);
@@ -1480,6 +1498,10 @@ pub fn run(filter: Option<String>) {
         if taskbar_created == 0 { log("could not register TaskbarCreated message"); }
         else if ChangeWindowMessageFilterEx(main, taskbar_created, MSGFLT_ALLOW, None).is_err() {
             log("could not allow TaskbarCreated through the elevated message filter");
+        }
+        // Explorer runs at medium integrity; an elevated Tilework must accept its tray callbacks.
+        if ChangeWindowMessageFilterEx(main, WM_TRAY, MSGFLT_ALLOW, None).is_err() {
+            log("could not allow tray callbacks through the elevated message filter");
         }
         TASKBAR_CREATED.with(|id| id.set(taskbar_created));
         let app = App {
@@ -1843,6 +1865,14 @@ mod tests {
         assert!(!placement.observe(Some(refused), Duration::from_secs(1)));
         assert!(placement.observe(Some(refused), Duration::from_secs(2)));
     }
+    #[test]
+    fn restart_arguments_survive_windows_command_line_parsing() {
+        assert_eq!(quote_arg("plain"), r#""plain""#);
+        assert_eq!(quote_arg(r#"a "b""#), r#""a \"b\"""#);
+        assert_eq!(quote_arg(r"C:\dir\"), r#""C:\dir\\""#);
+        assert_eq!(quote_arg(r#"x\"y"#), r#""x\\\"y""#);
+    }
+
     #[test]
     fn log_text_has_no_controls_and_titles_are_bounded() {
         assert_eq!(clean_text("one\ntwo\r\tthree", 7), "one two");

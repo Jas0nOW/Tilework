@@ -48,6 +48,8 @@ pub trait Win {
     fn class_name(&self, h: isize) -> String;
     fn current_desktop(&self) -> u128;
     fn invalidate_desktop(&self);
+    /// Re-acquires shell COM objects after Explorer restarts (`force`) or when they were never obtained.
+    fn reconnect_shell(&mut self, _force: bool) {}
     fn surface_of(&self, h: isize) -> (SurfaceKey, Rect) {
         let (monitor, area) = self.monitor_of(h);
         (SurfaceKey { desktop: self.desktop_id(h), monitor }, area)
@@ -269,6 +271,18 @@ impl Platform {
     /// Invalidate cached desktop evidence after a foreground or desktop-switch event.
     pub fn invalidate_desktop(&self) { self.desktop_cache.set(None); }
 
+    /// The virtual desktop manager lives in Explorer; after an Explorer restart the old proxy is
+    /// disconnected and every desktop id reads as 0. Re-create it, keeping the old one on failure.
+    pub fn reconnect_shell(&mut self, force: bool) {
+        if !force && self.vdm.is_some() { return; }
+        match unsafe { CoCreateInstance::<_, IVirtualDesktopManager>(&VirtualDesktopManager, None, CLSCTX_ALL) } {
+            Ok(vdm) => { self.vdm = Some(vdm); crate::app::log("virtual desktop manager connected"); }
+            Err(e) if force => crate::app::log(&format!("could not reconnect the virtual desktop manager: {e}")),
+            Err(_) => {}
+        }
+        self.invalidate_desktop();
+    }
+
     pub fn current_desktop(&self) -> u128 {
         if let Some((time, id)) = self.desktop_cache.get() && time.elapsed() < Duration::from_millis(250) {
             return id;
@@ -449,6 +463,7 @@ impl Win for Platform {
     fn class_name(&self, h: isize) -> String { Platform::class_name(self, h) }
     fn current_desktop(&self) -> u128 { Platform::current_desktop(self) }
     fn invalidate_desktop(&self) { Platform::invalidate_desktop(self); }
+    fn reconnect_shell(&mut self, force: bool) { Platform::reconnect_shell(self, force); }
 }
 
 #[derive(Debug, PartialEq, Eq)]

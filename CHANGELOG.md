@@ -7,6 +7,9 @@
 - Treat a Tilework instance with other elevation as already running instead of logging an error.
 - Re-check cached window elevation after 30 seconds so reused process ids are not misclassified.
 - Make the drag preview and focus frame cheaper and steadier: unchanged previews cost no window calls, paints allocate no GDI objects, and the focus frame follows its window immediately and hides on minimize, close or cloak.
+- Fix drops onto a monitor whose tiles are all minimized, the focus frame staying hidden after a drag without a drop, and a UTF-8 byte order mark hiding the first setting in `config.ini`.
+- Harden against failed window creation, an unreadable monitor work area during display changes, a partially written Snap recovery marker, Explorer timing out when the tray icon is added at sign-in, and lost virtual desktop information after Explorer restarts.
+- Let the installer detect a running elevated Tilework, accept tray clicks in an elevated Tilework, and never open the browser elevated.
 
 ## 0.3.0 (beta)
 
