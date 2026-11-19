@@ -971,7 +971,9 @@ impl<P: Win> App<P> {
         match result { Ok(()) => self.cfg = Config::load(), Err(e) => log(&format!("settings update failed: {e}")) }
     }
 
-    fn menu_command(&mut self, cmd: usize) -> Option<std::path::PathBuf> {
+    /// Modal UI (message boxes, the UAC prompt) is returned as a follow-up and shown by the caller
+    /// after the app borrow ends: its nested message loop would otherwise queue every event.
+    fn menu_command(&mut self, cmd: usize) -> Option<MenuFollowUp> {
         let app = self;
         unsafe {
             match cmd {
@@ -982,19 +984,15 @@ impl<P: Win> App<P> {
                         Ok(()) => log(if enabled { "autostart entry registered" } else { "autostart entry removed" }),
                         Err(e) => {
                             log(&e);
-                            let message = wide(&e);
-                            MessageBoxW(Some(app.main), PCWSTR(message.as_ptr()), w!("Tilework Autostart"), MB_OK | MB_ICONERROR);
+                            return Some(MenuFollowUp::AutostartError(e));
                         }
                     }
                 }
                 MENU_CHECK_UPDATE => check_update_async(),
-                MENU_RESTART_ADMIN => {
-                    // Only a started elevated instance (UAC accepted) may replace this one.
-                    if restart_as_administrator(app.filter.as_deref()) { PostQuitMessage(0); }
-                }
+                MENU_RESTART_ADMIN => return Some(MenuFollowUp::RestartAsAdministrator(app.filter.clone())),
                 MENU_OPEN_CONFIG => {
                     app.cfg.ensure_exists();
-                    return Config::path();
+                    return Config::path().map(MenuFollowUp::OpenConfig);
                 }
                 MENU_FFM_OFF => {
                     app.cfg.focus_follows_mouse = false;
@@ -1092,13 +1090,28 @@ fn open_config(path: &std::path::Path) {
     }
 }
 
+enum MenuFollowUp {
+    OpenConfig(std::path::PathBuf),
+    AutostartError(String),
+    RestartAsAdministrator(Option<String>),
+}
+
 fn show_menu() {
     if MENU_OPEN.with(|m| m.replace(true)) { return; }
     let snapshot = APP.with(|a| a.try_borrow().ok().and_then(|g| g.as_ref().map(|app| (app.cfg.clone(), app.main, app.desktop_on(app.shown)))));
     if let Some((cfg, main, on)) = snapshot {
         let cmd = unsafe { build_and_track_menu(&cfg, main, on) };
         let action = APP.with(|a| a.try_borrow_mut().ok().and_then(|mut g| g.as_mut().and_then(|app| app.menu_command(cmd))));
-        if let Some(path) = action { open_config(&path); }
+        match action {
+            Some(MenuFollowUp::OpenConfig(path)) => open_config(&path),
+            Some(MenuFollowUp::AutostartError(e)) => unsafe {
+                let message = wide(&e);
+                MessageBoxW(Some(main), PCWSTR(message.as_ptr()), w!("Tilework Autostart"), MB_OK | MB_ICONERROR);
+            },
+            // Only a started elevated instance (UAC accepted) may replace this one.
+            Some(MenuFollowUp::RestartAsAdministrator(filter)) if restart_as_administrator(filter.as_deref()) => unsafe { PostQuitMessage(0); },
+            _ => {}
+        }
     }
     MENU_OPEN.with(|m| m.set(false));
 }
@@ -2249,6 +2262,15 @@ mod scenarios {
         assert!(matches!(a.focus_border.state, OverlayState::Shown(_)));
         a.shutdown();
         assert_eq!((a.overlay.state, a.focus_border.state, a.followed), (OverlayState::Hidden, OverlayState::Hidden, 0));
+    }
+
+    // ---------- robustness ----------
+
+    #[test]
+    fn restart_as_administrator_is_deferred_until_the_app_borrow_ends() {
+        let (mut a, _) = app(); a.filter = Some("probe".into());
+        // The UAC prompt runs a nested message loop; it must not run inside menu_command.
+        assert!(matches!(a.menu_command(MENU_RESTART_ADMIN), Some(MenuFollowUp::RestartAsAdministrator(Some(f))) if f == "probe"));
     }
 
 }
