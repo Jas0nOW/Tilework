@@ -156,6 +156,13 @@ retried until the cursor moves to another window.
 
 Windows 10/11 apps (especially borderless, Electron, Terminal, and modern custom-rendered windows) frequently ignore DWM window border attributes. Tilework uses a layered, click-through overlay window (`TileworkFocusBorder`) to draw a 3 px accent around the focused tiled window. Eligibility follows the current foreground window and current desktop. Minimized, maximized, fullscreen and untracked windows clear the overlay.
 
+The frame follows the focused window's own location, hide and cloak events (hooked for that window's
+process only, to keep the event volume low), so it moves with asynchronous placements and disappears
+at once on minimize, maximize, close or cloak instead of on the next poll. Both overlays remember what
+they show: an unchanged drag preview or frame costs no window-manager call, a hide of a hidden overlay
+is free, and only a new target re-asserts the topmost position. Painting uses the DC's stock brush,
+so no GDI object is created per paint. A display change makes the next update unconditional.
+
 ## 11. Architecture
 
 ```

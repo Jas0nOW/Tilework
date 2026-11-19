@@ -12,7 +12,7 @@ use std::io::Write;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
-use windows::Win32::Graphics::Gdi::{BeginPaint, CreateBitmap, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect, PAINTSTRUCT};
+use windows::Win32::Graphics::Gdi::{BeginPaint, CreateBitmap, DeleteObject, EndPaint, FillRect, GetStockObject, RedrawWindow, SetDCBrushColor, DC_BRUSH, RDW_INVALIDATE, RDW_UPDATENOW, HBRUSH, HDC, PAINTSTRUCT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, RegisterHotKey, MOD_NOREPEAT, MOD_WIN, VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2};
@@ -38,6 +38,8 @@ const FFM_PRESETS: [u64; 5] = [150, 300, 500, 800, 1200];
 const ACCENT: u32 = 0x00FF823C; // BGR: a clear blue
 const DWMWA_BORDER_COLOR: DWMWINDOWATTRIBUTE = DWMWINDOWATTRIBUTE(34);
 const COLOR_DEFAULT: u32 = 0xFFFF_FFFF;
+/// Colour key of the layered overlays: pixels painted in it are fully transparent.
+const COLOR_KEY: u32 = 0x00FF00FF;
 /// Cursor distance from the screen border that counts as "drop at the outer edge".
 const EDGE_PX: i32 = 36;
 
@@ -137,8 +139,13 @@ pub struct App<P: Win = Platform> {
     border_original: HashMap<Hwnd, u32>,
     taskbar_created: u32,
     drag: Option<Drag>,
-    overlay: HWND,
-    focus_border: HWND,
+    overlay: Overlay,
+    focus_border: Overlay,
+    /// The window whose own location and visibility changes are followed (0 = none), and the
+    /// process those per-process event hooks are registered for.
+    followed: Hwnd,
+    follow_pid: u32,
+    follow_hooks: Vec<HWINEVENTHOOK>,
     main: HWND,
     filter: Option<String>,
     icon_on: HICON,
@@ -151,8 +158,71 @@ thread_local! {
     static PENDING: RefCell<VecDeque<PendingEvent>> = const { RefCell::new(VecDeque::new()) };
     static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
     static MENU_OPEN: Cell<bool> = const { Cell::new(false) };
+    /// Mirror of `App::followed` for the event hook callback, which cannot borrow the app.
+    static FOLLOWED: Cell<isize> = const { Cell::new(0) };
     /// What the drag overlay paints: the screen area and (rectangle, is the dragged window) pairs.
     static OVERLAY: RefCell<(Rect, Vec<(Rect, bool)>)> = const { RefCell::new((Rect::new(0, 0, 0, 0), Vec::new())) };
+}
+
+/// What an overlay window shows right now, as far as Tilework knows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OverlayState {
+    /// The system may have moved or shown it (display change): the next update must not be skipped.
+    Unknown,
+    Hidden,
+    Shown(Rect),
+}
+
+/// Win32 work an overlay update needs: reposition/raise the window, and repaint its content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OverlayPlan { position: bool, repaint: bool }
+
+/// Decides the minimum Win32 work for showing an overlay at `area`. `raise` re-asserts the topmost
+/// z-order; `repaint` means the content changed. A move with the same size keeps the content.
+fn overlay_plan(state: OverlayState, area: Rect, raise: bool, repaint: bool) -> OverlayPlan {
+    let same_size = matches!(state, OverlayState::Shown(r) if (r.w, r.h) == (area.w, area.h));
+    OverlayPlan { position: raise || state != OverlayState::Shown(area), repaint: repaint || !same_size }
+}
+
+/// A click-through, never-activating layered window that remembers what it shows, so repeated
+/// updates with the same geometry cost no window-manager calls at all.
+struct Overlay {
+    hwnd: HWND,
+    state: OverlayState,
+    /// Window-manager calls issued (SetWindowPos, RedrawWindow, ShowWindow), for diagnostics.
+    calls: u32,
+}
+
+impl Overlay {
+    fn new(hwnd: HWND) -> Self { Self { hwnd, state: OverlayState::Hidden, calls: 0 } }
+
+    fn show(&mut self, area: Rect, raise: bool, repaint: bool) {
+        if area.w <= 0 || area.h <= 0 { self.hide(); return; }
+        let plan = overlay_plan(self.state, area, raise, repaint);
+        self.state = OverlayState::Shown(area);
+        self.calls += u32::from(plan.position) + u32::from(plan.repaint);
+        if self.hwnd.is_invalid() { return; }
+        unsafe {
+            if plan.position {
+                let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), area.x, area.y, area.w, area.h, SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
+            }
+            // Paint now rather than when the message loop gets to it, so a moved or resized overlay
+            // never shows stale content. No erase: painting fully covers the client area.
+            if plan.repaint { let _ = RedrawWindow(Some(self.hwnd), None, None, RDW_INVALIDATE | RDW_UPDATENOW); }
+        }
+    }
+
+    /// Idempotent: hiding a hidden overlay issues no call.
+    fn hide(&mut self) {
+        if self.state == OverlayState::Hidden { return; }
+        self.state = OverlayState::Hidden;
+        self.calls += 1;
+        if self.hwnd.is_invalid() { return; }
+        unsafe { let _ = ShowWindow(self.hwnd, SW_HIDE); }
+    }
+
+    /// The system may have moved, resized or shown the window behind our back.
+    fn forget(&mut self) { self.state = OverlayState::Unknown; }
 }
 
 fn clean_text(text: &str, limit: usize) -> String {
@@ -505,19 +575,58 @@ impl<P: Win> App<P> {
     fn refresh_focus(&mut self) {
         let h = self.p.foreground_window();
         self.observe_foreground(h);
-        if h == 0 || self.shown == 0 || self.current_desktop() != self.shown || !self.desktop_on(self.shown)
-            || !self.is_tracked_here(h) || self.p.is_minimized(h) || self.p.is_maximized(h) || self.p.is_fullscreen(h) {
+        let tracked = h != 0 && self.shown != 0 && self.current_desktop() == self.shown && self.desktop_on(self.shown) && self.is_tracked_here(h);
+        // Followed even while maximized or minimized, so that restoring it brings the border back.
+        self.follow(if tracked { h } else { 0 });
+        if !tracked || self.p.is_minimized(h) || self.p.is_maximized(h) || self.p.is_fullscreen(h) {
             if let Some(prev) = self.bordered.take() { self.set_border(prev, COLOR_DEFAULT); }
             self.hide_focus_border();
             return;
         }
         self.last_tracked_focus = Some(h);
-        if self.bordered != Some(h) {
+        let new_target = self.bordered != Some(h);
+        if new_target {
             if let Some(prev) = self.bordered.replace(h) { self.set_border(prev, COLOR_DEFAULT); }
             self.set_border(h, ACCENT);
         }
         if self.drag.is_some() { self.hide_focus_border(); }
-        else { self.show_focus_border(h); }
+        else { self.show_focus_border(h, new_target); }
+    }
+
+    /// Registers location and visibility hooks for the process of `h` (0 = none), so the focus
+    /// border follows the window at once instead of on the next poll. Hooks are per process to keep
+    /// the event volume low; re-registered only when the process changes.
+    fn follow(&mut self, h: Hwnd) {
+        self.followed = h;
+        FOLLOWED.with(|f| f.set(h));
+        if self.main.is_invalid() { return; }
+        let mut pid = 0u32;
+        if h != 0 { unsafe { GetWindowThreadProcessId(hwnd_of(h), Some(&mut pid)); } }
+        if pid == self.follow_pid && (pid == 0 || !self.follow_hooks.is_empty()) { return; }
+        for hook in self.follow_hooks.drain(..) { unsafe { let _ = UnhookWinEvent(hook); } }
+        self.follow_pid = pid;
+        if pid == 0 { return; }
+        // object hide, object location change
+        for ev in [0x8003u32, 0x800B] {
+            let hook = unsafe { SetWinEventHook(ev, ev, None, Some(follow_event_proc), pid, 0, WINEVENT_OUTOFCONTEXT) };
+            if hook.is_invalid() { log(&format!("could not follow window events {ev:x} of process {pid}")); }
+            else { self.follow_hooks.push(hook); }
+        }
+    }
+
+    /// The followed window moved, resized, was hidden, cloaked or destroyed: update the border now.
+    fn follow_focus(&mut self, h: Hwnd, event: u32) {
+        if h == 0 || h != self.followed || self.drag.is_some() { return; }
+        if matches!(event, 0x8001 | 0x8003 | 0x8017) {
+            if let Some(b) = self.bordered.take() { self.set_border(b, COLOR_DEFAULT); }
+            self.hide_focus_border();
+            return;
+        }
+        if self.bordered == Some(h) && !self.p.is_minimized(h) && !self.p.is_maximized(h) && !self.p.is_fullscreen(h) {
+            self.show_focus_border(h, false);
+        } else {
+            self.refresh_focus();
+        }
     }
 
     /// Switches tiling on or off for the desktop that is shown right now.
@@ -530,11 +639,7 @@ impl<P: Win> App<P> {
         let on = self.desktop_on(d);
         log(&format!("tiling {} for desktop {d:x}", if on { "ON" } else { "OFF" }));
         self.shown = d;
-        self.drag = None;
-        unsafe {
-            let _ = KillTimer(Some(self.main), TIMER_DRAG);
-        }
-        self.hide_overlay();
+        self.cancel_drag();
         if let Some(b) = self.bordered.take() {
             self.set_border(b, COLOR_DEFAULT);
         }
@@ -548,7 +653,7 @@ impl<P: Win> App<P> {
 
     fn cancel_drag(&mut self) {
         self.drag = None;
-        unsafe { let _ = KillTimer(Some(self.main), TIMER_DRAG); }
+        if !self.main.is_invalid() { unsafe { let _ = KillTimer(Some(self.main), TIMER_DRAG); } }
         self.hide_overlay();
     }
 
@@ -580,6 +685,8 @@ impl<P: Win> App<P> {
 
     fn refresh_surfaces(&mut self) {
         self.monitor_moves.clear();
+        self.overlay.forget();
+        self.focus_border.forget();
         if self.current_desktop() == 0 { self.reconcile(true); return; }
         self.cancel_drag();
         let tops = self.p.all_top_level();
@@ -612,6 +719,7 @@ impl<P: Win> App<P> {
         let intent = self.p.resize_intent(h);
         log(&format!("drag start {h:x} class={} rect={}x{}@{},{} intent={intent:?} move_only={move_only}", self.p.class_name(h), v.w, v.h, v.x, v.y));
         self.hide_focus_border();
+        self.overlay.calls = 0;
         self.drag = Some(Drag { hwnd: h, key, start: v, resize: false, move_only, intent, dpi: self.p.dpi(h), monitor_changed: false, released_since: None, target: None, last: None });
         set_timer(self.main, TIMER_DRAG, 30);
     }
@@ -651,17 +759,14 @@ impl<P: Win> App<P> {
         // Release can arrive before the first 30 ms tick or after the last cursor move.
         let drop_area = self.drag_tick();
         let Some(d) = self.drag.take() else { return };
-        unsafe {
-            let _ = KillTimer(Some(self.main), TIMER_DRAG);
-        }
-        self.hide_overlay();
+        self.cancel_drag();
         if d.hwnd != h {
             return;
         }
         let home = d.key;
         if !self.drag_desktop_valid(home.desktop) { return; }
-        log(&format!("drag end {h:x} start={}x{}@{},{} end={} resize={} intent={:?} target={:?}", d.start.w, d.start.h, d.start.x, d.start.y,
-            self.p.visible_rect(h).map(|r| format!("{}x{}@{},{}", r.w, r.h, r.x, r.y)).unwrap_or_default(), d.resize, d.intent, d.target.map(|t| t.2)));
+        log(&format!("drag end {h:x} start={}x{}@{},{} end={} resize={} intent={:?} target={:?} overlay_calls={}", d.start.w, d.start.h, d.start.x, d.start.y,
+            self.p.visible_rect(h).map(|r| format!("{}x{}@{},{}", r.w, r.h, r.x, r.y)).unwrap_or_default(), d.resize, d.intent, d.target.map(|t| t.2), self.overlay.calls));
         if d.resize {
             if let (Some(v), Some(s)) = (self.p.visible_rect(h), self.surfaces.get_mut(&home))
                 && let Some(old) = s.tree.rect_of(s.area, h) {
@@ -811,8 +916,7 @@ impl<P: Win> App<P> {
 
     /// Shows the complete layout that a drop would produce: every window as a thin frame, the
     /// dragged window highlighted. That way it is clear what happens to the neighbours too.
-    fn show_overlay(&self, area: Rect, layout: &[(Hwnd, Rect)], dragged: Hwnd) {
-        if self.overlay.is_invalid() { return; }
+    fn show_overlay(&mut self, area: Rect, layout: &[(Hwnd, Rect)], dragged: Hwnd) {
         let items: Vec<(Rect, bool)> = layout.iter().map(|(h, r)| (*r, *h == dragged)).collect();
         let changed = OVERLAY.with(|o| {
             let mut o = o.borrow_mut();
@@ -823,42 +927,24 @@ impl<P: Win> App<P> {
                 true
             }
         });
-        unsafe {
-            let _ = SetWindowPos(self.overlay, Some(HWND_TOPMOST), area.x, area.y, area.w, area.h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-            if changed {
-                let _ = InvalidateRect(Some(self.overlay), None, true);
-            }
+        // A new target re-asserts the topmost position; an unchanged preview costs nothing.
+        self.overlay.show(area, changed, changed);
+    }
+
+    fn hide_overlay(&mut self) {
+        self.overlay.hide();
+    }
+
+    /// Frames the focused window. Unchanged geometry costs no call; only a new target is raised.
+    fn show_focus_border(&mut self, h: Hwnd, raise: bool) {
+        match self.p.visible_rect(h) {
+            Some(r) => self.focus_border.show(r, raise, false),
+            None => self.focus_border.hide(),
         }
     }
 
-    fn hide_overlay(&self) {
-        if self.overlay.is_invalid() { return; }
-        unsafe {
-            let _ = ShowWindow(self.overlay, SW_HIDE);
-        }
-    }
-
-    fn show_focus_border(&self, h: Hwnd) {
-        if self.focus_border.is_invalid() { return; }
-        let Some(r) = self.p.visible_rect(h) else {
-            self.hide_focus_border();
-            return;
-        };
-        if r.w <= 0 || r.h <= 0 {
-            self.hide_focus_border();
-            return;
-        }
-        unsafe {
-            let _ = SetWindowPos(self.focus_border, Some(HWND_TOPMOST), r.x, r.y, r.w, r.h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-            let _ = InvalidateRect(Some(self.focus_border), None, true);
-        }
-    }
-
-    fn hide_focus_border(&self) {
-        if self.focus_border.is_invalid() { return; }
-        unsafe {
-            let _ = ShowWindow(self.focus_border, SW_HIDE);
-        }
+    fn hide_focus_border(&mut self) {
+        self.focus_border.hide();
     }
 
     fn tray_data(&self) -> NOTIFYICONDATAW {
@@ -924,10 +1010,12 @@ impl<P: Win> App<P> {
 
     fn shutdown(&mut self) {
         restore_owned_snap();
+        self.cancel_drag();
         if let Some(b) = self.bordered.take() {
             self.set_border(b, COLOR_DEFAULT);
         }
         self.hide_focus_border();
+        self.follow(0);
         notify(NIM_DELETE, &self.tray_data());
         log("exit");
     }
@@ -1061,9 +1149,24 @@ unsafe extern "system" fn win_event_proc(_h: HWINEVENTHOOK, event: u32, hwnd: HW
     });
 }
 
+/// Per-process hook: forwards only the followed window's own location/visibility changes.
+unsafe extern "system" fn follow_event_proc(_h: HWINEVENTHOOK, event: u32, hwnd: HWND, id_object: i32, id_child: i32, _thread: u32, _time: u32) {
+    callback_guard(|| {
+    if id_object != 0 || id_child != 0 || hwnd.0.is_null() || id_of(hwnd) != FOLLOWED.with(Cell::get) {
+        return;
+    }
+    let main = MAIN_HANDLE.with(Cell::get);
+    if !main.is_invalid() {
+        unsafe { if PostMessageW(Some(main), WM_EVENT, WPARAM(event as usize), LPARAM(hwnd.0 as isize)).is_err() { queue_pending(WM_EVENT, WPARAM(event as usize), LPARAM(hwnd.0 as isize)); } }
+    }
+    });
+}
+
 unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     callback_guard(|| match msg {
         WM_ERASEBKGND => LRESULT(1),
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
         WM_PAINT => {
             paint_overlay(hwnd);
             LRESULT(0)
@@ -1072,39 +1175,40 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
     })
 }
 
+/// Fills with the DC's stock brush: no GDI object is created per paint, so none can leak.
+fn fill(hdc: HDC, rect: &RECT, color: u32) {
+    unsafe {
+        SetDCBrushColor(hdc, COLORREF(color));
+        FillRect(hdc, rect, HBRUSH(GetStockObject(DC_BRUSH).0));
+    }
+}
+
 fn paint_overlay(hwnd: HWND) {
     unsafe {
         let mut ps = PAINTSTRUCT::default();
         let hdc = BeginPaint(hwnd, &mut ps);
         let mut rc = RECT::default();
         let _ = GetClientRect(hwnd, &mut rc);
-        let key = CreateSolidBrush(COLORREF(0x00FF00FF)); // transparent colour key
-        let fill = CreateSolidBrush(COLORREF(ACCENT));
-        let grey = CreateSolidBrush(COLORREF(0x00E0E0E0));
-        let white = CreateSolidBrush(COLORREF(0x00FFFFFF));
-        FillRect(hdc, &rc, key);
+        fill(hdc, &rc, COLOR_KEY);
         OVERLAY.with(|o| {
             let (origin, items) = &*o.borrow();
             for (r, highlight) in items {
                 let inner = RECT { left: r.x - origin.x + 3, top: r.y - origin.y + 3, right: r.right() - origin.x - 3, bottom: r.bottom() - origin.y - 3 };
                 if *highlight {
-                    FillRect(hdc, &inner, fill);
+                    fill(hdc, &inner, ACCENT);
                 }
                 let t = 3;
-                let line = if *highlight { white } else { grey };
+                let line = if *highlight { 0x00FFFFFF } else { 0x00E0E0E0 };
                 for strip in [
                     RECT { bottom: inner.top + t, ..inner },
                     RECT { top: inner.bottom - t, ..inner },
                     RECT { right: inner.left + t, ..inner },
                     RECT { left: inner.right - t, ..inner },
                 ] {
-                    FillRect(hdc, &strip, line);
+                    fill(hdc, &strip, line);
                 }
             }
         });
-        for b in [key, fill, grey, white] {
-            let _ = DeleteObject(b.into());
-        }
         let _ = EndPaint(hwnd, &ps);
     }
 }
@@ -1112,6 +1216,8 @@ fn paint_overlay(hwnd: HWND) {
 unsafe extern "system" fn focus_border_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     callback_guard(|| match msg {
         WM_ERASEBKGND => LRESULT(1),
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
         WM_PAINT => {
             paint_focus_border(hwnd);
             LRESULT(0)
@@ -1126,9 +1232,7 @@ fn paint_focus_border(hwnd: HWND) {
         let hdc = BeginPaint(hwnd, &mut ps);
         let mut rc = RECT::default();
         let _ = GetClientRect(hwnd, &mut rc);
-        let key = CreateSolidBrush(COLORREF(0x00FF00FF));
-        let accent = CreateSolidBrush(COLORREF(ACCENT));
-        FillRect(hdc, &rc, key);
+        fill(hdc, &rc, COLOR_KEY);
         let t = 3;
         for strip in [
             RECT { left: 0, top: 0, right: rc.right, bottom: t },
@@ -1136,10 +1240,8 @@ fn paint_focus_border(hwnd: HWND) {
             RECT { left: 0, top: 0, right: t, bottom: rc.bottom },
             RECT { left: rc.right - t, top: 0, right: rc.right, bottom: rc.bottom },
         ] {
-            FillRect(hdc, &strip, accent);
+            fill(hdc, &strip, ACCENT);
         }
-        let _ = DeleteObject(key.into());
-        let _ = DeleteObject(accent.into());
         let _ = EndPaint(hwnd, &ps);
     }
 }
@@ -1165,6 +1267,8 @@ fn dispatch<P: Win>(app: &mut App<P>, event: PendingEvent) -> bool {
             0x0020 => { app.reconcile(false); },
             0x000A => app.drag_start(lp),
             0x000B => app.drag_end(lp),
+            0x800B => app.follow_focus(lp, 0x800B),
+            ev @ (0x8001 | 0x8003 | 0x8017) => { app.follow_focus(lp, ev); set_timer(app.main, TIMER_RECONCILE, 80); },
             _ => set_timer(app.main, TIMER_RECONCILE, 80),
         },
         WM_TIMER => match wp {
@@ -1238,9 +1342,8 @@ pub fn run(filter: Option<String>) {
         let hinst = GetModuleHandleW(None).unwrap();
         let class_main = w!("TileworkMain");
         let class_overlay = w!("TileworkOverlay");
-        let accent_brush = CreateSolidBrush(COLORREF(ACCENT));
         RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(main_proc), hInstance: hinst.into(), lpszClassName: class_main, ..Default::default() });
-        RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(overlay_proc), hInstance: hinst.into(), lpszClassName: class_overlay, hbrBackground: accent_brush, ..Default::default() });
+        RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(overlay_proc), hInstance: hinst.into(), lpszClassName: class_overlay, ..Default::default() });
         let main = CreateWindowExW(WINDOW_EX_STYLE(0), class_main, w!("Tilework"), WS_OVERLAPPED, 0, 0, 0, 0, None, None, Some(hinst.into()), None).unwrap();
         MAIN_HANDLE.with(|h| h.set(main));
         let overlay = CreateWindowExW(
@@ -1258,7 +1361,7 @@ pub fn run(filter: Option<String>) {
             None,
         )
         .unwrap();
-        let _ = SetLayeredWindowAttributes(overlay, COLORREF(0x00FF00FF), 200, LWA_COLORKEY | LWA_ALPHA);
+        let _ = SetLayeredWindowAttributes(overlay, COLORREF(COLOR_KEY), 200, LWA_COLORKEY | LWA_ALPHA);
 
         let class_focus = w!("TileworkFocusBorder");
         RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(focus_border_proc), hInstance: hinst.into(), lpszClassName: class_focus, ..Default::default() });
@@ -1277,7 +1380,7 @@ pub fn run(filter: Option<String>) {
             None,
         )
         .unwrap();
-        let _ = SetLayeredWindowAttributes(focus_border, COLORREF(0x00FF00FF), 0, LWA_COLORKEY);
+        let _ = SetLayeredWindowAttributes(focus_border, COLORREF(COLOR_KEY), 0, LWA_COLORKEY);
 
         let platform = Platform::new();
         let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
@@ -1306,8 +1409,9 @@ pub fn run(filter: Option<String>) {
             border_original: HashMap::new(),
             taskbar_created,
             drag: None,
-            overlay,
-            focus_border,
+            overlay: Overlay::new(overlay),
+            focus_border: Overlay::new(focus_border),
+            followed: 0, follow_pid: 0, follow_hooks: Vec::new(),
             main,
             filter,
             icon_on: make_icon(true),
@@ -1358,7 +1462,6 @@ pub fn run(filter: Option<String>) {
         let _ = DestroyWindow(focus_border);
         let _ = DestroyWindow(main);
         MAIN_HANDLE.with(|h| h.set(HWND(std::ptr::null_mut())));
-        let _ = DeleteObject(accent_brush.into());
     }
 }
 
@@ -1724,7 +1827,7 @@ mod scenarios {
         let p = FakeWin { windows: RefCell::new(windows), area: Cell::new(area), desktop: Cell::new(1), desktop_queries: Cell::new(0), requests: RefCell::new(Vec::new()), cursor: Cell::new((0, 0)), foreground: Cell::new(0), dpi: Cell::new(96) };
         let (drag, surfaces, _) = super::tests::drag_fixture();
         let key = drag.key;
-        (App { p, disabled: HashSet::new(), cfg: Config::default(), hover: None, hover_attempted: None, hover_foreground: None, hover_attempt_position: None, ghost_seen: HashSet::new(), reserved: HashSet::new(), shown: 1, desktop_error_logged: false, dispatch_desktop: Cell::new(None), dispatching: false, mins: HashMap::new(), placed: HashMap::new(), monitor_moves: HashMap::new(), floating: HashSet::new(), surfaces, last_tracked_focus: None, bordered: None, border_original: HashMap::new(), taskbar_created: 0, drag: None, overlay: HWND::default(), focus_border: HWND::default(), main: HWND::default(), filter: None, icon_on: HICON::default(), icon_off: HICON::default() }, key)
+        (App { p, disabled: HashSet::new(), cfg: Config::default(), hover: None, hover_attempted: None, hover_foreground: None, hover_attempt_position: None, ghost_seen: HashSet::new(), reserved: HashSet::new(), shown: 1, desktop_error_logged: false, dispatch_desktop: Cell::new(None), dispatching: false, mins: HashMap::new(), placed: HashMap::new(), monitor_moves: HashMap::new(), floating: HashSet::new(), surfaces, last_tracked_focus: None, bordered: None, border_original: HashMap::new(), taskbar_created: 0, drag: None, overlay: Overlay::new(HWND::default()), focus_border: Overlay::new(HWND::default()), followed: 0, follow_pid: 0, follow_hooks: Vec::new(), main: HWND::default(), filter: None, icon_on: HICON::default(), icon_off: HICON::default() }, key)
     }
     fn poll(app: &mut App<FakeWin>, key: SurfaceKey) {
         for p in app.placed.values_mut() { p.requested = Instant::now() - Duration::from_secs(1); }
@@ -1978,6 +2081,124 @@ mod scenarios {
         let result: LRESULT = contain_callback(|| panic!("simulated callback panic"), || { a.reserved.clear(); });
         assert_eq!(result, LRESULT(0));
         assert!(a.reserved.is_empty());
+    }
+
+    #[test]
+    fn overlay_updates_only_issue_the_window_calls_that_change_something() {
+        let r = Rect::new(0, 0, 800, 600);
+        let plan = |position, repaint| OverlayPlan { position, repaint };
+        assert_eq!(overlay_plan(OverlayState::Hidden, r, false, false), plan(true, true));
+        assert_eq!(overlay_plan(OverlayState::Unknown, r, false, false), plan(true, true));
+        assert_eq!(overlay_plan(OverlayState::Shown(r), r, false, false), plan(false, false));
+        assert_eq!(overlay_plan(OverlayState::Shown(r), Rect { x: 50, ..r }, false, false), plan(true, false));
+        assert_eq!(overlay_plan(OverlayState::Shown(r), Rect { w: 700, ..r }, false, false), plan(true, true));
+        assert_eq!(overlay_plan(OverlayState::Shown(r), r, true, false), plan(true, false));
+        assert_eq!(overlay_plan(OverlayState::Shown(r), r, false, true), plan(false, true));
+
+        let mut o = Overlay::new(HWND::default());
+        o.hide(); o.hide();
+        assert_eq!(o.calls, 0, "hiding a hidden overlay is free");
+        o.show(r, false, false); o.show(r, false, false);
+        assert_eq!((o.calls, o.state), (2, OverlayState::Shown(r)));
+        o.show(Rect { w: 0, ..r }, false, false);
+        assert_eq!((o.calls, o.state), (3, OverlayState::Hidden), "an empty rectangle hides");
+        o.forget(); o.hide();
+        assert_eq!(o.calls, 4, "after a display change the next hide is never skipped");
+    }
+
+    #[test]
+    fn an_unchanged_drag_preview_costs_no_window_calls_per_tick() {
+        let (mut a, key) = app(); a.apply(key, false);
+        a.drag_start(1);
+        let start = a.drag.as_ref().unwrap().start;
+        a.p.windows.borrow_mut().get_mut(&1).unwrap().rect = Rect { x: start.x + 300, ..start };
+        a.p.cursor.set((1400, 500));
+        for _ in 0..50 { a.drag_tick(); }
+        // Previously every 30 ms tick repositioned the overlay: 50 SetWindowPos + 1 InvalidateRect.
+        assert_eq!(a.overlay.calls, 2, "one show and one paint for the whole steady preview");
+        assert!(matches!(a.overlay.state, OverlayState::Shown(_)));
+
+        // A new target repaints once and re-asserts the z-order once.
+        a.p.cursor.set((1400, 1060));
+        for _ in 0..10 { a.drag_tick(); }
+        assert_eq!(a.overlay.calls, 4);
+
+        // Every cancel path hides, and repeated hides are free.
+        a.cancel_drag(); a.cancel_drag(); a.hide_overlay();
+        assert_eq!((a.overlay.calls, a.overlay.state), (5, OverlayState::Hidden));
+    }
+
+    #[test]
+    fn a_resize_drag_does_not_hide_the_overlay_on_every_tick() {
+        let (mut a, key) = app(); a.apply(key, false);
+        a.drag_start(1);
+        let start = a.drag.as_ref().unwrap().start;
+        a.p.windows.borrow_mut().get_mut(&1).unwrap().rect = Rect { w: start.w + 200, ..start };
+        for _ in 0..50 { a.drag_tick(); }
+        assert_eq!((a.overlay.calls, a.overlay.state), (0, OverlayState::Hidden));
+    }
+
+    #[test]
+    fn focus_border_follows_its_window_and_skips_unchanged_refreshes() {
+        let (mut a, key) = app(); a.apply(key, false);
+        a.p.foreground.set(1);
+        a.refresh_focus();
+        let r1 = a.p.visible_rect(1).unwrap();
+        assert_eq!((a.focus_border.state, a.followed), (OverlayState::Shown(r1), 1));
+        let calls = a.focus_border.calls;
+        for _ in 0..20 { a.refresh_focus(); a.reconcile(false); }
+        assert_eq!(a.focus_border.calls, calls, "periodic refreshes of an unchanged border are free");
+
+        // The window is moved asynchronously: its location event moves the border without a poll.
+        let moved = Rect { x: r1.x + 10, w: r1.w - 10, ..r1 };
+        a.p.windows.borrow_mut().get_mut(&1).unwrap().rect = moved;
+        dispatch(&mut a, PendingEvent { msg: WM_EVENT, wp: 0x800B, lp: 1 });
+        assert_eq!(a.focus_border.state, OverlayState::Shown(moved));
+        // Events of other windows are ignored.
+        a.p.windows.borrow_mut().get_mut(&1).unwrap().rect = r1;
+        dispatch(&mut a, PendingEvent { msg: WM_EVENT, wp: 0x800B, lp: 2 });
+        assert_eq!(a.focus_border.state, OverlayState::Shown(moved));
+
+        // Maximize hides it at once; restoring brings it back, still followed meanwhile.
+        a.p.windows.borrow_mut().get_mut(&1).unwrap().maximized = true;
+        dispatch(&mut a, PendingEvent { msg: WM_EVENT, wp: 0x800B, lp: 1 });
+        assert_eq!((a.focus_border.state, a.bordered, a.followed), (OverlayState::Hidden, None, 1));
+        a.p.windows.borrow_mut().get_mut(&1).unwrap().maximized = false;
+        dispatch(&mut a, PendingEvent { msg: WM_EVENT, wp: 0x800B, lp: 1 });
+        assert_eq!((a.focus_border.state, a.bordered), (OverlayState::Shown(r1), Some(1)));
+
+        // Destroy, hide and cloak remove a stale border immediately, before the reconcile timer.
+        for ev in [0x8001, 0x8003, 0x8017] {
+            a.refresh_focus();
+            assert_eq!(a.bordered, Some(1));
+            dispatch(&mut a, PendingEvent { msg: WM_EVENT, wp: ev, lp: 1 });
+            assert_eq!((a.focus_border.state, a.bordered), (OverlayState::Hidden, None), "event {ev:x}");
+        }
+
+        // A drag hides the border and ignores the dragged window's location events.
+        a.refresh_focus();
+        a.drag_start(1);
+        dispatch(&mut a, PendingEvent { msg: WM_EVENT, wp: 0x800B, lp: 1 });
+        assert_eq!(a.focus_border.state, OverlayState::Hidden);
+    }
+
+    #[test]
+    fn display_change_and_shutdown_leave_no_overlay_behind() {
+        let (mut a, key) = app(); a.apply(key, false);
+        a.p.foreground.set(1);
+        a.refresh_focus();
+        a.drag_start(2);
+        a.p.windows.borrow_mut().get_mut(&2).unwrap().rect.x += 300;
+        a.p.cursor.set((300, 500));
+        a.drag_tick();
+        assert!(matches!(a.overlay.state, OverlayState::Shown(_)));
+        dispatch(&mut a, PendingEvent { msg: WM_DISPLAYCHANGE, wp: 0, lp: 0 });
+        assert!(a.drag.is_none());
+        assert_eq!(a.overlay.state, OverlayState::Hidden);
+        // The border is re-shown unconditionally since the system may have moved it.
+        assert!(matches!(a.focus_border.state, OverlayState::Shown(_)));
+        a.shutdown();
+        assert_eq!((a.overlay.state, a.focus_border.state, a.followed), (OverlayState::Hidden, OverlayState::Hidden, 0));
     }
 
 }
