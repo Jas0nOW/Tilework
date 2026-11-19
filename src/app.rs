@@ -160,6 +160,7 @@ thread_local! {
     static PENDING: RefCell<VecDeque<PendingEvent>> = const { RefCell::new(VecDeque::new()) };
     static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
     static MENU_OPEN: Cell<bool> = const { Cell::new(false) };
+    static TRAY_ADDED: Cell<bool> = const { Cell::new(false) };
     /// Mirror of `App::followed` for the event hook callback, which cannot borrow the app.
     static FOLLOWED: Cell<isize> = const { Cell::new(0) };
     /// What the drag overlay paints: the screen area and (rectangle, is the dragged window) pairs.
@@ -471,6 +472,12 @@ impl<P: Win> App<P> {
     fn apply(&mut self, key: SurfaceKey, force: bool) {
         if self.shown == 0 || key.desktop != self.shown || !self.desktop_on(key.desktop) { return; }
         let Some(s) = self.surfaces.get_mut(&key) else { return };
+        // A monitor query that fails mid display change reports an empty work area. Laying out
+        // into it would shrink every window to its minimum; wait for the next poll instead.
+        if s.area.w <= 0 || s.area.h <= 0 {
+            log(&format!("apply skipped for monitor {:x}: empty work area", key.monitor));
+            return;
+        }
         s.tree.skipped = s.tree.leaves().into_iter().filter(|h| self.p.is_minimized(*h)).collect();
         let area = s.area;
         let layout = s.tree.layout(area);
@@ -681,6 +688,7 @@ impl<P: Win> App<P> {
     }
 
     fn poll_tick(&mut self) {
+        if !TRAY_ADDED.with(Cell::get) { self.add_tray(true); }
         self.poll_drag_release();
         if self.drag.is_none() { self.reconcile(false); }
     }
@@ -973,11 +981,25 @@ impl<P: Win> App<P> {
         notify(NIM_MODIFY, &self.tray_data());
     }
 
+    /// Explorer can time out while it is busy at sign-in, and then no TaskbarCreated follows: the
+    /// tray icon (the only way to exit) would be missing for the whole session. A failed add is
+    /// retried from the poll; NIM_MODIFY detects an add that timed out but took effect anyway.
+    fn add_tray(&self, retry: bool) {
+        if self.main.is_invalid() { return; }
+        let data = self.tray_data();
+        let added = unsafe { Shell_NotifyIconW(NIM_ADD, &data).as_bool() || Shell_NotifyIconW(NIM_MODIFY, &data).as_bool() };
+        TRAY_ADDED.with(|t| t.set(added));
+        if !added && !retry { log("could not add the tray icon; retrying"); }
+        if added && retry { log("tray icon added after retry"); }
+    }
+
     fn reload_saved_settings(&mut self, result: std::io::Result<()>) {
         match result { Ok(()) => self.cfg = Config::load(), Err(e) => log(&format!("settings update failed: {e}")) }
     }
 
-    fn menu_command(&mut self, cmd: usize) -> Option<std::path::PathBuf> {
+    /// Modal UI (message boxes, the UAC prompt) is returned as a follow-up and shown by the caller
+    /// after the app borrow ends: its nested message loop would otherwise queue every event.
+    fn menu_command(&mut self, cmd: usize) -> Option<MenuFollowUp> {
         let app = self;
         unsafe {
             match cmd {
@@ -988,19 +1010,15 @@ impl<P: Win> App<P> {
                         Ok(()) => log(if enabled { "autostart entry registered" } else { "autostart entry removed" }),
                         Err(e) => {
                             log(&e);
-                            let message = wide(&e);
-                            MessageBoxW(Some(app.main), PCWSTR(message.as_ptr()), w!("Tilework Autostart"), MB_OK | MB_ICONERROR);
+                            return Some(MenuFollowUp::AutostartError(e));
                         }
                     }
                 }
                 MENU_CHECK_UPDATE => check_update_async(),
-                MENU_RESTART_ADMIN => {
-                    // Only a started elevated instance (UAC accepted) may replace this one.
-                    if restart_as_administrator(app.filter.as_deref()) { PostQuitMessage(0); }
-                }
+                MENU_RESTART_ADMIN => return Some(MenuFollowUp::RestartAsAdministrator(app.filter.clone())),
                 MENU_OPEN_CONFIG => {
                     app.cfg.ensure_exists();
-                    return Config::path();
+                    return Config::path().map(MenuFollowUp::OpenConfig);
                 }
                 MENU_FFM_OFF => {
                     app.cfg.focus_follows_mouse = false;
@@ -1059,6 +1077,10 @@ fn check_update_async() {
     if CHECKING.swap(true, Ordering::Relaxed) { return; }
     if let Err(e) = std::thread::Builder::new().spawn(|| {
         let (message, release_url, buttons) = match crate::setup::check_for_update() {
+            // An elevated Tilework would start the browser as administrator; show the address instead.
+            UpdateStatus::Available { tag, release_url } if crate::platform::self_elevated() => (
+                format!("Tilework {tag} is available:\n{release_url}"), None, MB_OK | MB_ICONINFORMATION,
+            ),
             UpdateStatus::Available { tag, release_url } => (
                 format!("Tilework {tag} is available. Open the official release page?"),
                 Some(release_url), MB_YESNO | MB_ICONINFORMATION,
@@ -1098,13 +1120,28 @@ fn open_config(path: &std::path::Path) {
     }
 }
 
+enum MenuFollowUp {
+    OpenConfig(std::path::PathBuf),
+    AutostartError(String),
+    RestartAsAdministrator(Option<String>),
+}
+
 fn show_menu() {
     if MENU_OPEN.with(|m| m.replace(true)) { return; }
     let snapshot = APP.with(|a| a.try_borrow().ok().and_then(|g| g.as_ref().map(|app| (app.cfg.clone(), app.main, app.desktop_on(app.shown)))));
     if let Some((cfg, main, on)) = snapshot {
         let cmd = unsafe { build_and_track_menu(&cfg, main, on) };
         let action = APP.with(|a| a.try_borrow_mut().ok().and_then(|mut g| g.as_mut().and_then(|app| app.menu_command(cmd))));
-        if let Some(path) = action { open_config(&path); }
+        match action {
+            Some(MenuFollowUp::OpenConfig(path)) => open_config(&path),
+            Some(MenuFollowUp::AutostartError(e)) => unsafe {
+                let message = wide(&e);
+                MessageBoxW(Some(main), PCWSTR(message.as_ptr()), w!("Tilework Autostart"), MB_OK | MB_ICONERROR);
+            },
+            // Only a started elevated instance (UAC accepted) may replace this one.
+            Some(MenuFollowUp::RestartAsAdministrator(filter)) if restart_as_administrator(filter.as_deref()) => unsafe { PostQuitMessage(0); },
+            _ => {}
+        }
     }
     MENU_OPEN.with(|m| m.set(false));
 }
@@ -1303,7 +1340,7 @@ fn queue_pending(msg: u32, wp: WPARAM, lp: LPARAM) -> bool {
 
 fn dispatch<P: Win>(app: &mut App<P>, event: PendingEvent) -> bool {
     let PendingEvent { msg, wp, lp } = event;
-    if app.taskbar_created != 0 && msg == app.taskbar_created { notify(NIM_ADD, &app.tray_data()); return true; }
+    if app.taskbar_created != 0 && msg == app.taskbar_created { app.add_tray(false); return true; }
     if msg == WM_EVENT && matches!(wp as u32, 0x0003 | 0x0020 | 0x8017 | 0x8018) { app.p.invalidate_desktop(); }
     if msg == WM_TIMER && wp == TIMER_HOVER && !app.cfg.focus_follows_mouse { return true; }
     app.dispatch_desktop.set(None);
@@ -1386,12 +1423,20 @@ pub fn run(filter: Option<String>) {
     let cfg = Config::load();
     crate::tree::set_min_zone(cfg.min_zone_width, cfg.min_zone_height);
     unsafe {
-        let hinst = GetModuleHandleW(None).unwrap();
+        // A failure here (exhausted desktop heap or USER handle quota, no interactive desktop)
+        // must end the start-up cleanly and leave a trace, not panic. Snap is still untouched.
+        let hinst = match GetModuleHandleW(None) {
+            Ok(h) => h,
+            Err(e) => { log(&format!("cannot start: no module handle: {e}")); return; }
+        };
         let class_main = w!("TileworkMain");
         let class_overlay = w!("TileworkOverlay");
         RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(main_proc), hInstance: hinst.into(), lpszClassName: class_main, ..Default::default() });
         RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(overlay_proc), hInstance: hinst.into(), lpszClassName: class_overlay, ..Default::default() });
-        let main = CreateWindowExW(WINDOW_EX_STYLE(0), class_main, w!("Tilework"), WS_OVERLAPPED, 0, 0, 0, 0, None, None, Some(hinst.into()), None).unwrap();
+        let main = match CreateWindowExW(WINDOW_EX_STYLE(0), class_main, w!("Tilework"), WS_OVERLAPPED, 0, 0, 0, 0, None, None, Some(hinst.into()), None) {
+            Ok(h) => h,
+            Err(e) => { log(&format!("cannot start: could not create the main window: {e}")); return; }
+        };
         MAIN_HANDLE.with(|h| h.set(main));
         let overlay = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -1407,7 +1452,8 @@ pub fn run(filter: Option<String>) {
             Some(hinst.into()),
             None,
         )
-        .unwrap();
+        // Without an overlay, tiling still works; only the drag preview is missing.
+        .unwrap_or_else(|e| { log(&format!("could not create the drag preview window: {e}")); HWND::default() });
         let _ = SetLayeredWindowAttributes(overlay, COLORREF(COLOR_KEY), 200, LWA_COLORKEY | LWA_ALPHA);
 
         let class_focus = w!("TileworkFocusBorder");
@@ -1426,8 +1472,8 @@ pub fn run(filter: Option<String>) {
             Some(hinst.into()),
             None,
         )
-        .unwrap();
-        let _ = SetLayeredWindowAttributes(focus_border, COLORREF(COLOR_KEY), 0, LWA_COLORKEY);
+        .unwrap_or_else(|e| { log(&format!("could not create the focus border window: {e}")); HWND::default() });
+        let _ = SetLayeredWindowAttributes(focus_border,COLORREF(COLOR_KEY), 0, LWA_COLORKEY);
 
         let platform = Platform::new();
         let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
@@ -1464,8 +1510,7 @@ pub fn run(filter: Option<String>) {
             icon_on: make_icon(true),
             icon_off: make_icon(false),
         };
-        let nid = app.tray_data();
-        notify(NIM_ADD, &nid);
+        app.add_tray(false);
         APP.with(|a| *a.borrow_mut() = Some(app));
 
         // foreground, move/size start+end, minimise start+end, destroy, show, cloak, uncloak
@@ -2289,6 +2334,27 @@ mod scenarios {
         assert!(matches!(a.focus_border.state, OverlayState::Shown(_)));
         a.shutdown();
         assert_eq!((a.overlay.state, a.focus_border.state, a.followed), (OverlayState::Hidden, OverlayState::Hidden, 0));
+    }
+
+    // ---------- robustness ----------
+
+    #[test]
+    fn restart_as_administrator_is_deferred_until_the_app_borrow_ends() {
+        let (mut a, _) = app(); a.filter = Some("probe".into());
+        // The UAC prompt runs a nested message loop; it must not run inside menu_command.
+        assert!(matches!(a.menu_command(MENU_RESTART_ADMIN), Some(MenuFollowUp::RestartAsAdministrator(Some(f))) if f == "probe"));
+    }
+
+    #[test]
+    fn an_unreadable_monitor_work_area_never_squeezes_windows() {
+        let (mut a, key) = app(); a.apply(key, false);
+        let tiles: Vec<_> = [1, 2].iter().map(|h| a.p.visible_rect(*h)).collect();
+        // GetMonitorInfoW failing during a monitor hot-unplug reports an empty work area.
+        a.p.area.set(Rect::new(0, 0, 0, 0));
+        a.p.requests.borrow_mut().clear();
+        a.reconcile(true);
+        assert!(a.p.requests.borrow().is_empty(), "no placement into an empty area: {:?}", a.p.requests.borrow());
+        assert_eq!([1, 2].iter().map(|h| a.p.visible_rect(*h)).collect::<Vec<_>>(), tiles);
     }
 
 }

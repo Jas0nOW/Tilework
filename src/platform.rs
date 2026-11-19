@@ -627,7 +627,14 @@ fn managed_snap_inner(on: bool) -> bool {
     match options.open(&path) {
         Ok(mut file) => {
             use std::io::Write;
-            if file.write_all(marker).is_err() || file.sync_all().is_err() { return false; }
+            if let Err(e) = file.write_all(marker).and_then(|()| file.sync_all()) {
+                // Snap is still unchanged. A partial marker left behind would be rejected as corrupt
+                // by every later recovery and block Snap management until --restore-snap.
+                drop(file);
+                let _ = std::fs::remove_file(&path);
+                crate::app::log(&format!("could not write the Snap recovery marker: {e}"));
+                return false;
+            }
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             if read_marker_file(&path).ok().as_deref() != Some(marker.as_slice()) { return false; }
