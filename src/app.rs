@@ -32,6 +32,8 @@ const MENU_EXIT: usize = 2;
 const MENU_OPEN_CONFIG: usize = 3;
 const MENU_AUTOSTART: usize = 4;
 const MENU_CHECK_UPDATE: usize = 5;
+const MENU_RESTART_ADMIN: usize = 6;
+const MENU_ADMIN_INFO: usize = 7;
 const MENU_FFM_OFF: usize = 10;
 const MENU_FFM_BASE: usize = 20;
 const FFM_PRESETS: [u64; 5] = [150, 300, 500, 800, 1200];
@@ -868,6 +870,7 @@ impl<P: Win> App<P> {
         let tip = if self.shown == 0 { "Tilework: paused (desktop identity unavailable)" }
             else if on { "Tilework: ON for this desktop (click to turn off)" }
             else { "Tilework: OFF for this desktop (click to turn on)" };
+        let tip = if crate::platform::self_elevated() { format!("{tip} (Administrator)") } else { tip.to_string() };
         for (i, c) in tip.encode_utf16().take(127).enumerate() {
             nid.szTip[i] = c;
         }
@@ -899,6 +902,10 @@ impl<P: Win> App<P> {
                     }
                 }
                 MENU_CHECK_UPDATE => check_update_async(),
+                MENU_RESTART_ADMIN => {
+                    // Only a started elevated instance (UAC accepted) may replace this one.
+                    if restart_as_administrator(app.filter.as_deref()) { PostQuitMessage(0); }
+                }
                 MENU_OPEN_CONFIG => {
                     app.cfg.ensure_exists();
                     return Config::path();
@@ -1008,6 +1015,35 @@ fn show_menu() {
     MENU_OPEN.with(|m| m.set(false));
 }
 
+/// Starts an elevated copy of this exe via the UAC prompt. The copy waits for this instance to release
+/// the single-instance mutex (`--replace`). Returns true only when it was started; a cancelled prompt
+/// leaves this instance running.
+fn restart_as_administrator(filter: Option<&str>) -> bool {
+    use windows::Win32::Foundation::ERROR_CANCELLED;
+    use windows::Win32::UI::Shell::{ShellExecuteExW, SHELLEXECUTEINFOW};
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => { log(&format!("restart as administrator: cannot resolve own path: {e}")); return false; }
+    };
+    let mut args = String::from("--replace");
+    if let Some(f) = filter { args.push_str(&format!(" --filter \"{}\"", f.replace('"', ""))); }
+    let file = wide(&exe.to_string_lossy());
+    let params = wide(&args);
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        lpVerb: w!("runas"),
+        lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: PCWSTR(params.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    match unsafe { ShellExecuteExW(&mut info) } {
+        Ok(()) => { log("restarting as administrator"); true }
+        Err(e) if e.code() == ERROR_CANCELLED.to_hresult() => { log("restart as administrator cancelled"); false }
+        Err(e) => { log(&format!("restart as administrator failed: {e}")); false }
+    }
+}
+
 unsafe fn build_and_track_menu(cfg: &Config, main: HWND, on: bool) -> usize {
         unsafe {
             let Ok(menu) = CreatePopupMenu() else { log("could not create tray menu"); return 0; };
@@ -1038,6 +1074,11 @@ unsafe fn build_and_track_menu(cfg: &Config, main: HWND, on: bool) -> usize {
             }
 
             if let Err(e) = AppendMenuW(menu, MF_STRING, MENU_OPEN_CONFIG, w!("Open settings file")) { log(&format!("could not append tray menu item: {e}")); }
+            if crate::platform::self_elevated() {
+                if let Err(e) = AppendMenuW(menu, MF_STRING | MF_GRAYED, MENU_ADMIN_INFO, w!("Running as administrator")) { log(&format!("could not append tray menu item: {e}")); }
+            } else if let Err(e) = AppendMenuW(menu, MF_STRING, MENU_RESTART_ADMIN, w!("Restart as administrator")) {
+                log(&format!("could not append tray menu item: {e}"));
+            }
             if let Err(e) = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) { log(&format!("could not append tray menu item: {e}")); }
             if let Err(e) = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Exit Tilework")) { log(&format!("could not append tray menu item: {e}")); }
             let mut pt = POINT::default();

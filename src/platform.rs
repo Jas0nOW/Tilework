@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
-use windows::Win32::System::Threading::{OpenProcessToken, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -54,11 +54,34 @@ pub trait Win {
     }
 }
 
+const ELEVATION_CACHE_TTL: Duration = Duration::from_secs(30);
+
+unsafe fn token_elevated(token: HANDLE) -> bool {
+    let mut info = TOKEN_ELEVATION::default();
+    let mut len = 0u32;
+    unsafe {
+        GetTokenInformation(token, TokenElevation, Some(&mut info as *mut TOKEN_ELEVATION as *mut c_void),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32, &mut len).is_ok() && info.TokenIsElevated != 0
+    }
+}
+
+/// True when this Tilework process runs elevated (administrator). Determined once from the own token.
+pub fn self_elevated() -> bool {
+    static ELEVATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ELEVATED.get_or_init(|| unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() { return false; }
+        let elevated = token_elevated(token);
+        let _ = CloseHandle(token);
+        elevated
+    })
+}
+
 pub struct Platform {
     desktop_cache: Cell<Option<(Instant, u128)>>,
     vdm: Option<IVirtualDesktopManager>,
     com_initialized: bool,
-    elevated_pids: std::cell::RefCell<std::collections::HashMap<u32, bool>>,
+    elevated_pids: std::cell::RefCell<std::collections::HashMap<u32, (bool, Instant)>>,
 }
 
 pub fn hwnd_of(h: isize) -> HWND {
@@ -121,15 +144,18 @@ impl Platform {
             if cloak == 2 { self.raw_desktop_id(h) } else { 0 }, current)
     }
 
-    /// True for normal application windows that should be tiled.
-    /// True when the window belongs to a process we may not move. Tilework always runs as a standard
-    /// user, so windows of elevated processes reject `SetWindowPos` (UIPI) and would otherwise be
-    /// retried forever and leave a hole in the layout.
+    /// True when the window belongs to an elevated process this Tilework instance cannot move.
+    /// A standard-user Tilework is blocked by UIPI from `SetWindowPos` on elevated windows, which
+    /// would otherwise be retried forever and leave a hole in the layout. An elevated Tilework can
+    /// move them, so nothing is skipped. Results are cached per pid for a short time because pids
+    /// are reused.
     fn is_elevated_window(&self, h: isize) -> bool {
+        if self_elevated() { return false; }
         let mut pid = 0u32;
         unsafe { GetWindowThreadProcessId(hwnd_of(h), Some(&mut pid)); }
         if pid == 0 { return false; }
-        if let Some(known) = self.elevated_pids.borrow().get(&pid) { return *known; }
+        if let Some((known, at)) = self.elevated_pids.borrow().get(&pid)
+            && at.elapsed() < ELEVATION_CACHE_TTL { return *known; }
         let elevated = unsafe {
             match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
                 Err(_) => false,
@@ -138,12 +164,9 @@ impl Platform {
                     let result = if OpenProcessToken(process, TOKEN_QUERY, &mut token).is_err() {
                         true // a token we cannot even query belongs to a higher integrity level
                     } else {
-                        let mut info = TOKEN_ELEVATION::default();
-                        let mut len = 0u32;
-                        let ok = GetTokenInformation(token, TokenElevation, Some(&mut info as *mut TOKEN_ELEVATION as *mut c_void),
-                            std::mem::size_of::<TOKEN_ELEVATION>() as u32, &mut len).is_ok();
+                        let elevated = token_elevated(token);
                         let _ = CloseHandle(token);
-                        ok && info.TokenIsElevated != 0
+                        elevated
                     };
                     let _ = CloseHandle(process);
                     result
@@ -152,8 +175,8 @@ impl Platform {
         };
         let mut cache = self.elevated_pids.borrow_mut();
         if cache.len() > 512 { cache.clear(); }
-        cache.insert(pid, elevated);
-        if elevated { crate::app::log(&format!("ignoring elevated window {h:x} (pid {pid}): a standard-user Tilework cannot move it")); }
+        let changed = cache.insert(pid, (elevated, Instant::now())).is_none_or(|(old, _)| old != elevated);
+        if elevated && changed { crate::app::log(&format!("ignoring elevated window {h:x} (pid {pid}): a standard-user Tilework cannot move it; start Tilework as administrator to include it")); }
         elevated
     }
 

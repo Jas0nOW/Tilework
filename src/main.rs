@@ -24,20 +24,6 @@ fn main() {
         println!("Tilework {}", env!("CARGO_PKG_VERSION"));
         return;
     }
-    // Elevated window management would cross the trust boundary of per-user state.
-    if unsafe { windows::Win32::UI::Shell::IsUserAnAdmin().as_bool() } {
-        let message = "Tilework runs with standard user permissions. Start it without Run as administrator.";
-        if matches!(action, CliAction::Run(_)) {
-            use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
-            use windows::core::{PCWSTR, w};
-            let message: Vec<u16> = message.encode_utf16().chain([0]).collect();
-            unsafe { MessageBoxW(None, PCWSTR(message.as_ptr()), w!("Tilework"), MB_OK | MB_ICONERROR); }
-        } else {
-            attach_console();
-            eprintln!("{message}");
-        }
-        std::process::exit(1);
-    }
     // DPI must be established before creating any window or querying geometry.
     unsafe {
         use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
@@ -100,13 +86,8 @@ fn main() {
         CliAction::RestoreSnap(force) => {
             unsafe { let _ = windows::Win32::System::Console::AttachConsole(windows::Win32::System::Console::ATTACH_PARENT_PROCESS); }
             unsafe {
-                use windows::Win32::System::Threading::CreateMutexW;
-                use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
-                let mutex = match CreateMutexW(None, false, windows::core::w!("Local\\TileworkSingleInstance")) {
-                    Ok(m) => m,
-                    Err(e) => { app::log(&format!("could not create single-instance mutex: {e}")); return; }
-                };
-                let running = GetLastError() == ERROR_ALREADY_EXISTS;
+                use windows::Win32::Foundation::CloseHandle;
+                let Some((mutex, running)) = claim_instance() else { return; };
                 if restore_refused(true, running, force) {
                     eprintln!("Tilework is running; close it first or use --force to restore Snap.");
                     let _ = CloseHandle(mutex);
@@ -120,23 +101,8 @@ fn main() {
                 let _ = CloseHandle(mutex);
             }
         }
-        CliAction::Run(filter) => {
-            // Detach console for normal GUI execution
-            unsafe { let _ = windows::Win32::System::Console::FreeConsole(); }
-            unsafe {
-                use windows::Win32::System::Threading::CreateMutexW;
-                use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
-                let mutex = match CreateMutexW(None, false, windows::core::w!("Local\\TileworkSingleInstance")) {
-                    Ok(m) => m,
-                    Err(e) => { app::log(&format!("could not create single-instance mutex: {e}")); return; }
-                };
-                let running = GetLastError() == ERROR_ALREADY_EXISTS;
-                if !running {
-                    app::run(filter);
-                }
-                let _ = CloseHandle(mutex);
-            }
-        }
+        CliAction::Run(filter) => run_manager(filter, false),
+        CliAction::Replace(filter) => run_manager(filter, true),
     }
 }
 
@@ -178,6 +144,8 @@ fn dump() {
 enum CliAction {
     Version,
     Run(Option<String>),
+    /// Internal: like `Run`, but waits for a previous instance to exit (used by "Restart as administrator").
+    Replace(Option<String>),
     Dump,
     SnapStatus,
     RestoreSnap(bool),
@@ -194,6 +162,7 @@ fn parse_cli_action(args: &[String]) -> Result<CliAction, &'static str> {
     let mut filter = None;
     let mut action: Option<CliAction> = None;
     let mut force = false;
+    let mut replace = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -253,9 +222,17 @@ fn parse_cli_action(args: &[String]) -> Result<CliAction, &'static str> {
                 if force { return Err("--force may only be supplied once"); }
                 force = true;
             }
+            "--replace" => {
+                if replace { return Err("--replace may only be supplied once"); }
+                replace = true;
+            }
             _ => return Err("unknown argument"),
         }
         i += 1;
+    }
+
+    if replace && action.is_some() {
+        return Err("--replace cannot be combined with commands");
     }
 
     if force {
@@ -270,15 +247,55 @@ fn parse_cli_action(args: &[String]) -> Result<CliAction, &'static str> {
             return Err("--filter cannot be combined with commands");
         }
         Ok(act)
+    } else if replace {
+        Ok(CliAction::Replace(filter))
     } else {
         Ok(CliAction::Run(filter))
+    }
+}
+
+/// Runs the tiling manager unless another instance owns the mutex. With `replace` (a restart from the
+/// tray) the old instance may still be shutting down, so wait up to 10 s for it to release the mutex.
+fn run_manager(filter: Option<String>, replace: bool) {
+    // Detach console for normal GUI execution
+    unsafe { let _ = windows::Win32::System::Console::FreeConsole(); }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let Some((mutex, running)) = claim_instance() else { return; };
+        if !running {
+            app::run(filter);
+            unsafe { let _ = windows::Win32::Foundation::CloseHandle(mutex); }
+            return;
+        }
+        if !mutex.is_invalid() { unsafe { let _ = windows::Win32::Foundation::CloseHandle(mutex); } }
+        if !replace { return; }
+        if std::time::Instant::now() >= deadline {
+            app::log("previous Tilework instance did not exit in time");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Opens the single-instance mutex. Returns the handle and whether another instance already owns it.
+/// An instance running with different elevation owns a mutex we may not open (access denied), which
+/// also means "already running". `None` means the check itself failed (logged).
+fn claim_instance() -> Option<(windows::Win32::Foundation::HANDLE, bool)> {
+    use windows::Win32::Foundation::{GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, HANDLE};
+    use windows::Win32::System::Threading::CreateMutexW;
+    unsafe {
+        match CreateMutexW(None, false, windows::core::w!("Local\\TileworkSingleInstance")) {
+            Ok(m) => Some((m, GetLastError() == ERROR_ALREADY_EXISTS)),
+            Err(e) if e.code() == ERROR_ACCESS_DENIED.to_hresult() => Some((HANDLE::default(), true)),
+            Err(e) => { app::log(&format!("could not create single-instance mutex: {e}")); None }
+        }
     }
 }
 
 #[cfg(test)]
 fn parse_filter(args: &[String]) -> Result<Option<String>, &'static str> {
     match parse_cli_action(args)? {
-        CliAction::Run(f) => Ok(f),
+        CliAction::Run(f) | CliAction::Replace(f) => Ok(f),
         CliAction::Dump | CliAction::SnapStatus | CliAction::RestoreSnap(_) => Ok(None),
         _ => Err("installer/updater flags cannot be evaluated as simple filters"),
     }
@@ -306,6 +323,17 @@ mod tests {
         assert!(!restore_refused(false, true, false));
         assert!(parse_filter(&["app".into(), "--force".into()]).is_err());
         assert!(parse_filter(&["app".into(), "--force".into(), "--restore-snap".into()]).is_ok());
+    }
+
+    #[test]
+    fn replace_only_combines_with_run_and_filter() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_cli_action(&a(&["app", "--replace"])), Ok(CliAction::Replace(None)));
+        assert_eq!(parse_cli_action(&a(&["app", "--replace", "--filter", "x"])), Ok(CliAction::Replace(Some("x".into()))));
+        assert!(parse_cli_action(&a(&["app", "--replace", "--replace"])).is_err());
+        assert!(parse_cli_action(&a(&["app", "--replace", "--dump"])).is_err());
+        assert!(parse_cli_action(&a(&["app", "--version", "--replace"])).is_err());
+        assert!(parse_cli_action(&a(&["app", "--replace", "--force"])).is_err());
     }
 
     #[test]
