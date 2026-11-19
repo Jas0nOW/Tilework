@@ -27,20 +27,20 @@ optional addition **(planned)**.
 
 ## 2. Core concepts
 
-**Surface** â€“ one virtual desktop on one monitor. Every surface has its own layout. Surfaces never
+**Surface** – one virtual desktop on one monitor. Every surface has its own layout. Surfaces never
 influence each other; moving a window to another monitor or desktop moves it to that surface's
 layout.
 
-**Zone tree** â€“ the layout of a surface. The tree is made of containers and windows:
+**Zone tree** – the layout of a surface. The tree is made of containers and windows:
 
-- a *container* holds 2â€“4 zones side by side (horizontal) or stacked (vertical);
+- a *container* holds 2–4 zones side by side (horizontal) or stacked (vertical);
 - a *zone* is either a window or another container;
 - each zone has a weight; zones stay equal until the user resizes one.
 
 Invariants (checked by tests): no container has fewer than 2 or more than 4 zones, a zone is never
 empty, the zones always cover the surface completely without gaps or overlaps.
 
-**Work area** â€“ the monitor without the taskbar. Windows are placed so that their *visible* edges
+**Work area** – the monitor without the taskbar. Windows are placed so that their *visible* edges
 match the zone (the invisible resize borders of Windows 10/11 are compensated).
 
 ## 3. Automatic placement
@@ -87,10 +87,10 @@ added or removed; there is an "equalise" operation in the tree **(UI planned)**.
 
 ## 6. Minimum sizes
 
-Some apps refuse to get small (Chrome â‰ˆ 502 px wide, Discord â‰ˆ 802Ã—501, ChatGPT â‰ˆ 480Ã—600). The
+Some apps refuse to get small (Chrome ≈ 502 px wide, Discord ≈ 802×501, ChatGPT ≈ 480×600). The
 program does not fight them:
 
-- Every zone has a global floor (default 260Ã—160 px, configurable) so that part of the title bar
+- Every zone has a global floor (default 260×160 px, configurable) so that part of the title bar
   always stays grabbable.
 - Placement requests are asynchronous and skip hung and minimized windows. A displaced window is
   placed again with bounded retries and backoff. A larger result is considered a possible refusal
@@ -126,6 +126,7 @@ out.
 
 - **Maximized and full-screen windows** already tiled keep their reserved tile and are left alone until restored, including across minimize/restore. Neighbours keep their positions. A newly adopted maximized window is restored into its tile; genuinely full-screen untracked windows are not adopted. Full-screen detection requires monitor coverage and a style without the normal caption. A normal maximized window on a monitor without a visible taskbar is adopted and restored. A tile matching the whole monitor is still a tile.
 - Dialogs, tool windows, pop-ups, menus, tooltips, the taskbar and the desktop.
+- Windows of elevated (administrator) programs, unless Tilework itself runs as administrator (section 11). A standard instance cannot move them, so it skips them.
 - Minimized tracked windows keep their reserved tiles while they remain top-level windows; this preserves manual layouts across Win+D.
 
 ## 9. Windows' own snapping
@@ -168,6 +169,7 @@ so no GDI object is created per paint. A display change makes the next update un
 ```
 main.rs      DPI awareness, single instance, CLI and diagnostics
 setup.rs     per-user sign-in entry and stable-release checks against the fixed GitHub repository
+update.rs    one-click install: download, SHA-256 check, hand-off to the installer
 packaging/   per-user Inno Setup installer, Start Menu shortcut and uninstall registration
 config.rs    key=value settings file (%LOCALAPPDATA%\<name>\config.ini), tolerant parser
 tree.rs      pure logic, no Windows calls: zone tree, placement policy (V3 progression), drop zones,
@@ -210,6 +212,7 @@ Tray menu and `config.ini`:
 | `focus_follows_mouse` | `true` | focus the window under the cursor |
 | `focus_delay_ms` | `300` | how long the cursor must rest (50–5000) |
 | `min_zone_width` / `min_zone_height` | `260` / `160` | smallest zone |
+| `check_updates` | `true` | check GitHub once a day for a newer stable release (tray: **Check for updates automatically**) |
 
 ## 13. Browser simulation and release verification
 

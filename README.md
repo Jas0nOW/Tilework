@@ -27,7 +27,7 @@ The demo is a single-monitor simulation. Add five windows to see the layout prog
 That's it. Works on Windows 10 (22H2) and Windows 11, 64-bit. No administrator rights needed. To also tile administrator windows, see [Administrator windows](#administrator-windows).
 
 **Handy to know**
-- **Start together with Windows:** right-click the Tilework icon next to the clock and tick **Start with Windows**.
+- **Start together with Windows:** right-click the Tilework icon next to the clock and tick **Start with Windows** (installed version only).
 - **Pause:** press `Win + Y` or click the icon.
 - **Uninstall:** open **Settings → Apps**, pick **Tilework** and click **Uninstall**.
 - **No installation wanted?** Download `Tilework-Portable-x64.exe` instead and just open it.
@@ -54,7 +54,7 @@ Setup stops when it finds legacy executable files or a visible scheduled task ma
 
 #### Update or roll back
 
-Tilework checks GitHub for a newer public stable release about a minute after it starts and then at most once a day. It only talks to GitHub, never blocks while doing so, and stays silent when there is nothing new or the network is down. When a release is available, a tray notification appears (at most once a day per version) and the tray menu gains **Install update vX.Y.Z**.
+Tilework checks GitHub for a newer public stable release about a minute after it starts and then at most once a day. It only talks to GitHub, never blocks while doing so, and stays silent when there is nothing new or the network is down. When a release is available, a tray notification appears (at most once a day per version) and the tray menu gains **Install update vX.Y.Z** (portable copies: **Download update vX.Y.Z**).
 
 **One-click install** (installed copies): click the notification or the menu item. Tilework downloads the official `Tilework-Setup-x64.exe` and `SHA256SUMS.txt` of that release over HTTPS into `%LOCALAPPDATA%\Tilework\updates`, checks the installer against its published SHA-256, and only then closes itself, runs the installer for your user account and starts the new version again. If the check fails, nothing is installed and you get a message. The binaries are not code-signed, so this checksum is the integrity check. The portable exe cannot be replaced by the installer, so it opens the release page instead. A Tilework started as administrator only shows the release address; start it normally to install.
 
@@ -94,6 +94,7 @@ App minimum sizes, foreground restrictions, and ambiguous virtual desktop inform
 | `--version` | Show the executable version |
 | `--dump` | Print eligible windows and proposed bounds without moving them |
 | `--filter TEXT` | Run with management restricted to matching window titles |
+| `--check-update` | Check GitHub once for a newer stable release and print the result |
 | `--snap-status` | Read the current Windows Snap setting |
 | `--restore-snap` | Enable Windows Snap and clear a recovery marker after Tilework has exited |
 | `--autostart-on`, `--autostart-off`, `--autostart-status` | Manage or inspect the current user's sign-in entry |
@@ -119,3 +120,4 @@ Tilework starts with normal rights by default. To tile administrator windows too
 ## Known limitations
 
 - Started normally, Tilework cannot move windows of elevated (administrator) programs, for example a "Run as administrator" PowerShell. Windows forbids it, so Tilework leaves those windows alone and keeps them out of the layout. To include them, start Tilework as administrator (see [Administrator windows](#administrator-windows)).
+- **Start with Windows** always starts Tilework with normal rights. After sign-in, elevated windows therefore stay untouched until you start Tilework as administrator yourself.
