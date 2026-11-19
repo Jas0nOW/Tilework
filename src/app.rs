@@ -160,6 +160,7 @@ thread_local! {
     static PENDING: RefCell<VecDeque<PendingEvent>> = const { RefCell::new(VecDeque::new()) };
     static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
     static MENU_OPEN: Cell<bool> = const { Cell::new(false) };
+    static TRAY_ADDED: Cell<bool> = const { Cell::new(false) };
     /// Mirror of `App::followed` for the event hook callback, which cannot borrow the app.
     static FOLLOWED: Cell<isize> = const { Cell::new(0) };
     /// What the drag overlay paints: the screen area and (rectangle, is the dragged window) pairs.
@@ -687,6 +688,7 @@ impl<P: Win> App<P> {
     }
 
     fn poll_tick(&mut self) {
+        if !TRAY_ADDED.with(Cell::get) { self.add_tray(true); }
         self.poll_drag_release();
         if self.drag.is_none() { self.reconcile(false); }
     }
@@ -971,6 +973,18 @@ impl<P: Win> App<P> {
 
     fn update_tray(&self) {
         notify(NIM_MODIFY, &self.tray_data());
+    }
+
+    /// Explorer can time out while it is busy at sign-in, and then no TaskbarCreated follows: the
+    /// tray icon (the only way to exit) would be missing for the whole session. A failed add is
+    /// retried from the poll; NIM_MODIFY detects an add that timed out but took effect anyway.
+    fn add_tray(&self, retry: bool) {
+        if self.main.is_invalid() { return; }
+        let data = self.tray_data();
+        let added = unsafe { Shell_NotifyIconW(NIM_ADD, &data).as_bool() || Shell_NotifyIconW(NIM_MODIFY, &data).as_bool() };
+        TRAY_ADDED.with(|t| t.set(added));
+        if !added && !retry { log("could not add the tray icon; retrying"); }
+        if added && retry { log("tray icon added after retry"); }
     }
 
     fn reload_saved_settings(&mut self, result: std::io::Result<()>) {
@@ -1320,7 +1334,7 @@ fn queue_pending(msg: u32, wp: WPARAM, lp: LPARAM) -> bool {
 
 fn dispatch<P: Win>(app: &mut App<P>, event: PendingEvent) -> bool {
     let PendingEvent { msg, wp, lp } = event;
-    if app.taskbar_created != 0 && msg == app.taskbar_created { notify(NIM_ADD, &app.tray_data()); return true; }
+    if app.taskbar_created != 0 && msg == app.taskbar_created { app.add_tray(false); return true; }
     if msg == WM_EVENT && matches!(wp as u32, 0x0003 | 0x0020 | 0x8017 | 0x8018) { app.p.invalidate_desktop(); }
     if msg == WM_TIMER && wp == TIMER_HOVER && !app.cfg.focus_follows_mouse { return true; }
     app.dispatch_desktop.set(None);
@@ -1490,8 +1504,7 @@ pub fn run(filter: Option<String>) {
             icon_on: make_icon(true),
             icon_off: make_icon(false),
         };
-        let nid = app.tray_data();
-        notify(NIM_ADD, &nid);
+        app.add_tray(false);
         APP.with(|a| *a.borrow_mut() = Some(app));
 
         // foreground, move/size start+end, minimise start+end, destroy, show, cloak, uncloak
