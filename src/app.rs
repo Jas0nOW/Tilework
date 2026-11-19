@@ -1057,6 +1057,10 @@ fn check_update_async() {
     if CHECKING.swap(true, Ordering::Relaxed) { return; }
     if let Err(e) = std::thread::Builder::new().spawn(|| {
         let (message, release_url, buttons) = match crate::setup::check_for_update() {
+            // An elevated Tilework would start the browser as administrator; show the address instead.
+            UpdateStatus::Available { tag, release_url } if crate::platform::self_elevated() => (
+                format!("Tilework {tag} is available:\n{release_url}"), None, MB_OK | MB_ICONINFORMATION,
+            ),
             UpdateStatus::Available { tag, release_url } => (
                 format!("Tilework {tag} is available. Open the official release page?"),
                 Some(release_url), MB_YESNO | MB_ICONINFORMATION,
