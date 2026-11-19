@@ -1,7 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 (beta)
 
+- Give the program, its Start menu shortcut and the installer a Tilework icon.
 - Check for updates automatically (about a minute after start, then at most once a day; tray toggle **Check for updates automatically**, `check_updates` in `config.ini`, default on). New releases are announced once a day per version by a tray notification and an **Install update** menu item.
 - One-click update: download the official installer, verify its SHA-256 against the release's `SHA256SUMS.txt`, then close Tilework, run the per-user installer and restart the new version. Portable copies open the release page instead.
 - Allow starting Tilework with administrator rights. An elevated Tilework also tiles elevated windows; a normal one keeps leaving them alone.

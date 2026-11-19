@@ -28,6 +28,7 @@ WizardStyle=modern
 AppMutex=Local\TileworkSingleInstance
 CloseApplications=no
 RestartApplications=no
+SetupIconFile=..\assets\tilework.ico
 UninstallDisplayIcon={app}\tilework.exe
 UninstallDisplayName=Tilework
 Uninstallable=yes
