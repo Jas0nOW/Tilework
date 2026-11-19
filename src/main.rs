@@ -87,7 +87,10 @@ fn main() {
             unsafe { let _ = windows::Win32::System::Console::AttachConsole(windows::Win32::System::Console::ATTACH_PARENT_PROCESS); }
             unsafe {
                 use windows::Win32::Foundation::CloseHandle;
-                let Some((mutex, running)) = claim_instance() else { return; };
+                let Some((mutex, running)) = claim_instance() else {
+                    eprintln!("Could not check whether Tilework is running; Snap was not changed.");
+                    std::process::exit(1);
+                };
                 if restore_refused(true, running, force) {
                     eprintln!("Tilework is running; close it first or use --force to restore Snap.");
                     let _ = CloseHandle(mutex);
