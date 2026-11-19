@@ -1380,12 +1380,20 @@ pub fn run(filter: Option<String>) {
     let cfg = Config::load();
     crate::tree::set_min_zone(cfg.min_zone_width, cfg.min_zone_height);
     unsafe {
-        let hinst = GetModuleHandleW(None).unwrap();
+        // A failure here (exhausted desktop heap or USER handle quota, no interactive desktop)
+        // must end the start-up cleanly and leave a trace, not panic. Snap is still untouched.
+        let hinst = match GetModuleHandleW(None) {
+            Ok(h) => h,
+            Err(e) => { log(&format!("cannot start: no module handle: {e}")); return; }
+        };
         let class_main = w!("TileworkMain");
         let class_overlay = w!("TileworkOverlay");
         RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(main_proc), hInstance: hinst.into(), lpszClassName: class_main, ..Default::default() });
         RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(overlay_proc), hInstance: hinst.into(), lpszClassName: class_overlay, ..Default::default() });
-        let main = CreateWindowExW(WINDOW_EX_STYLE(0), class_main, w!("Tilework"), WS_OVERLAPPED, 0, 0, 0, 0, None, None, Some(hinst.into()), None).unwrap();
+        let main = match CreateWindowExW(WINDOW_EX_STYLE(0), class_main, w!("Tilework"), WS_OVERLAPPED, 0, 0, 0, 0, None, None, Some(hinst.into()), None) {
+            Ok(h) => h,
+            Err(e) => { log(&format!("cannot start: could not create the main window: {e}")); return; }
+        };
         MAIN_HANDLE.with(|h| h.set(main));
         let overlay = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -1401,7 +1409,8 @@ pub fn run(filter: Option<String>) {
             Some(hinst.into()),
             None,
         )
-        .unwrap();
+        // Without an overlay, tiling still works; only the drag preview is missing.
+        .unwrap_or_else(|e| { log(&format!("could not create the drag preview window: {e}")); HWND::default() });
         let _ = SetLayeredWindowAttributes(overlay, COLORREF(COLOR_KEY), 200, LWA_COLORKEY | LWA_ALPHA);
 
         let class_focus = w!("TileworkFocusBorder");
@@ -1420,8 +1429,8 @@ pub fn run(filter: Option<String>) {
             Some(hinst.into()),
             None,
         )
-        .unwrap();
-        let _ = SetLayeredWindowAttributes(focus_border, COLORREF(COLOR_KEY), 0, LWA_COLORKEY);
+        .unwrap_or_else(|e| { log(&format!("could not create the focus border window: {e}")); HWND::default() });
+        let _ = SetLayeredWindowAttributes(focus_border,COLORREF(COLOR_KEY), 0, LWA_COLORKEY);
 
         let platform = Platform::new();
         let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
