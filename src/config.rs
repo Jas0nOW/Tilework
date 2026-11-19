@@ -28,7 +28,8 @@ impl Config {
 
     pub fn parse(text: &str) -> Self {
         let mut c = Self::default();
-        for line in text.lines() {
+        // Notepad and other editors may save UTF-8 with a byte order mark.
+        for line in text.trim_start_matches('\u{feff}').lines() {
             let line = line.trim();
             if line.starts_with('#') || line.starts_with(';') { continue; }
             let Some((k, v)) = line.split_once('=') else { continue };
@@ -360,6 +361,16 @@ mod tests {
         assert_eq!(c.focus_delay_ms, 5000);
         assert_eq!(c.min_zone_width, 80);
         assert!(c.focus_follows_mouse);
+    }
+
+    #[test]
+    fn a_byte_order_mark_does_not_hide_the_first_setting() {
+        // Some Windows editors save UTF-8 with a byte order mark.
+        let c = Config::parse("\u{feff}focus_follows_mouse=false\r\nfocus_delay_ms=800\r\n");
+        assert!(!c.focus_follows_mouse);
+        assert_eq!(c.focus_delay_ms, 800);
+        let c = Config::parse("\u{feff}# comment\nmin_zone_width=300\n");
+        assert_eq!(c.min_zone_width, 300);
     }
 
     #[test]
