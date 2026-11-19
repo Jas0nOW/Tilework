@@ -15,8 +15,9 @@ use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
 pub const RELEASES_URL: &str = "https://github.com/Jas0nOW/Tilework/releases";
+pub const SUMS: &str = "SHA256SUMS.txt";
 const RELEASE_API: &str = "https://api.github.com/repos/Jas0nOW/Tilework/releases/latest";
-const INSTALLER: &str = "Tilework-Setup-x64.exe";
+pub const INSTALLER: &str = "Tilework-Setup-x64.exe";
 const RUN_KEY: windows::core::PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const RUN_NAME: windows::core::PCWSTR = w!("Tilework");
 const MAX_RUN_LENGTH: usize = 260;
@@ -115,7 +116,7 @@ pub enum UpdateStatus {
     Error(String),
 }
 
-fn parse_version(value: &str) -> Option<(u32, u32, u32)> {
+pub fn parse_version(value: &str) -> Option<(u32, u32, u32)> {
     let mut parts = value.split('.');
     let mut next = || {
         let part = parts.next()?;
@@ -171,16 +172,24 @@ fn interpret_response(response: &[u8], current: (u32, u32, u32)) -> UpdateStatus
     })
 }
 
+/// The System32 `curl.exe` (never a copy found through `PATH`).
+pub fn curl_path() -> Result<PathBuf, String> {
+    let mut system = [0u16; 260];
+    let len = unsafe { GetSystemDirectoryW(Some(&mut system)) } as usize;
+    if len == 0 || len >= system.len() {
+        return Err("Could not locate the Windows system directory.".into());
+    }
+    Ok(PathBuf::from(OsString::from_wide(&system[..len])).join("curl.exe"))
+}
+
 pub fn check_for_update() -> UpdateStatus {
     let Some(current) = parse_version(env!("CARGO_PKG_VERSION")) else {
         return UpdateStatus::Error("This build has an invalid version.".into());
     };
-    let mut system = [0u16; 260];
-    let len = unsafe { GetSystemDirectoryW(Some(&mut system)) } as usize;
-    if len == 0 || len >= system.len() {
-        return UpdateStatus::Error("Could not locate the Windows system directory.".into());
-    }
-    let curl = PathBuf::from(OsString::from_wide(&system[..len])).join("curl.exe");
+    let curl = match curl_path() {
+        Ok(curl) => curl,
+        Err(e) => return UpdateStatus::Error(e),
+    };
     match Command::new(curl)
         .creation_flags(CREATE_NO_WINDOW.0)
         .args([

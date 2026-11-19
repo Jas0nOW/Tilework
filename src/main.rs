@@ -4,6 +4,7 @@ mod config;
 mod platform;
 pub mod setup;
 mod tree;
+mod update;
 
 use platform::Platform;
 use std::collections::HashMap;
@@ -268,6 +269,9 @@ fn run_manager(filter: Option<String>, replace: bool) {
         if !running {
             app::run(filter);
             unsafe { let _ = windows::Win32::Foundation::CloseHandle(mutex); }
+            // After the mutex is gone, so the installer's AppMutex check passes at once.
+            // Never set when elevated: install_update refuses to prepare it.
+            update::launch_pending_installer();
             return;
         }
         if !mutex.is_invalid() { unsafe { let _ = windows::Win32::Foundation::CloseHandle(mutex); } }

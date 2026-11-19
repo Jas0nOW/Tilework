@@ -51,6 +51,9 @@ Name: "{autoprograms}\Uninstall Tilework"; Filename: "{uninstallexe}"
 
 [Run]
 Filename: "{app}\tilework.exe"; Description: "Launch Tilework"; Flags: postinstall nowait skipifsilent
+; One-click updates start Setup with /RelaunchTilework=1 (see src/update.rs): the old instance has
+; exited, so bring the new version back up after the files are replaced.
+Filename: "{app}\tilework.exe"; Flags: nowait; Check: RelaunchRequested
 
 [Registry]
 Root: HKCU; Subkey: "Software\Tilework"; ValueType: string; ValueName: "InstallPath"; ValueData: "{app}"; Flags: uninsdeletevalue uninsdeletekeyifempty
@@ -84,6 +87,11 @@ begin
       Exit;
     end;
   end;
+end;
+
+function RelaunchRequested(): Boolean;
+begin
+  Result := ExpandConstant('{param:RelaunchTilework|0}') = '1';
 end;
 
 function InitializeSetup(): Boolean;

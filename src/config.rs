@@ -12,11 +12,13 @@ pub struct Config {
     pub min_zone_width: i32,
     pub min_zone_height: i32,
     pub verbose_log: bool,
+    /// Look for new releases in the background (at most once a day).
+    pub check_updates: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { focus_follows_mouse: true, focus_delay_ms: 300, min_zone_width: 260, min_zone_height: 160, verbose_log: false }
+        Self { focus_follows_mouse: true, focus_delay_ms: 300, min_zone_width: 260, min_zone_height: 160, verbose_log: false, check_updates: true }
     }
 }
 
@@ -40,6 +42,7 @@ impl Config {
                 "min_zone_width" => if let Ok(n) = v.parse::<i32>() { c.min_zone_width = n.clamp(80, 1000); },
                 "min_zone_height" => if let Ok(n) = v.parse::<i32>() { c.min_zone_height = n.clamp(60, 1000); },
                 "verbose_log" => if let Ok(b) = v.parse() { c.verbose_log = b; },
+                "check_updates" => if let Ok(b) = v.parse() { c.check_updates = b; },
                 _ => {}
             }
         }
@@ -56,8 +59,10 @@ impl Config {
              min_zone_width={}\n\
              min_zone_height={}\n\
              # Include window titles in the log.\n\
-             verbose_log={}\n",
-            self.focus_follows_mouse, self.focus_delay_ms, self.min_zone_width, self.min_zone_height, self.verbose_log
+             verbose_log={}\n\
+             # Check GitHub for a new release shortly after start and then once a day.\n\
+             check_updates={}\n",
+            self.focus_follows_mouse, self.focus_delay_ms, self.min_zone_width, self.min_zone_height, self.verbose_log, self.check_updates
         )
     }
 
@@ -148,6 +153,15 @@ fn ensure_exists_at(path: &Path, text: &str) -> std::io::Result<()> {
     file.flush()?;
     file.sync_all()
 }
+
+/// Reads a small bookkeeping file next to the config with the same path safety rules.
+pub(crate) fn read_state(path: &Path) -> std::io::Result<String> {
+    let _guard = guard_parent(path)?;
+    safe_path(path)?;
+    read_file(path)
+}
+
+pub(crate) fn write_state(path: &Path, text: &str) -> std::io::Result<()> { save_to_path(path, text) }
 
 fn save_to_path(path: &Path, text: &str) -> std::io::Result<()> {
     let _guard = guard_parent(path)?;
@@ -351,7 +365,7 @@ mod tests {
 
     #[test]
     fn a_saved_config_reads_back_the_same() {
-        let c = Config { focus_follows_mouse: false, focus_delay_ms: 800, min_zone_width: 300, min_zone_height: 200, verbose_log: true };
+        let c = Config { focus_follows_mouse: false, focus_delay_ms: 800, min_zone_width: 300, min_zone_height: 200, verbose_log: true, check_updates: false };
         assert_eq!(Config::parse(&c.to_text()), c);
     }
 
@@ -376,7 +390,7 @@ mod tests {
     #[test]
     fn save_atomically_replaces_an_existing_config() {
         let path = test_file("atomic-overwrite");
-        let config = Config { focus_follows_mouse: false, focus_delay_ms: 900, min_zone_width: 320, min_zone_height: 220, verbose_log: false };
+        let config = Config { focus_follows_mouse: false, focus_delay_ms: 900, min_zone_width: 320, min_zone_height: 220, verbose_log: false, check_updates: true };
         std::fs::write(&path, "old contents").unwrap();
         save_to_path(&path, &config.to_text()).unwrap();
         assert_eq!(Config::parse(&std::fs::read_to_string(&path).unwrap()), config);
