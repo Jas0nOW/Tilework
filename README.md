@@ -54,9 +54,15 @@ Setup stops when it finds legacy executable files or a visible scheduled task ma
 
 #### Update or roll back
 
-Use **Check for updates…** in the tray or `--check-update` from a terminal. The check reports newer public stable releases with the expected installer. Beta testers can check the Releases page for prereleases.
+Tilework checks GitHub for a newer public stable release about a minute after it starts and then at most once a day. It only talks to GitHub, never blocks while doing so, and stays silent when there is nothing new or the network is down. When a release is available, a tray notification appears (at most once a day per version) and the tray menu gains **Install update vX.Y.Z**.
 
-Exit Tilework, verify the checksum for the desired version, then run its installer. Keep a previous verified installer and a backup of `config.ini` if you need to roll back. Exit Tilework and reinstall that version. The app delegates downloads and installation to the user and the standalone installer.
+**One-click install** (installed copies): click the notification or the menu item. Tilework downloads the official `Tilework-Setup-x64.exe` and `SHA256SUMS.txt` of that release over HTTPS into `%LOCALAPPDATA%\Tilework\updates`, checks the installer against its published SHA-256, and only then closes itself, runs the installer for your user account and starts the new version again. If the check fails, nothing is installed and you get a message. The binaries are not code-signed, so this checksum is the integrity check. The portable exe cannot be replaced by the installer, so it opens the release page instead. A Tilework started as administrator only shows the release address; start it normally to install.
+
+- **Turn automatic checks off:** untick **Check for updates automatically** in the tray menu, or set `check_updates=false` in `config.ini`. **Check for updates…** still works manually, and `--check-update` checks from a terminal.
+- If notifications are hidden by Windows Focus Assist, use the tray menu item.
+- Beta testers can check the Releases page for prereleases; they are never offered automatically.
+
+To roll back, exit Tilework, verify the checksum of the desired version's installer and run it. Keep a backup of `config.ini` if you need one.
 
 #### Uninstall
 

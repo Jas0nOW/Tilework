@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Check for updates automatically (about a minute after start, then at most once a day; tray toggle **Check for updates automatically**, `check_updates` in `config.ini`, default on). New releases are announced once a day per version by a tray notification and an **Install update** menu item.
+- One-click update: download the official installer, verify its SHA-256 against the release's `SHA256SUMS.txt`, then close Tilework, run the per-user installer and restart the new version. Portable copies open the release page instead.
 - Allow starting Tilework with administrator rights. An elevated Tilework also tiles elevated windows; a normal one keeps leaving them alone.
 - Add **Restart as administrator** to the tray menu, show "Running as administrator" and an "(Administrator)" tooltip suffix when elevated.
 - Treat a Tilework instance with other elevation as already running instead of logging an error.

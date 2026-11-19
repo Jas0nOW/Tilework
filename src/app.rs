@@ -16,16 +16,23 @@ use windows::Win32::Graphics::Gdi::{BeginPaint, CreateBitmap, DeleteObject, EndP
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, RegisterHotKey, MOD_NOREPEAT, MOD_WIN, VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2};
-use windows::Win32::UI::Shell::{ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW};
+use windows::Win32::UI::Shell::{ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const WM_EVENT: u32 = WM_APP + 1;
 const WM_TRAY: u32 = WM_APP + 2;
 const WM_PENDING: u32 = WM_APP + 3;
+/// A worker thread left a tray balloon text in `update::take_note`.
+const WM_UPDATE_NOTE: u32 = WM_APP + 4;
+/// A worker verified the installer; Tilework shuts down and the installer is started.
+const WM_UPDATE_INSTALL: u32 = WM_APP + 5;
+/// Tray callback sent when the user clicks a balloon (`NIN_BALLOONUSERCLICK`).
+const NIN_BALLOONUSERCLICK: u32 = WM_USER + 5;
 const TIMER_RECONCILE: usize = 1;
 const TIMER_DRAG: usize = 2;
 const TIMER_POLL: usize = 3;
 const TIMER_HOVER: usize = 4;
+const TIMER_UPDATE: usize = 5;
 const HOTKEY_TOGGLE: i32 = 1;
 const MENU_TOGGLE: usize = 1;
 const MENU_EXIT: usize = 2;
@@ -34,6 +41,8 @@ const MENU_AUTOSTART: usize = 4;
 const MENU_CHECK_UPDATE: usize = 5;
 const MENU_RESTART_ADMIN: usize = 6;
 const MENU_ADMIN_INFO: usize = 7;
+const MENU_INSTALL_UPDATE: usize = 8;
+const MENU_AUTO_UPDATE: usize = 9;
 const MENU_FFM_OFF: usize = 10;
 const MENU_FFM_BASE: usize = 20;
 const FFM_PRESETS: [u64; 5] = [150, 300, 500, 800, 1200];
@@ -287,6 +296,12 @@ fn notify(action: windows::Win32::UI::Shell::NOTIFY_ICON_MESSAGE, data: &NOTIFYI
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Modal message from a worker thread or before the window exists.
+pub fn message_box(title: &str, text: &str) {
+    let (title, text) = (wide(title), wide(text));
+    unsafe { MessageBoxW(None, PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONWARNING | MB_SETFOREGROUND); }
 }
 
 fn make_icon(on: bool) -> HICON {
@@ -977,6 +992,22 @@ impl<P: Win> App<P> {
         nid
     }
 
+    fn show_balloon(&self, title: &str, text: &str) {
+        let mut nid = self.tray_data();
+        nid.uFlags |= NIF_INFO;
+        nid.dwInfoFlags = NIIF_INFO;
+        for (dst, src) in [(&mut nid.szInfoTitle[..63], title), (&mut nid.szInfo[..255], text)] {
+            for (i, c) in src.encode_utf16().take(dst.len()).enumerate() { dst[i] = c; }
+        }
+        notify(NIM_MODIFY, &nid);
+    }
+
+    /// Hourly: starts a background check when enabled; the worker decides whether one is due.
+    fn update_tick(&self) {
+        set_timer(self.main, TIMER_UPDATE, crate::update::RECHECK_TICK_MS);
+        if self.cfg.check_updates { check_update_async(self.main, UpdateCheck::Scheduled); }
+    }
+
     fn update_tray(&self) {
         notify(NIM_MODIFY, &self.tray_data());
     }
@@ -1014,7 +1045,12 @@ impl<P: Win> App<P> {
                         }
                     }
                 }
-                MENU_CHECK_UPDATE => check_update_async(),
+                MENU_CHECK_UPDATE => check_update_async(app.main, UpdateCheck::Manual),
+                MENU_INSTALL_UPDATE => install_available_update(app.main),
+                MENU_AUTO_UPDATE => {
+                    app.cfg.check_updates = !app.cfg.check_updates;
+                    app.reload_saved_settings(Config::update_keys(&[("check_updates", if app.cfg.check_updates { "true" } else { "false" })]));
+                }
                 MENU_RESTART_ADMIN => return Some(MenuFollowUp::RestartAsAdministrator(app.filter.clone())),
                 MENU_OPEN_CONFIG => {
                     app.cfg.ensure_exists();
@@ -1069,40 +1105,133 @@ fn foreground_has_menu(foreground: HWND) -> bool {
     found
 }
 
-fn check_update_async() {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UpdateCheck { Manual, Scheduled }
+
+fn open_release_page(url: &str) {
+    let url = wide(url);
+    unsafe {
+        let result = ShellExecuteW(None, w!("open"), PCWSTR(url.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+        if result.0 as isize <= 32 {
+            log("could not open the official Tilework release page");
+            message_box("Tilework Update", "Could not open the browser. Visit github.com/Jas0nOW/Tilework/releases.");
+        }
+    }
+}
+
+fn window_from(raw: isize) -> HWND { HWND(raw as *mut c_void) }
+
+/// Download, verify and hand over to the installer (worker thread, blocking). Tilework itself only
+/// exits after the installer is verified; the installer is started from `main` once the
+/// single-instance mutex is released. Portable copies cannot be replaced by the per-user installer,
+/// so they get the release page instead. An elevated Tilework never starts the installer (it would
+/// run as administrator, which the per-user installer rejects, and the browser must not open
+/// elevated either): it only shows the address and explains how to update.
+fn install_update(main: isize, tag: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static INSTALLING: AtomicBool = AtomicBool::new(false);
+    let Some(page) = crate::update::installer_url(tag).map(|_| format!("{}/tag/{tag}", crate::setup::RELEASES_URL)) else { return };
+    if crate::platform::self_elevated() {
+        message_box("Tilework Update", &format!("Tilework {tag} is available.\nStart Tilework without administrator rights to install it from the tray, or download it from:\n{page}"));
+        return;
+    }
+    if !crate::setup::is_running_installed() { open_release_page(&page); return; }
+    if INSTALLING.swap(true, Ordering::SeqCst) { return; }
+    crate::update::set_note("Tilework", &format!("Downloading and verifying {tag}..."));
+    unsafe { let _ = PostMessageW(Some(window_from(main)), WM_UPDATE_NOTE, WPARAM(0), LPARAM(0)); }
+    match crate::update::download_and_verify(tag) {
+        Ok(path) => {
+            log(&format!("update {tag} verified; shutting down for the installer"));
+            crate::update::set_installer(path);
+            unsafe { let _ = PostMessageW(Some(window_from(main)), WM_UPDATE_INSTALL, WPARAM(0), LPARAM(0)); }
+        }
+        Err(e) => {
+            INSTALLING.store(false, Ordering::SeqCst);
+            log(&format!("update {tag} not installed: {e}"));
+            message_box("Tilework Update", &format!("The update was not installed because {e}.
+Nothing was changed. You can download it from github.com/Jas0nOW/Tilework/releases."));
+        }
+    }
+}
+
+fn install_available_update(main: HWND) {
+    let Some(tag) = crate::update::available_tag() else { return };
+    let main = main.0 as isize;
+    if let Err(e) = std::thread::Builder::new().spawn(move || install_update(main, &tag)) {
+        log(&format!("could not start the update installation: {e}"));
+    }
+}
+
+fn check_update_async(main: HWND, mode: UpdateCheck) {
     use crate::setup::UpdateStatus;
+    use crate::update::{self, UpdateState};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     static CHECKING: AtomicBool = AtomicBool::new(false);
     if CHECKING.swap(true, Ordering::Relaxed) { return; }
-    if let Err(e) = std::thread::Builder::new().spawn(|| {
-        let (message, release_url, buttons) = match crate::setup::check_for_update() {
-            // An elevated Tilework would start the browser as administrator; show the address instead.
-            UpdateStatus::Available { tag, release_url } if crate::platform::self_elevated() => (
-                format!("Tilework {tag} is available:\n{release_url}"), None, MB_OK | MB_ICONINFORMATION,
-            ),
-            UpdateStatus::Available { tag, release_url } => (
-                format!("Tilework {tag} is available. Open the official release page?"),
-                Some(release_url), MB_YESNO | MB_ICONINFORMATION,
-            ),
-            UpdateStatus::UpToDate => ("Tilework is up to date.".into(), None, MB_OK | MB_ICONINFORMATION),
-            UpdateStatus::NoReleaseFound => ("No public stable release found.".into(), None, MB_OK | MB_ICONINFORMATION),
-            UpdateStatus::Error(e) => (format!("Could not check for updates:\n{e}"), None, MB_OK | MB_ICONWARNING),
-        };
-        let message = wide(&message);
-        unsafe {
-            if MessageBoxW(None, PCWSTR(message.as_ptr()), w!("Tilework Update"), buttons | MB_SETFOREGROUND) == IDYES
-                && let Some(release_url) = release_url
-            {
-                let url = wide(&release_url);
-                let result = ShellExecuteW(None, w!("open"), PCWSTR(url.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
-                if result.0 as isize <= 32 {
-                    log("could not open the official Tilework release page");
-                    MessageBoxW(None, w!("Could not open the browser. Visit github.com/Jas0nOW/Tilework/releases."), w!("Tilework Update"), MB_OK | MB_ICONWARNING);
+    let main = main.0 as isize;
+    if let Err(e) = std::thread::Builder::new().spawn(move || {
+        let mut state = update::load_state();
+        let now = update::unix_now();
+        if mode == UpdateCheck::Scheduled && !update::should_check_now(state.last_check, now) {
+            CHECKING.store(false, Ordering::Relaxed);
+            return;
+        }
+        let status = crate::setup::check_for_update();
+        // A failed check is retried in an hour instead of waiting a full day.
+        state.last_check = Some(if matches!(status, UpdateStatus::Error(_)) { now.saturating_sub(update::DAY_SECS - 3600) } else { now });
+        // The per-user installer can only be started by a non-elevated, installed Tilework.
+        let elevated = crate::platform::self_elevated();
+        let installed = crate::setup::is_running_installed() && !elevated;
+        let mut dialog: Option<(String, Option<String>, MESSAGEBOX_STYLE)> = None;
+        match status {
+            UpdateStatus::Available { tag, release_url } => {
+                update::set_available(Some(tag.clone()));
+                let notify_user = mode == UpdateCheck::Scheduled && update::should_notify(&state, &tag, now);
+                if mode == UpdateCheck::Manual || notify_user {
+                    state = UpdateState { notified_tag: Some(tag.clone()), notified_at: Some(now), ..state };
+                }
+                if notify_user {
+                    let action = if elevated { "start Tilework without administrator rights to install it" }
+                        else if installed { "click to install" } else { "click to open the release page" };
+                    update::set_note(&format!("Tilework {tag} is available"), &format!("Tilework {tag} is available - {action}."));
+                    unsafe { let _ = PostMessageW(Some(window_from(main)), WM_UPDATE_NOTE, WPARAM(0), LPARAM(0)); }
+                } else if mode == UpdateCheck::Manual {
+                    dialog = Some(if elevated {
+                        (format!("Tilework {tag} is available.\nStart Tilework without administrator rights to install it from the tray, or download it from:\n{release_url}"), None, MB_OK | MB_ICONINFORMATION)
+                    } else if installed {
+                        (format!("Tilework {tag} is available.
+
+Yes: download, verify and install it now (Tilework restarts).
+No: open the release page.
+Cancel: not now."), Some(tag), MB_YESNOCANCEL | MB_ICONINFORMATION)
+                    } else {
+                        (format!("Tilework {tag} is available. Open the official release page?"), Some(release_url), MB_YESNO | MB_ICONINFORMATION)
+                    });
                 }
             }
+            UpdateStatus::UpToDate => { update::set_available(None); if mode == UpdateCheck::Manual { dialog = Some(("Tilework is up to date.".into(), None, MB_OK | MB_ICONINFORMATION)); } }
+            UpdateStatus::NoReleaseFound => { if mode == UpdateCheck::Manual { dialog = Some(("No public stable release found.".into(), None, MB_OK | MB_ICONINFORMATION)); } }
+            UpdateStatus::Error(e) => {
+                log(&format!("update check failed: {e}"));
+                if mode == UpdateCheck::Manual { dialog = Some((format!("Could not check for updates:
+{e}"), None, MB_OK | MB_ICONWARNING)); }
+            }
         }
+        update::save_state(&state);
         CHECKING.store(false, Ordering::Relaxed);
+        if let Some((message, target, buttons)) = dialog {
+            let text = wide(&message);
+            let answer = unsafe { MessageBoxW(None, PCWSTR(text.as_ptr()), w!("Tilework Update"), buttons | MB_SETFOREGROUND) };
+            // With three buttons `target` is the tag (install / release page); with two it is the URL.
+            let three = buttons == (MB_YESNOCANCEL | MB_ICONINFORMATION);
+            match (answer, target) {
+                (IDYES, Some(tag)) if three => install_update(main, &tag),
+                (IDNO, Some(tag)) if three => open_release_page(&format!("{}/tag/{tag}", crate::setup::RELEASES_URL)),
+                (IDYES, Some(url)) if !three => open_release_page(&url),
+                _ => {}
+            }
+        }
     }) {
         CHECKING.store(false, Ordering::Relaxed);
         log(&format!("could not start update check: {e}"));
@@ -1200,7 +1329,17 @@ unsafe fn build_and_track_menu(cfg: &Config, main: HWND, on: bool) -> usize {
                     log(&format!("could not append tray menu item: {e}"));
                 }
             }
+            if let Some(tag) = crate::update::available_tag() {
+                let verb = if crate::platform::self_elevated() { "Update available:" } else if crate::setup::is_running_installed() { "Install update" } else { "Download update" };
+                let label = wide(&format!("{verb} {tag}"));
+                if let Err(e) = AppendMenuW(menu, MF_STRING, MENU_INSTALL_UPDATE, PCWSTR(label.as_ptr())) {
+                    log(&format!("could not append tray menu item: {e}"));
+                }
+            }
             if let Err(e) = AppendMenuW(menu, MF_STRING, MENU_CHECK_UPDATE, w!("Check for updates...")) {
+                log(&format!("could not append tray menu item: {e}"));
+            }
+            if let Err(e) = AppendMenuW(menu, check(cfg.check_updates), MENU_AUTO_UPDATE, w!("Check for updates automatically")) {
                 log(&format!("could not append tray menu item: {e}"));
             }
 
@@ -1331,7 +1470,7 @@ fn paint_focus_border(hwnd: HWND) {
 }
 
 fn queue_pending(msg: u32, wp: WPARAM, lp: LPARAM) -> bool {
-    if matches!(msg, WM_EVENT | WM_TIMER | WM_HOTKEY | WM_TRAY | WM_DISPLAYCHANGE | WM_SETTINGCHANGE) || msg == TASKBAR_CREATED.with(Cell::get) && msg != 0 {
+    if matches!(msg, WM_EVENT | WM_TIMER | WM_UPDATE_NOTE | WM_HOTKEY | WM_TRAY | WM_DISPLAYCHANGE | WM_SETTINGCHANGE) || msg == TASKBAR_CREATED.with(Cell::get) && msg != 0 {
         PENDING.with(|p| p.borrow_mut().push_back(PendingEvent { msg, wp: wp.0, lp: lp.0 }));
         return true;
     }
@@ -1360,12 +1499,15 @@ fn dispatch<P: Win>(app: &mut App<P>, event: PendingEvent) -> bool {
             TIMER_DRAG => { let _ = app.drag_tick(); app.poll_drag_release(); },
             TIMER_HOVER => app.hover_tick(),
             TIMER_POLL => app.poll_tick(),
+            TIMER_UPDATE => app.update_tick(),
             _ => {},
         },
         WM_DISPLAYCHANGE => app.refresh_surfaces(),
         WM_SETTINGCHANGE if wp == SPI_SETWORKAREA.0 as usize => app.refresh_surfaces(),
         WM_HOTKEY if wp == HOTKEY_TOGGLE as usize => app.toggle(),
         WM_TRAY if lp as u32 == WM_LBUTTONUP => app.toggle(),
+        WM_TRAY if lp as u32 == NIN_BALLOONUSERCLICK => install_available_update(app.main),
+        WM_UPDATE_NOTE => if let Some((title, text)) = crate::update::take_note() { app.show_balloon(&title, &text); },
         _ => { app.dispatch_desktop.set(None); app.dispatching = false; return false; },
     };
     app.dispatch_desktop.set(None); app.dispatching = false;
@@ -1397,7 +1539,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 fn main_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if msg == WM_QUERYENDSESSION { return LRESULT(1); }
     if msg == WM_ENDSESSION && wp.0 != 0 { restore_owned_snap(); unsafe { PostQuitMessage(0); } return LRESULT(0); }
-    if msg == WM_CLOSE { unsafe { PostQuitMessage(0); } return LRESULT(0); }
+    if msg == WM_CLOSE || msg == WM_UPDATE_INSTALL { unsafe { PostQuitMessage(0); } return LRESULT(0); }
     if msg == WM_PENDING {
         let events = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
         for e in events { main_message(hwnd, e.msg, WPARAM(e.wp), LPARAM(e.lp)); }
@@ -1525,6 +1667,7 @@ pub fn run(filter: Option<String>) {
         }
         set_timer(main, TIMER_POLL, 1500);
         set_timer(main, TIMER_HOVER, 50);
+        set_timer(main, TIMER_UPDATE, crate::update::FIRST_CHECK_DELAY_MS);
         log("started");
         APP.with(|a| {
             if let Some(app) = a.borrow_mut().as_mut() {
@@ -1544,7 +1687,7 @@ pub fn run(filter: Option<String>) {
         }
         for hook in hooks { let _ = UnhookWinEvent(hook); }
         let _ = windows::Win32::UI::Input::KeyboardAndMouse::UnregisterHotKey(Some(main), HOTKEY_TOGGLE);
-        for timer in [TIMER_RECONCILE, TIMER_DRAG, TIMER_POLL, TIMER_HOVER] { let _ = KillTimer(Some(main), timer); }
+        for timer in [TIMER_RECONCILE, TIMER_DRAG, TIMER_POLL, TIMER_HOVER, TIMER_UPDATE] { let _ = KillTimer(Some(main), timer); }
         APP.with(|a| { if let Some(mut app) = a.borrow_mut().take() {
             app.shutdown();
             let _ = DestroyIcon(app.icon_on);
