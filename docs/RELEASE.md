@@ -1,4 +1,20 @@
-# Tilework 0.3.0 release verification
+# Tilework release verification
+
+## 0.4.x (2026-11-19)
+
+Release decision: **BETA**, published as the latest release on GitHub.
+
+| Area | Result | Evidence |
+|---|---|---|
+| Rust tests, Clippy and release build | PASS | 127 locked tests passed, plus 2 ignored live tests (real v0.3.0 download verified against its published SHA-256, real GitHub release check). Clippy passed with warnings denied. |
+| Installer lifecycle in a fresh Windows VM | PASS | Workflow run 44556726964 for tag v0.4.0 with installer_qa enabled. It compiled the setup with the new icon and relaunch entry, then ran the full standard-user lifecycle. |
+| Draft attachments and public checksums | PASS | Setup and Portable SHA-256 values for v0.4.0 matched SHA256SUMS.txt. BUILDINFO.txt named the tagged commit 0278c5c. |
+| Clean per-user install | PASS | On Windows 11 (10.0.26300), the downloaded and verified v0.4.0 setup ran silently with a standard-user token. The installed exe matched the published Portable hash, and the Start menu shortcut was created. The legacy guard first stopped setup because of an obsolete development executable. Setup ran after that file was removed as the README migration describes. |
+| One-click update end to end | PASS | A 0.3.9 test build ran from the installed location with a standard-user token. Its automatic check announced v0.4.0. A posted balloon click (`NIN_BALLOONUSERCLICK`) then downloaded and verified the installer. The test build exited, the installer ran with `/RelaunchTilework=1`, and the new version restarted from the installed path. The relaunched exe matched the published hash. The first attempt hit an HTTP 500 from GitHub minutes after publishing; it was rejected cleanly. 0.4.1 adds curl retries for this. |
+| Administrator mode | PASS (partial) | An elevated Tilework started and tiled. A standard Tilework logged and skipped elevated windows. The UAC prompt of **Restart as administrator** needs a human click and was not exercised by automation. |
+| Real update from an installed 0.4.0 to 0.4.1 | See below | Recorded after the 0.4.1 release. |
+
+## 0.3.0
 
 Evidence was collected on 2026-11-17 using Windows 11 and a disposable Windows Server 2025 GitHub-hosted runner. Release decision: **BETA**. Version 0.3.0 is published for volunteer testers. The interactive desktop checks marked NOT TESTED below are still open.
 

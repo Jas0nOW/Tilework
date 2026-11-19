@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.1 (beta)
+
+- Retry update downloads and release checks when GitHub briefly answers with a server error, which happens right after a release is published.
+- Remove downloaded update installers on the next start instead of keeping them until the next update.
+
 ## 0.4.0 (beta)
 
 - Give the program, its Start menu shortcut and the installer a Tilework icon.
