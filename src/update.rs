@@ -219,6 +219,18 @@ pub fn launch_pending_installer() {
 // Download and verification
 // ---------------------------------------------------------------------------------------------
 
+/// Removes downloaded installers once Tilework runs again, i.e. after the installer finished or an
+/// attempt was abandoned. Best effort: a file still locked by a finishing installer is kept until
+/// the next start or attempt.
+pub fn remove_leftover_downloads() {
+    let Some(root) = data_dir().map(|d| d.join("updates")) else { return };
+    if crate::config::safe_path(&root).is_err() || !root.is_dir() { return; }
+    match std::fs::remove_dir_all(&root) {
+        Ok(()) => crate::app::log("removed downloaded update files"),
+        Err(e) => crate::app::log(&format!("could not remove downloaded update files yet: {e}")),
+    }
+}
+
 fn fresh_attempt_dir() -> Result<PathBuf, String> {
     let root = data_dir().ok_or("LOCALAPPDATA is unavailable")?.join("updates");
     let err = |e: std::io::Error| format!("could not prepare the update folder: {e}");
@@ -240,6 +252,9 @@ fn curl_download(url: &str, out: &Path, max_time: &str, max_size: u64) -> Result
     let output = std::process::Command::new(crate::setup::curl_path()?)
         .creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0)
         .args(["-q", "--silent", "--show-error", "--fail", "--location", "--proto", "=https", "--proto-redir", "=https",
+               // A freshly published release can briefly answer 5xx from GitHub's CDN; curl retries
+               // only transient failures (timeouts, 408, 429, 5xx).
+               "--retry", "3", "--retry-delay", "3",
                "--max-redirs", "5", "--max-time", max_time, "--max-filesize", &max_size.to_string(),
                "--user-agent", "Tilework-Updater", "--output"])
         .arg(out)

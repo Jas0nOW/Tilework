@@ -1580,6 +1580,7 @@ fn main_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
 
 pub fn run(filter: Option<String>) {
     if !prepare_snap_recovery() { log("Snap recovery unavailable; Snap setting will be left unchanged"); }
+    crate::update::remove_leftover_downloads();
     let cfg = Config::load();
     crate::tree::set_min_zone(cfg.min_zone_width, cfg.min_zone_height);
     unsafe {

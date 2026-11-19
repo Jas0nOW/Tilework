@@ -197,6 +197,8 @@ pub fn check_for_update() -> UpdateStatus {
             "--silent",
             "--proto",
             "=https",
+            "--retry",
+            "2",
             "--max-time",
             "10",
             "--max-filesize",
